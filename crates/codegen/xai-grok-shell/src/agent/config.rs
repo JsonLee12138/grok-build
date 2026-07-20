@@ -3239,6 +3239,10 @@ pub fn resolve_model_list(
         resolved = prefetched;
     }
     for (key, model_override) in &cfg.config_models {
+        if model_override.reject_model {
+            resolved.shift_remove(key);
+            continue;
+        }
         let had_base = resolved.contains_key(key);
         let base = resolved.shift_remove(key);
         if !had_base {
@@ -3754,10 +3758,10 @@ pub struct ConfigModelOverride {
     /// prefetched/base entry when Provider credentials cannot cross origin.
     #[serde(skip)]
     pub(crate) clear_credentials: bool,
-    /// Provider ApiKeySource adapter provenance. Ordinary legacy Model
-    /// overrides may still carry both api_key and env_key for fallback.
+    /// Fail-closed tombstone for an invalid credential declaration. Resolution
+    /// removes any default/prefetched entry with the same key.
     #[serde(skip)]
-    pub(crate) credentials_are_exclusive: bool,
+    pub(crate) reject_model: bool,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -3852,23 +3856,12 @@ impl ConfigModelOverride {
         if self.clear_credentials {
             entry.api_key = None;
             entry.env_key = None;
-        } else if self.credentials_are_exclusive {
-            if self.api_key.is_some() {
-                entry.api_key.clone_from(&self.api_key);
-                entry.env_key = None;
-            } else if self.env_key.is_some() {
-                entry.api_key = None;
-                entry.env_key.clone_from(&self.env_key);
-            }
-        } else {
-            // Legacy direct Model behavior: literal api_key may coexist with
-            // env_key so runtime credential resolution can use it as fallback.
-            if self.api_key.is_some() {
-                entry.api_key.clone_from(&self.api_key);
-            }
-            if self.env_key.is_some() {
-                entry.env_key.clone_from(&self.env_key);
-            }
+        } else if self.api_key.is_some() {
+            entry.api_key.clone_from(&self.api_key);
+            entry.env_key = None;
+        } else if self.env_key.is_some() {
+            entry.api_key = None;
+            entry.env_key.clone_from(&self.env_key);
         }
         if self.api_base_url.is_some() {
             entry.api_base_url.clone_from(&self.api_base_url);
@@ -5858,9 +5851,9 @@ reasoning_effort = "low"
     }
     #[test]
     #[serial]
-    fn config_toml_env_key_array_parses() {
+    fn config_toml_env_key_array_fails_closed() {
         let dm = crate::models::default_model();
-        let (_, models) = resolve_models_from_toml(
+        let (cfg, models) = resolve_models_from_toml(
             &format!(
                 r#"
             [model."{dm}"]
@@ -5871,11 +5864,13 @@ reasoning_effort = "low"
             ),
             None,
         );
-        let model = models.get(dm).expect("model should exist");
-        assert_eq!(
-            model.env_key.as_ref().map(|k| k.names()),
-            Some(vec!["ANTHROPIC_AUTH_TOKEN", "LC_ANTHROPIC_AUTH_TOKEN"])
-        );
+        assert!(!models.contains_key(dm));
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some(dm)
+                && warning.field.as_deref() == Some("env_key")
+                && warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+        }));
     }
     #[test]
     fn resolve_credentials_sets_auth_type() {
@@ -7412,8 +7407,8 @@ reasoning_effort = "low"
     }
 
     #[test]
-    fn direct_model_legacy_dual_credentials_remain_non_exclusive() {
-        let (_, catalog) = resolve_models_from_toml(
+    fn direct_model_legacy_dual_credentials_fail_closed() {
+        let (cfg, catalog) = resolve_models_from_toml(
             r#"
             [model."legacy-direct"]
             model = "wire-direct"
@@ -7423,12 +7418,13 @@ reasoning_effort = "low"
             None,
         );
 
-        let entry = &catalog["legacy-direct"];
-        assert_eq!(entry.api_key.as_deref(), Some("literal-key"));
-        assert_eq!(
-            entry.env_key.as_ref().and_then(EnvKeys::primary),
-            Some("FALLBACK_ENV")
-        );
+        assert!(!catalog.contains_key("legacy-direct"));
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some("legacy-direct")
+                && warning.field.as_deref() == Some("env_key")
+                && warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+        }));
     }
 
     #[test]
@@ -7908,6 +7904,146 @@ reasoning_effort = "low"
     }
 
     #[test]
+    fn provider_model_acceptance_ac_15() {
+        let (literal_cfg, literal_catalog) = resolve_models_from_toml(
+            r#"
+            [model."direct-literal"]
+            model = "wire-literal"
+            api_key = "direct-literal-secret"
+            "#,
+            None,
+        );
+        for requested in ["direct-literal", "wire-literal"] {
+            let (catalog_key, entry) =
+                resolve_model_reference(&literal_catalog, &literal_cfg.model_aliases, requested)
+                    .expect("direct literal model resolves by table key and wire slug");
+            assert_eq!(catalog_key, "direct-literal");
+            assert_eq!(entry.api_key.as_deref(), Some("direct-literal-secret"));
+            assert!(entry.env_key.is_none());
+        }
+
+        let (env_cfg, env_catalog) = resolve_models_from_toml(
+            r#"
+            [model."direct-env"]
+            model = "wire-env"
+            api_key = { env = "DIRECT_MODEL_API_KEY" }
+            "#,
+            None,
+        );
+        for requested in ["direct-env", "wire-env"] {
+            let (catalog_key, entry) =
+                resolve_model_reference(&env_catalog, &env_cfg.model_aliases, requested)
+                    .expect("direct env model resolves by table key and wire slug");
+            assert_eq!(catalog_key, "direct-env");
+            assert!(entry.api_key.is_none());
+            assert_eq!(
+                entry.env_key.as_ref().and_then(EnvKeys::primary),
+                Some("DIRECT_MODEL_API_KEY")
+            );
+        }
+
+        let mut prefetched = IndexMap::new();
+        prefetched.insert(
+            "blocked-direct".to_owned(),
+            test_model_entry(
+                "wire-default-fallback",
+                "https://fallback.example/v1",
+                Some("default-fallback-secret"),
+                Some("DEFAULT_FALLBACK_ENV"),
+                None,
+            ),
+        );
+        let (blocked_cfg, blocked_catalog) = resolve_models_from_toml(
+            r#"
+            [model."blocked-direct"]
+            model = "wire-blocked"
+            env_key = "INDEPENDENT_ENV_MUST_FAIL_CLOSED"
+            "#,
+            Some(prefetched),
+        );
+        assert!(
+            resolve_model_reference(
+                &blocked_catalog,
+                &blocked_cfg.model_aliases,
+                "blocked-direct"
+            )
+            .is_none(),
+            "invalid direct Model must remove same-key prefetched/default fallback"
+        );
+        assert!(
+            resolve_model_reference(
+                &blocked_catalog,
+                &blocked_cfg.model_aliases,
+                "wire-default-fallback"
+            )
+            .is_none(),
+            "invalid direct Model must not remain reachable by the fallback wire slug"
+        );
+        assert!(blocked_cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some("blocked-direct")
+                && warning.field.as_deref() == Some("env_key")
+                && warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+        }));
+        let warning_json = serde_json::to_string(&blocked_cfg.model_override_warnings).unwrap();
+        for secret in [
+            "INDEPENDENT_ENV_MUST_FAIL_CLOSED",
+            "default-fallback-secret",
+            "DEFAULT_FALLBACK_ENV",
+        ] {
+            assert!(!warning_json.contains(secret), "warning leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn provider_model_invalid_provider_union_rejects_prefetched_fallback() {
+        let mut prefetched = IndexMap::new();
+        prefetched.insert(
+            "acme/demo-v1".to_owned(),
+            test_model_entry(
+                "old-wire-slug",
+                "https://fallback.example/v1",
+                Some("old-default-secret"),
+                Some("OLD_DEFAULT_ENV"),
+                None,
+            ),
+        );
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            api_key = { env = "VALID_PROVIDER_ENV", extra = "provider-union-secret" }
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            Some(prefetched),
+        );
+
+        for requested in ["acme/demo-v1", "old-wire-slug"] {
+            assert!(
+                resolve_model_reference(&catalog, &cfg.model_aliases, requested).is_none(),
+                "invalid Provider normalization must reject fallback reference {requested}"
+            );
+        }
+        assert!(cfg.config_models["acme/demo-v1"].reject_model);
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some("acme/demo-v1")
+                && warning.field.as_deref() == Some("provider")
+                && warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+        }));
+        let warnings = serde_json::to_string(&cfg.model_override_warnings).unwrap();
+        for secret in [
+            "provider-union-secret",
+            "old-default-secret",
+            "OLD_DEFAULT_ENV",
+        ] {
+            assert!(!warnings.contains(secret), "warning leaked {secret}");
+        }
+    }
+
+    #[test]
     fn provider_model_origin_bound_headers_do_not_cross_origins() {
         let cases = [
             (
@@ -8115,7 +8251,7 @@ reasoning_effort = "low"
             model = "{dm}"
             base_url = "https://inference.example.com/v1"
             context_window = 200000
-            env_key = "ENTERPRISE_AUTH_TOKEN"
+            api_key = {{ env = "ENTERPRISE_AUTH_TOKEN" }}
             "#,
             ),
             None,
@@ -8234,7 +8370,7 @@ reasoning_effort = "low"
             model = "grok-4.5"
             base_url = "https://inference.example.com/v1"
             context_window = 256000
-            env_key = "ENTERPRISE_AUTH_TOKEN"
+            api_key = { env = "ENTERPRISE_AUTH_TOKEN" }
             "#,
             None,
         );
@@ -11879,7 +12015,7 @@ default = "grok-4.5"
             [model.grok-build]
             model = "grok-4.5"
             base_url = "https://inference.company.com/v1"
-            env_key = "COMPANY_TOKEN"
+            api_key = { env = "COMPANY_TOKEN" }
             "#,
         )
         .unwrap();

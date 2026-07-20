@@ -265,15 +265,14 @@ model = "model-id"                    # model identifier sent to API
 base_url = "https://api.example.com/v1"  # OpenAI-compatible endpoint
 name = "Display Name"                 # shown in model picker
 description = "Model description"     # optional
-api_key = "sk-..."                    # API key for this provider
-env_key = "XAI_API_KEY"               # env var(s) holding the API key; string or array (first set, non-empty wins)
+api_key = { env = "XAI_API_KEY" }     # API key: literal string or env reference
 temperature = 0.7                     # sampling temperature (0.0-2.0)
 top_p = 0.95                          # nucleus sampling parameter
 max_completion_tokens = 8192          # max tokens per response
 context_window = 128000               # context window size (for auto-compact)
 ```
 
-Credential resolution: `api_key` > `env_key` > signed-in session token > `XAI_API_KEY`.
+Credential resolution: model `api_key` (literal or env reference) > signed-in session token > `XAI_API_KEY`.
 
 Override built-in models by using their name as the section key:
 

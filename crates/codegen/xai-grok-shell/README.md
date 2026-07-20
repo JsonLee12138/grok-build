@@ -1705,15 +1705,14 @@ model = "model-id"                    # Model identifier sent to API
 base_url = "https://api.example.com/v1"  # OpenAI-compatible endpoint
 name = "Display Name"                 # Shown in model picker
 description = "Model description"     # Optional description
-api_key = "sk-..."                    # API key for this provider (optional)
-env_key = "OPENAI_API_KEY"            # Env var(s) holding the API key (string or array; first set wins)
+api_key = { env = "OPENAI_API_KEY" }  # API key: literal string or env reference (optional)
 temperature = 0.7                     # Sampling temperature (0.0-2.0)
 top_p = 0.95                          # Nucleus sampling parameter
 max_completion_tokens = 8192          # Max tokens per response
 context_window = 256000               # Total context window in tokens (for auto-compact)
 ```
 
-**Credential resolution order:** `api_key` → `env_key` → `XAI_API_KEY`. If neither `api_key` nor `env_key` is set, Grok falls back to the global `XAI_API_KEY` environment variable.
+**Credential resolution order:** model `api_key` (literal or `{ env = "NAME" }`) → `XAI_API_KEY`. If `api_key` is omitted, Grok can use the signed-in session or global `XAI_API_KEY` fallback.
 
 The `context_window` parameter is used to calculate when auto-compact should trigger. If not specified, Grok falls back to built-in defaults for known models.
 
@@ -1753,7 +1752,7 @@ api_key = "sk-custom"
 > [model.my-custom-model]              # 2. tell Grok how to reach it
 > model = "my-custom-model"
 > api_backend = "responses"            # required — web search uses the Responses API
-> # base_url, api_key, env_key optional — defaults to cli-chat-proxy
+> # base_url and api_key optional — defaults to cli-chat-proxy/session auth
 > ```
 
 ### Examples
@@ -1784,7 +1783,7 @@ name = "CodeLlama (Ollama)"
 model = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 base_url = "https://api.together.xyz/v1"
 name = "Mixtral 8x7B"
-env_key = "TOGETHER_API_KEY"
+api_key = { env = "TOGETHER_API_KEY" }
 ```
 
 **OpenAI:**
@@ -1794,7 +1793,7 @@ env_key = "TOGETHER_API_KEY"
 model = "gpt-4o"
 base_url = "https://api.openai.com/v1"
 name = "GPT-4o"
-env_key = "OPENAI_API_KEY"
+api_key = { env = "OPENAI_API_KEY" }
 ```
 
 ### Using Custom Models

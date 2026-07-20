@@ -887,7 +887,7 @@ mod tests {
     /// CROSS-CRATE REGRESSION GUARD:
     ///
     /// Enterprise/BYOK configs (e.g. an enterprise `~/.grok/config.toml` with a
-    /// `[model.*]` table containing `env_key = "ANTHROPIC_AUTH_TOKEN"`) MUST
+    /// `[model.*]` table containing `api_key = { env = "ANTHROPIC_AUTH_TOKEN" }`) MUST
     /// NOT send the user to the login screen at startup.
     ///
     /// This test exercises the SHELL-PAGER JOIN, not just the pager half:
@@ -909,8 +909,8 @@ mod tests {
         use xai_grok_shell::agent::auth_method::{AuthMethodsBuildInputs, build_auth_methods};
 
         let built = build_auth_methods(AuthMethodsBuildInputs {
-            // enterprise-style: model has `env_key` set and the env var resolves,
-            // so the shell-side predicate returns true.
+            // Enterprise-style: the model's api_key references an environment
+            // variable that resolves, so the shell-side predicate returns true.
             has_external_api_key: true,
             // Realistic enterprise user: no cached session token, default `grok.com`
             // login (no enterprise OIDC).

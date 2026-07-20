@@ -1,7 +1,8 @@
 //! Resilient parsing for `[model.<id>]` TOML overrides.
 //!
-//! A model entry must survive a bad field: warn and skip the field, never
-//! drop the model (managed configs must not lose catalog entries).
+//! Ordinary bad fields are warned and skipped so the model survives. Invalid
+//! credential declarations are the exception: they reject the entire model
+//! to prevent fallback to inherited/default credentials.
 //!
 //! Every table is deserialized through `serde_ignored`, so unknown fields
 //! warn on every path and [`ConfigModelOverride`] stays the single source of
@@ -100,31 +101,43 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
             });
             continue;
         };
+        let credential = match parse_model_credentials(model_key, entry_table, &mut warnings) {
+            Ok(credential) => credential,
+            Err(()) => {
+                // The credential error rejects the whole model, but retain
+                // independent non-credential diagnostics without ever feeding
+                // credential values to the generic TOML error path.
+                let mut noncredential_fields = entry_table.clone();
+                noncredential_fields.remove("api_key");
+                noncredential_fields.remove("env_key");
+                let (_, extra_warnings) =
+                    parse_model_override_table(model_key, noncredential_fields);
+                warnings.extend(extra_warnings);
+                models.insert(
+                    model_key.clone(),
+                    ConfigModelOverride {
+                        reject_model: true,
+                        ..ConfigModelOverride::default()
+                    },
+                );
+                continue;
+            }
+        };
         let mut parsed_entry_table = entry_table.clone();
-        let mut credentials_are_exclusive = false;
-        if entry_table.contains_key("provider") {
-            let credential =
-                match parse_provider_model_credentials(model_key, entry_table, &mut warnings) {
-                    Ok(credential) => credential,
-                    Err(()) => continue,
-                };
-            if let Some(credential) = credential {
-                credentials_are_exclusive = true;
-                parsed_entry_table.remove("api_key");
-                parsed_entry_table.remove("env_key");
-                match credential {
-                    ApiKeySource::Literal(value) => {
-                        parsed_entry_table.insert("api_key".to_owned(), toml::Value::String(value));
-                    }
-                    ApiKeySource::Environment { env } => {
-                        parsed_entry_table.insert("env_key".to_owned(), toml::Value::String(env));
-                    }
+        if let Some(credential) = credential {
+            parsed_entry_table.remove("api_key");
+            parsed_entry_table.remove("env_key");
+            match credential {
+                ApiKeySource::Literal(value) => {
+                    parsed_entry_table.insert("api_key".to_owned(), toml::Value::String(value));
+                }
+                ApiKeySource::Environment { env } => {
+                    parsed_entry_table.insert("env_key".to_owned(), toml::Value::String(env));
                 }
             }
         }
         let (mut entry, mut entry_warnings) =
             parse_model_override_table(model_key, parsed_entry_table);
-        entry.credentials_are_exclusive = credentials_are_exclusive;
         if entry
             .alias
             .as_deref()
@@ -151,6 +164,13 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
             &mut entry,
             &mut warnings,
         ) {
+            models.insert(
+                model_key.clone(),
+                ConfigModelOverride {
+                    reject_model: true,
+                    ..ConfigModelOverride::default()
+                },
+            );
             continue;
         }
         models.insert(model_key.clone(), entry);
@@ -248,7 +268,7 @@ fn is_valid_alias(alias: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn parse_provider_model_credentials(
+fn parse_model_credentials(
     model_key: &str,
     table: &toml::map::Map<String, toml::Value>,
     warnings: &mut Vec<ModelOverrideWarning>,
@@ -334,7 +354,6 @@ fn normalize_provider_model(
         if changes_origin {
             entry.clear_credentials = true;
         } else if let Some(api_key) = &provider.api_key {
-            entry.credentials_are_exclusive = true;
             match api_key {
                 ApiKeySource::Literal(value) => entry.api_key = Some(value.clone()),
                 ApiKeySource::Environment { env } => {
@@ -776,8 +795,10 @@ pub(in crate::agent) mod tests {
         for (case, model_key, input) in cases {
             let (models, warnings) = parse_raw(input);
             assert!(
-                !models.contains_key(model_key),
-                "{case}: model must be dropped"
+                models
+                    .get(model_key)
+                    .is_some_and(|model| model.reject_model),
+                "{case}: model must retain a fail-closed tombstone"
             );
             let matching: Vec<_> = warnings
                 .iter()
@@ -899,8 +920,10 @@ pub(in crate::agent) mod tests {
                 "{case}: provider must be ignored"
             );
             assert!(
-                !models.contains_key(model_key),
-                "{case}: referencing model must be ignored"
+                models
+                    .get(model_key)
+                    .is_some_and(|model| model.reject_model),
+                "{case}: referencing model must retain a fail-closed tombstone"
             );
             assert!(
                 warnings.iter().any(|warning| warning.kind == expected_kind),
@@ -949,7 +972,12 @@ pub(in crate::agent) mod tests {
                 warnings,
             } = parse_model_overrides(&raw);
             assert!(!providers.contains_key("acme"), "{case}");
-            assert!(!models.contains_key("acme/demo-v1"), "{case}");
+            assert!(
+                models
+                    .get("acme/demo-v1")
+                    .is_some_and(|model| model.reject_model),
+                "{case}: referencing model must retain a fail-closed tombstone"
+            );
             assert!(
                 warnings
                     .iter()
@@ -973,7 +1001,7 @@ pub(in crate::agent) mod tests {
             r#"
             [model."grok-4.5"]
             model = "grok-4.5"
-            env_key = "ANTHROPIC_AUTH_TOKEN"
+            api_key = { env = "ANTHROPIC_AUTH_TOKEN" }
             compactions_remaining = 1
             send_compactions_remaining = true
             "#,
@@ -1017,7 +1045,7 @@ pub(in crate::agent) mod tests {
             r#"
             [model."grok-4.5"]
             model = "grok-4.5"
-            env_key = "ANTHROPIC_AUTH_TOKEN"
+            api_key = { env = "ANTHROPIC_AUTH_TOKEN" }
             reasoning_effort = "not-a-level"
             "#,
         );
@@ -1039,7 +1067,7 @@ pub(in crate::agent) mod tests {
             r#"
             [model."grok-4.5"]
             model = "grok-4.5"
-            env_key = "TOKEN"
+            api_key = { env = "TOKEN" }
             future_field = 1
             "#,
         );
@@ -1188,7 +1216,7 @@ pub(in crate::agent) mod tests {
             name: Some("Model M".into()),
             description: Some("desc".into()),
             api_key: Some("key".into()),
-            env_key: Some(crate::agent::config::EnvKeys::single("ENV_KEY")),
+            env_key: None,
             api_base_url: Some("https://api.example.com".into()),
             max_completion_tokens: Some(1024),
             temperature: Some(0.5),
@@ -1224,7 +1252,7 @@ pub(in crate::agent) mod tests {
             show_model_fingerprint: Some(true),
             stream_tool_calls: Some(false),
             clear_credentials: false,
-            credentials_are_exclusive: false,
+            reject_model: false,
         }
     }
 

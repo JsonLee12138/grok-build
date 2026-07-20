@@ -1731,7 +1731,7 @@ mod tests {
             r#"
             [model."grok-4.5"]
             model = "grok-4.5"
-            env_key = "ANTHROPIC_AUTH_TOKEN"
+            api_key = { env = "ANTHROPIC_AUTH_TOKEN" }
             compactions_remaining = 1
             send_compactions_remaining = true
             reasoning_effort = "not-a-level"

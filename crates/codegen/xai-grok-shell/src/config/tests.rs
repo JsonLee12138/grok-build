@@ -2579,7 +2579,7 @@ cli_chat_proxy_base_url = "https://cli-chat-proxy.grok.com/v1"
 
 [model.grok-build]
 base_url = "https://inference.acme-corp.example/xai/v1"
-env_key = "ANTHROPIC_AUTH_TOKEN"
+api_key = { env = "ANTHROPIC_AUTH_TOKEN" }
 model = "grok-4.5"
 
 [models]

@@ -253,12 +253,71 @@ fn normalize_provider_model(
         return false;
     }
 
+    let changes_origin = model_changes_provider_origin(entry, provider);
+
     entry.provider = Some(provider_id.to_owned());
     entry.model = Some(wire_model_id.to_owned());
     if entry.base_url.is_none() {
         entry.base_url.clone_from(&provider.base_url);
     }
+    if entry.api_base_url.is_none() {
+        entry.api_base_url.clone_from(&provider.api_base_url);
+    }
+    if entry.api_backend.is_none() {
+        entry.api_backend.clone_from(&provider.api_backend);
+    }
+    if entry.auth_scheme.is_none() {
+        entry.auth_scheme = if changes_origin {
+            Some(xai_grok_sampler::AuthScheme::default())
+        } else {
+            provider.auth_scheme
+        };
+    }
+    if entry.extra_headers.is_none() {
+        if changes_origin {
+            // ModelEntry has one shared header map for both endpoints. Once
+            // either endpoint crosses origin, inherited provider headers must
+            // be cleared from any prefetched/base entry as well.
+            entry.extra_headers = Some(IndexMap::new());
+        } else if !provider.extra_headers.is_empty() {
+            entry.extra_headers = Some(provider.extra_headers.clone());
+        }
+    }
     true
+}
+
+fn model_changes_provider_origin(model: &ConfigModelOverride, provider: &ProviderConfig) -> bool {
+    // Without a provider-owned session endpoint, the eventual base URL comes
+    // from ModelEntry fallback/default state. Provider headers and auth cannot
+    // be proven to belong to that origin, even if api_base_url is configured.
+    let Some(provider_base_url) = provider.base_url.as_deref() else {
+        return true;
+    };
+    let base_changed = model
+        .base_url
+        .as_deref()
+        .is_some_and(|model_url| !urls_have_same_origin(model_url, provider_base_url));
+    let provider_api_url = provider
+        .api_base_url
+        .as_deref()
+        .unwrap_or(provider_base_url);
+    let api_base_changed = model
+        .api_base_url
+        .as_deref()
+        .is_some_and(|model_url| !urls_have_same_origin(model_url, provider_api_url));
+    base_changed || api_base_changed
+}
+
+fn urls_have_same_origin(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let (Ok(left), Ok(right)) = (url::Url::parse(left), url::Url::parse(right)) else {
+        return false;
+    };
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 /// Logs the warnings when they differ from the previous parse, so a
@@ -786,7 +845,11 @@ mod tests {
         );
         let entry = models.get("m").unwrap();
         assert_eq!(
-            entry.extra_headers.get("x-team").map(String::as_str),
+            entry
+                .extra_headers
+                .as_ref()
+                .and_then(|headers| headers.get("x-team"))
+                .map(String::as_str),
             Some("codegen")
         );
         assert!(entry.temperature.is_none());
@@ -874,9 +937,12 @@ mod tests {
             temperature: Some(0.5),
             top_p: Some(0.9),
             api_backend: Some(ApiBackend::Messages),
-            extra_headers: [("x-team".to_owned(), "codegen".to_owned())]
-                .into_iter()
-                .collect(),
+            auth_scheme: Some(xai_grok_sampler::AuthScheme::XApiKey),
+            extra_headers: Some(
+                [("x-team".to_owned(), "codegen".to_owned())]
+                    .into_iter()
+                    .collect(),
+            ),
             context_window: Some(200_000),
             auto_compact_threshold_percent: Some(80),
             system_prompt_label: Some("label".into()),

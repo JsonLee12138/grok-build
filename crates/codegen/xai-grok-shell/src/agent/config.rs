@@ -3578,12 +3578,17 @@ fn is_default_laziness_detector(cfg: &LazinessDetectorPerModelConfig) -> bool {
 #[serde(default)]
 pub struct ProviderConfig {
     pub base_url: Option<String>,
+    pub api_base_url: Option<String>,
+    pub api_backend: Option<ApiBackend>,
+    pub auth_scheme: Option<AuthScheme>,
+    #[serde(default)]
+    pub extra_headers: IndexMap<String, String>,
 }
 /// A `[model.foo]` entry from config.toml, parsed directly from raw TOML
 /// (bypassing deep merge). Scalar fields are `Option` so absent means "inherit
-/// from defaults/prefetched"; the collection fields (`extra_headers`,
-/// `reasoning_efforts`) merge only when non-empty and so cannot express
-/// "override to empty."
+/// from defaults/prefetched". `extra_headers` retains presence so an explicit
+/// empty table can clear inherited headers; `reasoning_efforts` still merges
+/// only when non-empty and cannot express "override to empty."
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ConfigModelOverride {
@@ -3602,8 +3607,9 @@ pub struct ConfigModelOverride {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: Option<ApiBackend>,
-    #[serde(default)]
-    pub extra_headers: IndexMap<String, String>,
+    pub auth_scheme: Option<AuthScheme>,
+    /// `None` means inherit; `Some(empty)` explicitly clears inherited headers.
+    pub extra_headers: Option<IndexMap<String, String>>,
     pub context_window: Option<u64>,
     /// Per-model auto-compact threshold override (0-100) from `[model.<id>]`.
     /// Read directly by `resolve_auto_compact_threshold_percent`; intentionally
@@ -3665,8 +3671,11 @@ impl ConfigModelOverride {
         if let Some(ref v) = self.api_backend {
             entry.info.api_backend = v.clone();
         }
-        if !self.extra_headers.is_empty() {
-            entry.info.extra_headers = self.extra_headers.clone();
+        if let Some(v) = self.auth_scheme {
+            entry.info.auth_scheme = v;
+        }
+        if let Some(extra_headers) = &self.extra_headers {
+            entry.info.extra_headers.clone_from(extra_headers);
         }
         if let Some(cw) = self.context_window.and_then(NonZeroU64::new) {
             entry.info.context_window = cw;
@@ -7347,6 +7356,345 @@ reasoning_effort = "low"
 
         assert!(before.contains_key("acme/demo-v1"));
         assert!(!after.contains_key("acme/demo-v1"));
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_04() {
+        fn existing_backend_name(backend: &ApiBackend) -> &'static str {
+            match backend {
+                ApiBackend::ChatCompletions => "chat_completions",
+                ApiBackend::Responses => "responses",
+                ApiBackend::Messages => "messages",
+            }
+        }
+
+        let cases = [
+            ("chat_completions", ApiBackend::ChatCompletions),
+            ("messages", ApiBackend::Messages),
+            ("responses", ApiBackend::Responses),
+        ];
+        for (configured, expected) in cases {
+            let (_, catalog) = resolve_models_from_toml(
+                &format!(
+                    r#"
+                    [provider.acme]
+                    base_url = "https://api.acme.example/v1"
+                    api_backend = "{configured}"
+
+                    [model."acme/demo-v1"]
+                    provider = "acme"
+                    "#
+                ),
+                None,
+            );
+            let actual = &catalog["acme/demo-v1"].info.api_backend;
+            assert_eq!(actual, &expected, "provider backend must be preserved");
+            assert_eq!(existing_backend_name(actual), configured);
+        }
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_07() {
+        let (_, inherited_catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://provider.example/v1"
+            api_base_url = "https://provider-api.example/v1"
+            api_backend = "messages"
+            auth_scheme = "x_api_key"
+            extra_headers = { x-route = "provider" }
+
+            [model."acme/inherited"]
+            provider = "acme"
+            "#,
+            None,
+        );
+        let inherited = &inherited_catalog["acme/inherited"];
+        assert_eq!(inherited.info.base_url, "https://provider.example/v1");
+        assert_eq!(
+            inherited.api_base_url.as_deref(),
+            Some("https://provider-api.example/v1")
+        );
+        assert_eq!(inherited.info.api_backend, ApiBackend::Messages);
+        assert_eq!(inherited.info.auth_scheme, AuthScheme::XApiKey);
+        assert_eq!(
+            inherited
+                .info
+                .extra_headers
+                .get("x-route")
+                .map(String::as_str),
+            Some("provider")
+        );
+
+        enum ConnectionField {
+            BaseUrl,
+            ApiBaseUrl,
+            ApiBackend,
+            AuthScheme,
+            ExtraHeaders,
+        }
+
+        let cases = [
+            (
+                ConnectionField::BaseUrl,
+                r#"
+                [provider.acme]
+                base_url = "https://provider.example/v1"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                base_url = "https://model.example/v1"
+                "#,
+            ),
+            (
+                ConnectionField::ApiBaseUrl,
+                r#"
+                [provider.acme]
+                api_base_url = "https://provider-api.example/v1"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                api_base_url = "https://model-api.example/v1"
+                "#,
+            ),
+            (
+                ConnectionField::ApiBackend,
+                r#"
+                [provider.acme]
+                api_backend = "messages"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                api_backend = "responses"
+                "#,
+            ),
+            (
+                ConnectionField::AuthScheme,
+                r#"
+                [provider.acme]
+                auth_scheme = "x_api_key"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                auth_scheme = "bearer"
+                "#,
+            ),
+            (
+                ConnectionField::ExtraHeaders,
+                r#"
+                [provider.acme]
+                extra_headers = { x-route = "provider" }
+                [model."acme/demo-v1"]
+                provider = "acme"
+                extra_headers = { x-route = "model" }
+                "#,
+            ),
+        ];
+
+        for (field, input) in cases {
+            let (_, catalog) = resolve_models_from_toml(input, None);
+            let entry = &catalog["acme/demo-v1"];
+            match field {
+                ConnectionField::BaseUrl => {
+                    assert_eq!(entry.info.base_url, "https://model.example/v1")
+                }
+                ConnectionField::ApiBaseUrl => assert_eq!(
+                    entry.api_base_url.as_deref(),
+                    Some("https://model-api.example/v1")
+                ),
+                ConnectionField::ApiBackend => {
+                    assert_eq!(entry.info.api_backend, ApiBackend::Responses)
+                }
+                ConnectionField::AuthScheme => {
+                    assert_eq!(entry.info.auth_scheme, AuthScheme::Bearer)
+                }
+                ConnectionField::ExtraHeaders => assert_eq!(
+                    entry.info.extra_headers.get("x-route").map(String::as_str),
+                    Some("model")
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn provider_model_origin_bound_headers_do_not_cross_origins() {
+        let cases = [
+            (
+                "base_url changes origin",
+                r#"
+                base_url = "https://other.example/v1"
+                "#,
+            ),
+            (
+                "api_base_url changes origin",
+                r#"
+                api_base_url = "https://other.example/v1"
+                "#,
+            ),
+        ];
+
+        for (case, model_fields) in cases {
+            let (_, catalog) = resolve_models_from_toml(
+                &format!(
+                    r#"
+                    [provider.acme]
+                    base_url = "https://provider.example/session/v1"
+                    api_base_url = "https://provider.example/api/v1"
+                    auth_scheme = "x_api_key"
+                    extra_headers = {{ authorization = "provider-secret" }}
+
+                    [model."acme/demo-v1"]
+                    provider = "acme"
+                    {model_fields}
+                    "#
+                ),
+                None,
+            );
+            let entry = &catalog["acme/demo-v1"];
+            assert!(
+                entry.info.extra_headers.is_empty(),
+                "{case}: provider headers must not cross origin"
+            );
+            assert_eq!(
+                entry.info.auth_scheme,
+                AuthScheme::Bearer,
+                "{case}: provider auth scheme must not cross origin"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_model_origin_bound_data_requires_provider_session_endpoint() {
+        let cases = [
+            ("provider has no endpoint", ""),
+            (
+                "provider has only api endpoint",
+                r#"api_base_url = "https://provider.example/api/v1""#,
+            ),
+        ];
+
+        for (case, provider_endpoint) in cases {
+            let (_, catalog) = resolve_models_from_toml(
+                &format!(
+                    r#"
+                    [provider.acme]
+                    {provider_endpoint}
+                    auth_scheme = "x_api_key"
+                    extra_headers = {{ authorization = "provider-secret" }}
+
+                    [model."acme/demo-v1"]
+                    provider = "acme"
+                    "#
+                ),
+                None,
+            );
+            let entry = &catalog["acme/demo-v1"];
+            assert!(
+                entry.info.extra_headers.is_empty(),
+                "{case}: headers cannot bind to a fallback session origin"
+            );
+            assert_eq!(
+                entry.info.auth_scheme,
+                AuthScheme::Bearer,
+                "{case}: auth cannot bind to a fallback session origin"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_model_cross_origin_clears_prefetched_auth_and_headers() {
+        let endpoints = EndpointsConfig::default();
+        let mut stale = ModelEntry::fallback("demo-v1", &endpoints);
+        stale.info.base_url = "https://provider.example/v1".to_owned();
+        stale.info.auth_scheme = AuthScheme::XApiKey;
+        stale
+            .info
+            .extra_headers
+            .insert("authorization".to_owned(), "stale-secret".to_owned());
+        let prefetched = [("acme/demo-v1".to_owned(), stale)].into_iter().collect();
+
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://provider.example/v1"
+            auth_scheme = "x_api_key"
+            extra_headers = { authorization = "provider-secret" }
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            base_url = "https://other.example/v1"
+            "#,
+            Some(prefetched),
+        );
+        let entry = &catalog["acme/demo-v1"];
+        assert!(entry.info.extra_headers.is_empty());
+        assert_eq!(entry.info.auth_scheme, AuthScheme::Bearer);
+    }
+
+    #[test]
+    fn provider_model_explicit_headers_control_origin_bound_behavior() {
+        let cases = [
+            (
+                "same origin inherits provider headers",
+                r#"
+                base_url = "https://provider.example/model/v1"
+                "#,
+                Some("provider-secret"),
+                AuthScheme::XApiKey,
+            ),
+            (
+                "cross origin uses explicit model headers",
+                r#"
+                base_url = "https://other.example/v1"
+                extra_headers = { authorization = "model-secret" }
+                "#,
+                Some("model-secret"),
+                AuthScheme::Bearer,
+            ),
+            (
+                "explicit empty headers clear same-origin inheritance",
+                r#"
+                extra_headers = {}
+                "#,
+                None,
+                AuthScheme::XApiKey,
+            ),
+            (
+                "explicit empty headers remain empty across origin",
+                r#"
+                base_url = "https://other.example/v1"
+                extra_headers = {}
+                "#,
+                None,
+                AuthScheme::Bearer,
+            ),
+        ];
+
+        for (case, model_fields, expected_header, expected_auth) in cases {
+            let (_, catalog) = resolve_models_from_toml(
+                &format!(
+                    r#"
+                    [provider.acme]
+                    base_url = "https://provider.example/session/v1"
+                    api_base_url = "https://provider.example/api/v1"
+                    auth_scheme = "x_api_key"
+                    extra_headers = {{ authorization = "provider-secret" }}
+
+                    [model."acme/demo-v1"]
+                    provider = "acme"
+                    {model_fields}
+                    "#
+                ),
+                None,
+            );
+            let entry = &catalog["acme/demo-v1"];
+            assert_eq!(
+                entry
+                    .info
+                    .extra_headers
+                    .get("authorization")
+                    .map(String::as_str),
+                expected_header,
+                "{case}"
+            );
+            assert_eq!(entry.info.auth_scheme, expected_auth, "{case}");
+        }
     }
 
     fn resolve_sampling(model: &ModelEntry, session_key: Option<&str>) -> SamplerConfig {

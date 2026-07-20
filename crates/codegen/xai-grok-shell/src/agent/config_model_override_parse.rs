@@ -15,7 +15,7 @@
 use indexmap::IndexMap;
 use serde::Serialize;
 
-use super::config::ConfigModelOverride;
+use super::config::{ConfigModelOverride, ProviderConfig};
 
 /// Category for a [`ModelOverrideWarning`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -51,6 +51,7 @@ pub struct ModelOverrideWarning {
 /// Result of [`parse_model_overrides`].
 pub(crate) struct ParsedModelOverrides {
     pub models: IndexMap<String, ConfigModelOverride>,
+    pub providers: IndexMap<String, ProviderConfig>,
     pub warnings: Vec<ModelOverrideWarning>,
 }
 
@@ -59,8 +60,13 @@ pub(crate) struct ParsedModelOverrides {
 pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOverrides {
     let mut models = IndexMap::new();
     let mut warnings = Vec::new();
+    let providers = parse_providers(raw_config, &mut warnings);
     let Some(section) = raw_config.get("model") else {
-        return ParsedModelOverrides { models, warnings };
+        return ParsedModelOverrides {
+            models,
+            providers,
+            warnings,
+        };
     };
     let Some(table) = section.as_table() else {
         warnings.push(ModelOverrideWarning {
@@ -72,7 +78,11 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
                 section.type_str()
             ),
         });
-        return ParsedModelOverrides { models, warnings };
+        return ParsedModelOverrides {
+            models,
+            providers,
+            warnings,
+        };
     };
     for (model_key, value) in table {
         let Some(entry_table) = value.as_table() else {
@@ -87,11 +97,168 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
             });
             continue;
         };
-        let (entry, entry_warnings) = parse_model_override_table(model_key, entry_table.clone());
+        let (mut entry, mut entry_warnings) =
+            parse_model_override_table(model_key, entry_table.clone());
+        // Provider references have stricter fail-closed validation below. Drop
+        // the generic field-level parse warning so an invalid non-string
+        // reference produces one stable, value-free warning.
+        if entry_table.get("provider").is_some_and(|v| !v.is_str()) {
+            entry_warnings.retain(|warning| warning.field.as_deref() != Some("provider"));
+        }
         warnings.extend(entry_warnings);
+        if !normalize_provider_model(
+            model_key,
+            entry_table.get("provider"),
+            &providers,
+            &mut entry,
+            &mut warnings,
+        ) {
+            continue;
+        }
         models.insert(model_key.clone(), entry);
     }
-    ParsedModelOverrides { models, warnings }
+    ParsedModelOverrides {
+        models,
+        providers,
+        warnings,
+    }
+}
+
+fn parse_providers(
+    raw_config: &toml::Value,
+    warnings: &mut Vec<ModelOverrideWarning>,
+) -> IndexMap<String, ProviderConfig> {
+    let mut providers = IndexMap::new();
+    let Some(section) = raw_config.get("provider") else {
+        return providers;
+    };
+    let Some(table) = section.as_table() else {
+        warnings.push(ModelOverrideWarning {
+            model_key: None,
+            field: Some("provider".to_owned()),
+            kind: ModelOverrideWarningKind::NotATable,
+            reason: "`provider` must be a table of [provider.<id>] entries; all providers ignored"
+                .to_owned(),
+        });
+        return providers;
+    };
+    for (provider_id, value) in table {
+        if !is_valid_provider_id(provider_id) {
+            warnings.push(ModelOverrideWarning {
+                model_key: None,
+                field: Some(format!("provider.{provider_id}")),
+                kind: ModelOverrideWarningKind::InvalidValue,
+                reason: "provider id must be a non-empty ASCII identifier containing only letters, digits, `.`, `_`, or `-`; provider ignored"
+                    .to_owned(),
+            });
+            continue;
+        }
+        let Some(provider_table) = value.as_table() else {
+            warnings.push(ModelOverrideWarning {
+                model_key: None,
+                field: Some(format!("provider.{provider_id}")),
+                kind: ModelOverrideWarningKind::NotATable,
+                reason: "provider definition must be a table; provider ignored".to_owned(),
+            });
+            continue;
+        };
+        let mut unknown = Vec::new();
+        match serde_ignored::deserialize(toml::Value::Table(provider_table.clone()), |path| {
+            unknown.push(path.to_string());
+        }) {
+            Ok(provider) if unknown.is_empty() => {
+                providers.insert(provider_id.clone(), provider);
+            }
+            Ok(_provider) => {
+                for field in unknown {
+                    warnings.push(ModelOverrideWarning {
+                        model_key: None,
+                        field: Some(format!("provider.{provider_id}.{field}")),
+                        kind: ModelOverrideWarningKind::UnknownField,
+                        reason: "unknown provider field; provider ignored".to_owned(),
+                    });
+                }
+            }
+            Err(_) => warnings.push(ModelOverrideWarning {
+                model_key: None,
+                field: Some(format!("provider.{provider_id}")),
+                kind: ModelOverrideWarningKind::InvalidValue,
+                // Do not include the deserializer error: future provider fields may
+                // contain credentials, and warning text must never echo values.
+                reason: "provider definition contains an invalid value; provider ignored"
+                    .to_owned(),
+            }),
+        }
+    }
+    providers
+}
+
+fn is_valid_provider_id(provider_id: &str) -> bool {
+    !provider_id.is_empty()
+        && provider_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Validate the explicit provider reference and materialize provider-owned
+/// identity/endpoint fields into the existing model override representation.
+fn normalize_provider_model(
+    model_key: &str,
+    raw_provider: Option<&toml::Value>,
+    providers: &IndexMap<String, ProviderConfig>,
+    entry: &mut ConfigModelOverride,
+    warnings: &mut Vec<ModelOverrideWarning>,
+) -> bool {
+    let Some(raw_provider) = raw_provider else {
+        return true;
+    };
+    let Some(provider_id) = raw_provider.as_str() else {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("provider".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+            reason: "provider reference must be a string; model entry dropped".to_owned(),
+        });
+        return false;
+    };
+    let Some(provider) = providers.get(provider_id) else {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("provider".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+            reason: "referenced provider does not exist or is invalid; model entry dropped"
+                .to_owned(),
+        });
+        return false;
+    };
+    let Some((key_provider, wire_model_id)) = model_key.split_once('/') else {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("provider".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+            reason:
+                "provider model key must be `<provider-id>/<wire-model-id>`; model entry dropped"
+                    .to_owned(),
+        });
+        return false;
+    };
+    if key_provider != provider_id || wire_model_id.is_empty() {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("provider".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+            reason: "provider model key does not match its provider or has no wire model id; model entry dropped"
+                .to_owned(),
+        });
+        return false;
+    }
+
+    entry.provider = Some(provider_id.to_owned());
+    entry.model = Some(wire_model_id.to_owned());
+    if entry.base_url.is_none() {
+        entry.base_url.clone_from(&provider.base_url);
+    }
+    true
 }
 
 /// Logs the warnings when they differ from the previous parse, so a
@@ -284,8 +451,204 @@ mod tests {
         Vec<ModelOverrideWarning>,
     ) {
         let raw: toml::Value = toml::from_str(toml_str).unwrap();
-        let ParsedModelOverrides { models, warnings } = parse_model_overrides(&raw);
+        let ParsedModelOverrides {
+            models, warnings, ..
+        } = parse_model_overrides(&raw);
         (models, warnings)
+    }
+
+    #[test]
+    fn provider_model_invalid_references_are_fail_closed() {
+        let cases = [
+            (
+                "provider is not a string",
+                "acme/demo-v1",
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                [model."acme/demo-v1"]
+                provider = 7
+                "#,
+            ),
+            (
+                "provider does not exist",
+                "acme/demo-v1",
+                r#"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                "#,
+            ),
+            (
+                "key has no separator",
+                "demo-v1",
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                [model.demo-v1]
+                provider = "acme"
+                "#,
+            ),
+            (
+                "key provider does not match",
+                "other/demo-v1",
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                [model."other/demo-v1"]
+                provider = "acme"
+                "#,
+            ),
+            (
+                "wire model id is empty",
+                "acme/",
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                [model."acme/"]
+                provider = "acme"
+                "#,
+            ),
+        ];
+
+        for (case, model_key, input) in cases {
+            let (models, warnings) = parse_raw(input);
+            assert!(
+                !models.contains_key(model_key),
+                "{case}: model must be dropped"
+            );
+            let matching: Vec<_> = warnings
+                .iter()
+                .filter(|warning| {
+                    warning.kind == ModelOverrideWarningKind::InvalidValue
+                        && warning.model_key.as_deref() == Some(model_key)
+                        && warning.field.as_deref() == Some("provider")
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "{case}: warning identity must be stable");
+        }
+    }
+
+    #[test]
+    fn provider_model_invalid_definitions_are_ignored_and_warnings_are_redacted() {
+        let cases = [
+            (
+                "provider is not a table",
+                "acme",
+                "acme/demo-v1",
+                ModelOverrideWarningKind::NotATable,
+                r#"
+                provider = { acme = "sensitive-provider-value" }
+                [model."acme/demo-v1"]
+                provider = "acme"
+                "#,
+                "sensitive-provider-value",
+            ),
+            (
+                "provider id contains slash",
+                "bad/id",
+                "bad/id/demo-v1",
+                ModelOverrideWarningKind::InvalidValue,
+                r#"
+                [provider."bad/id"]
+                base_url = "https://api.example/v1"
+                [model."bad/id/demo-v1"]
+                provider = "bad/id"
+                "#,
+                "not-present-secret",
+            ),
+            (
+                "provider id is whitespace",
+                " ",
+                " /demo-v1",
+                ModelOverrideWarningKind::InvalidValue,
+                r#"
+                [provider." "]
+                base_url = "sensitive-whitespace-value"
+                [model." /demo-v1"]
+                provider = " "
+                "#,
+                "sensitive-whitespace-value",
+            ),
+            (
+                "provider id is unicode",
+                "供应商",
+                "供应商/demo-v1",
+                ModelOverrideWarningKind::InvalidValue,
+                r#"
+                [provider."供应商"]
+                base_url = "sensitive-unicode-value"
+                [model."供应商/demo-v1"]
+                provider = "供应商"
+                "#,
+                "sensitive-unicode-value",
+            ),
+            (
+                "provider id contains another special character",
+                "acme@prod",
+                "acme@prod/demo-v1",
+                ModelOverrideWarningKind::InvalidValue,
+                r#"
+                [provider."acme@prod"]
+                base_url = "sensitive-special-value"
+                [model."acme@prod/demo-v1"]
+                provider = "acme@prod"
+                "#,
+                "sensitive-special-value",
+            ),
+            (
+                "provider base_url has wrong type",
+                "acme",
+                "acme/demo-v1",
+                ModelOverrideWarningKind::InvalidValue,
+                r#"
+                [provider.acme]
+                base_url = 42
+                [model."acme/demo-v1"]
+                provider = "acme"
+                "#,
+                "42",
+            ),
+            (
+                "provider has unknown field",
+                "acme",
+                "acme/demo-v1",
+                ModelOverrideWarningKind::UnknownField,
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                secret_token = "plaintext-provider-secret"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                "#,
+                "plaintext-provider-secret",
+            ),
+        ];
+
+        for (case, provider_id, model_key, expected_kind, input, secret) in cases {
+            let raw: toml::Value = toml::from_str(input).expect("case TOML parses");
+            let ParsedModelOverrides {
+                models,
+                providers,
+                warnings,
+            } = parse_model_overrides(&raw);
+            assert!(
+                !providers.contains_key(provider_id),
+                "{case}: provider must be ignored"
+            );
+            assert!(
+                !models.contains_key(model_key),
+                "{case}: referencing model must be ignored"
+            );
+            assert!(
+                warnings.iter().any(|warning| warning.kind == expected_kind),
+                "{case}: expected provider warning"
+            );
+            let rendered = serde_json::to_string(&warnings).expect("warnings serialize");
+            assert!(
+                !rendered.contains(secret),
+                "{case}: warnings must not expose provider values"
+            );
+        }
     }
 
     #[test]
@@ -499,6 +862,7 @@ mod tests {
     /// here until the drift-guard tests cover it.
     fn fully_populated_override() -> ConfigModelOverride {
         ConfigModelOverride {
+            provider: None,
             model: Some("m".into()),
             base_url: Some("https://example.com".into()),
             name: Some("Model M".into()),
@@ -549,8 +913,9 @@ mod tests {
         model_table.insert("m".to_owned(), toml::Value::Table(entry));
         let mut root = toml::map::Map::new();
         root.insert("model".to_owned(), toml::Value::Table(model_table));
-        let ParsedModelOverrides { models, warnings } =
-            parse_model_overrides(&toml::Value::Table(root));
+        let ParsedModelOverrides {
+            models, warnings, ..
+        } = parse_model_overrides(&toml::Value::Table(root));
         (models, warnings)
     }
 

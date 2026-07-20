@@ -1278,6 +1278,9 @@ pub struct Config {
     /// `[model.*]` overrides from config.toml. Resolve via `resolve_model_list()`.
     #[serde(skip)]
     pub config_models: IndexMap<String, ConfigModelOverride>,
+    /// `[provider.*]` definitions referenced by provider-backed model entries.
+    #[serde(skip)]
+    pub providers: IndexMap<String, ProviderConfig>,
     /// Warnings from `[model.*]` parsing; surfaced by `grok inspect`.
     #[serde(skip)]
     pub model_override_warnings: Vec<super::config_model_override_parse::ModelOverrideWarning>,
@@ -1706,6 +1709,7 @@ impl Default for Config {
             doom_loop_recovery: crate::util::config::DoomLoopRecoverySettings::default(),
             auto_mode: AutoModeConfig::default(),
             config_models: IndexMap::new(),
+            providers: IndexMap::new(),
             model_override_warnings: Vec::new(),
             grok_com_config: GrokComConfig::default(),
             shortcuts: None,
@@ -1845,16 +1849,19 @@ impl Config {
         let raw_config = &Self::expand_auth_alias(raw_config);
         let super::config_model_override_parse::ParsedModelOverrides {
             models: config_models,
+            providers,
             warnings: model_override_warnings,
         } = super::config_model_override_parse::parse_model_overrides(raw_config);
         super::config_model_override_parse::log_model_override_warnings(&model_override_warnings);
         let mut base = toml::Value::try_from(Self::default()).map_err(|e| e.to_string())?;
         if let toml::Value::Table(ref mut t) = base {
             t.remove("model");
+            t.remove("provider");
         }
         let mut raw_without_model_sections = raw_config.clone();
         if let toml::Value::Table(ref mut t) = raw_without_model_sections {
             t.remove("model");
+            t.remove("provider");
         }
         crate::config::deep_merge_toml(&mut base, &raw_without_model_sections);
         let (mut config, user_unused) =
@@ -1866,6 +1873,7 @@ impl Config {
             );
         }
         config.config_models = config_models;
+        config.providers = providers;
         config.model_override_warnings = model_override_warnings;
         if config.grok_com_config.oidc.is_none() {
             config.grok_com_config.oidc = OidcAuthConfig::from_env();
@@ -3561,6 +3569,16 @@ pub struct ModelEntryConfig {
 fn is_default_laziness_detector(cfg: &LazinessDetectorPerModelConfig) -> bool {
     cfg == &LazinessDetectorPerModelConfig::default()
 }
+/// A named upstream provider from `[provider.<id>]`.
+///
+/// Provider-backed models are still materialized as the existing
+/// [`ModelEntry`] type; this configuration type does not cross into request
+/// handling.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProviderConfig {
+    pub base_url: Option<String>,
+}
 /// A `[model.foo]` entry from config.toml, parsed directly from raw TOML
 /// (bypassing deep merge). Scalar fields are `Option` so absent means "inherit
 /// from defaults/prefetched"; the collection fields (`extra_headers`,
@@ -3569,6 +3587,9 @@ fn is_default_laziness_detector(cfg: &LazinessDetectorPerModelConfig) -> bool {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ConfigModelOverride {
+    /// Explicit provider reference. Provider-backed keys must be
+    /// `<provider-id>/<wire-model-id>`.
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub name: Option<String>,
@@ -7236,6 +7257,98 @@ reasoning_effort = "low"
         let resolved = resolve_model_list(&cfg, prefetched);
         (cfg, resolved)
     }
+
+    #[test]
+    fn provider_model_acceptance_ac_01() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            None,
+        );
+
+        assert!(cfg.providers.contains_key("acme"));
+        assert_eq!(
+            catalog
+                .keys()
+                .filter(|key| key.as_str() == "acme/demo-v1")
+                .count(),
+            1
+        );
+        let entry = catalog.get("acme/demo-v1").expect("provider model exists");
+        assert_eq!(entry.info.model, "demo-v1");
+        assert_eq!(entry.info.base_url, "https://api.acme.example/v1");
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_02() {
+        use crate::agent::models::ModelsManager;
+
+        let config_with_url = |base_url: &str| {
+            let raw: toml::Value = toml::from_str(&format!(
+                r#"
+                [provider.acme]
+                base_url = "{base_url}"
+
+                [model."acme/demo-v1"]
+                provider = "acme"
+                "#
+            ))
+            .expect("test TOML parses");
+            Config::new_from_toml_cfg(&raw).expect("config parses")
+        };
+
+        let mgr = ModelsManager::default();
+        mgr.apply_config(config_with_url("https://a.acme.example/v1"));
+        let before = mgr.models();
+        mgr.apply_config(config_with_url("https://b.acme.example/v1"));
+        let after = mgr.models();
+
+        assert_eq!(
+            before["acme/demo-v1"].info.base_url,
+            "https://a.acme.example/v1"
+        );
+        assert_eq!(
+            after["acme/demo-v1"].info.base_url,
+            "https://b.acme.example/v1"
+        );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_03() {
+        use crate::agent::models::ModelsManager;
+
+        let parse_config = |input: &str| {
+            let raw: toml::Value = toml::from_str(input).expect("test TOML parses");
+            Config::new_from_toml_cfg(&raw).expect("config parses")
+        };
+        let mgr = ModelsManager::default();
+        mgr.apply_config(parse_config(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+        ));
+        let before = mgr.models();
+        mgr.apply_config(parse_config(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            "#,
+        ));
+        let after = mgr.models();
+
+        assert!(before.contains_key("acme/demo-v1"));
+        assert!(!after.contains_key("acme/demo-v1"));
+    }
+
     fn resolve_sampling(model: &ModelEntry, session_key: Option<&str>) -> SamplerConfig {
         let credentials = resolve_credentials(model, session_key);
         sampling_config_for_model(model, credentials, None, None, None, None)

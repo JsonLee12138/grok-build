@@ -124,6 +124,56 @@ impl EnvKeys {
         None
     }
 }
+
+/// The single supported API-key configuration syntax.
+///
+/// A string is always a literal secret; `{ env = "NAME" }` is a delayed
+/// environment reference and is never read while parsing configuration.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ApiKeySource {
+    Literal(String),
+    Environment { env: String },
+}
+
+impl<'de> Deserialize<'de> for ApiKeySource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct EnvironmentSource {
+            env: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawSource {
+            Literal(String),
+            Environment(EnvironmentSource),
+        }
+
+        Ok(match RawSource::deserialize(deserializer)? {
+            RawSource::Literal(value) => Self::Literal(value),
+            RawSource::Environment(EnvironmentSource { env }) => Self::Environment { env },
+        })
+    }
+}
+
+impl ApiKeySource {
+    pub(crate) fn is_valid(&self) -> bool {
+        match self {
+            Self::Literal(value) => !value.trim().is_empty(),
+            Self::Environment { env } => {
+                let mut bytes = env.bytes();
+                bytes
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                    && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            }
+        }
+    }
+}
 /// Semantic equality: compares the ordered name lists, so `One("X")` and
 /// `Many(["X"])` (the shape serde produces for `["X"]`) compare equal.
 impl PartialEq for EnvKeys {
@@ -3581,6 +3631,7 @@ pub struct ProviderConfig {
     pub api_base_url: Option<String>,
     pub api_backend: Option<ApiBackend>,
     pub auth_scheme: Option<AuthScheme>,
+    pub api_key: Option<ApiKeySource>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
 }
@@ -3635,6 +3686,14 @@ pub struct ConfigModelOverride {
     pub compaction_at_tokens: Option<CompactionAtTokens>,
     pub show_model_fingerprint: Option<bool>,
     pub stream_tool_calls: Option<bool>,
+    /// Adapter-only marker used to clear credentials inherited from a
+    /// prefetched/base entry when Provider credentials cannot cross origin.
+    #[serde(skip)]
+    pub(crate) clear_credentials: bool,
+    /// Provider ApiKeySource adapter provenance. Ordinary legacy Model
+    /// overrides may still carry both api_key and env_key for fallback.
+    #[serde(skip)]
+    pub(crate) credentials_are_exclusive: bool,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -3726,11 +3785,26 @@ impl ConfigModelOverride {
         if self.stream_tool_calls.is_some() {
             entry.info.stream_tool_calls = self.stream_tool_calls;
         }
-        if self.api_key.is_some() {
-            entry.api_key.clone_from(&self.api_key);
-        }
-        if self.env_key.is_some() {
-            entry.env_key.clone_from(&self.env_key);
+        if self.clear_credentials {
+            entry.api_key = None;
+            entry.env_key = None;
+        } else if self.credentials_are_exclusive {
+            if self.api_key.is_some() {
+                entry.api_key.clone_from(&self.api_key);
+                entry.env_key = None;
+            } else if self.env_key.is_some() {
+                entry.api_key = None;
+                entry.env_key.clone_from(&self.env_key);
+            }
+        } else {
+            // Legacy direct Model behavior: literal api_key may coexist with
+            // env_key so runtime credential resolution can use it as fallback.
+            if self.api_key.is_some() {
+                entry.api_key.clone_from(&self.api_key);
+            }
+            if self.env_key.is_some() {
+                entry.env_key.clone_from(&self.env_key);
+            }
         }
         if self.api_base_url.is_some() {
             entry.api_base_url.clone_from(&self.api_base_url);
@@ -7268,6 +7342,26 @@ reasoning_effort = "low"
     }
 
     #[test]
+    fn direct_model_legacy_dual_credentials_remain_non_exclusive() {
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [model."legacy-direct"]
+            model = "wire-direct"
+            api_key = "literal-key"
+            env_key = "FALLBACK_ENV"
+            "#,
+            None,
+        );
+
+        let entry = &catalog["legacy-direct"];
+        assert_eq!(entry.api_key.as_deref(), Some("literal-key"));
+        assert_eq!(
+            entry.env_key.as_ref().and_then(EnvKeys::primary),
+            Some("FALLBACK_ENV")
+        );
+    }
+
+    #[test]
     fn provider_model_acceptance_ac_01() {
         let (cfg, catalog) = resolve_models_from_toml(
             r#"
@@ -7394,6 +7488,76 @@ reasoning_effort = "low"
     }
 
     #[test]
+    fn provider_model_acceptance_ac_05() {
+        let (_, inherited_catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            api_key = "literal-secret"
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            None,
+        );
+        let inherited = &inherited_catalog["acme/demo-v1"];
+        assert_eq!(inherited.api_key.as_deref(), Some("literal-secret"));
+        assert!(inherited.env_key.is_none());
+
+        let (_, overridden_catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            api_key = "provider-secret"
+            [model."acme/demo-v1"]
+            provider = "acme"
+            api_key = { env = "MODEL_API_KEY" }
+            "#,
+            None,
+        );
+        let overridden = &overridden_catalog["acme/demo-v1"];
+        assert!(overridden.api_key.is_none());
+        assert_eq!(
+            overridden.env_key.as_ref().and_then(EnvKeys::primary),
+            Some("MODEL_API_KEY")
+        );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_06() {
+        let (_, inherited_catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            api_key = { env = "JSO_284_AC_06_UNSET_ENV_REFERENCE" }
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            None,
+        );
+        let inherited = &inherited_catalog["acme/demo-v1"];
+        assert!(inherited.api_key.is_none());
+        assert_eq!(
+            inherited.env_key.as_ref().and_then(EnvKeys::primary),
+            Some("JSO_284_AC_06_UNSET_ENV_REFERENCE")
+        );
+
+        let (_, overridden_catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            api_key = { env = "PROVIDER_API_KEY" }
+            [model."acme/demo-v1"]
+            provider = "acme"
+            api_key = "model-secret"
+            "#,
+            None,
+        );
+        let overridden = &overridden_catalog["acme/demo-v1"];
+        assert_eq!(overridden.api_key.as_deref(), Some("model-secret"));
+        assert!(overridden.env_key.is_none());
+    }
+
+    #[test]
     fn provider_model_acceptance_ac_07() {
         let (_, inherited_catalog) = resolve_models_from_toml(
             r#"
@@ -7513,6 +7677,83 @@ reasoning_effort = "low"
     }
 
     #[test]
+    fn provider_model_acceptance_ac_08() {
+        let cases = [
+            (
+                "independent env_key",
+                r#"api_key = "model-secret"
+                env_key = "SECRET_ENV_VALUE""#,
+                "env_key",
+                "SECRET_ENV_VALUE",
+            ),
+            (
+                "independent env_key without api_key",
+                r#"env_key = "ONLY_SECRET_ENV_VALUE""#,
+                "env_key",
+                "ONLY_SECRET_ENV_VALUE",
+            ),
+            (
+                "invalid environment name",
+                r#"api_key = { env = "9INVALID_SECRET_ENV" }"#,
+                "api_key",
+                "9INVALID_SECRET_ENV",
+            ),
+            (
+                "inline table has extra member",
+                r#"api_key = { env = "VALID_ENV", extra = "secret-ac-08-extra-marker" }"#,
+                "api_key",
+                "secret-ac-08-extra-marker",
+            ),
+            (
+                "api_key has wrong type",
+                "api_key = 28408",
+                "api_key",
+                "28408",
+            ),
+        ];
+
+        for (case, model_credentials, expected_field, secret) in cases {
+            let raw: toml::Value = toml::from_str(&format!(
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                {model_credentials}
+                "#
+            ))
+            .expect("case TOML parses");
+            let cfg = Config::new_from_toml_cfg(&raw).expect("config parses");
+            let catalog = resolve_model_list(&cfg, None);
+            assert!(
+                !catalog.contains_key("acme/demo-v1"),
+                "{case}: invalid provider model must be dropped"
+            );
+            assert!(cfg.model_override_warnings.iter().any(|warning| {
+                warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+                    && warning.model_key.as_deref() == Some("acme/demo-v1")
+                    && warning.field.as_deref() == Some(expected_field)
+            }));
+            let rendered = serde_json::to_string(&cfg.model_override_warnings).unwrap();
+            assert!(!rendered.contains(secret), "{case}: warning leaked a value");
+        }
+
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/demo-v1"]
+            provider = "acme"
+            api_key = "   "
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        assert!(!resolve_model_list(&cfg, None).contains_key("acme/demo-v1"));
+    }
+
+    #[test]
     fn provider_model_origin_bound_headers_do_not_cross_origins() {
         let cases = [
             (
@@ -7576,6 +7817,7 @@ reasoning_effort = "low"
                     [provider.acme]
                     {provider_endpoint}
                     auth_scheme = "x_api_key"
+                    api_key = "provider-api-secret"
                     extra_headers = {{ authorization = "provider-secret" }}
 
                     [model."acme/demo-v1"]
@@ -7594,6 +7836,8 @@ reasoning_effort = "low"
                 AuthScheme::Bearer,
                 "{case}: auth cannot bind to a fallback session origin"
             );
+            assert!(entry.api_key.is_none(), "{case}");
+            assert!(entry.env_key.is_none(), "{case}");
         }
     }
 
@@ -7603,6 +7847,8 @@ reasoning_effort = "low"
         let mut stale = ModelEntry::fallback("demo-v1", &endpoints);
         stale.info.base_url = "https://provider.example/v1".to_owned();
         stale.info.auth_scheme = AuthScheme::XApiKey;
+        stale.api_key = Some("stale-api-secret".to_owned());
+        stale.env_key = Some(EnvKeys::single("STALE_API_ENV"));
         stale
             .info
             .extra_headers
@@ -7614,6 +7860,7 @@ reasoning_effort = "low"
             [provider.acme]
             base_url = "https://provider.example/v1"
             auth_scheme = "x_api_key"
+            api_key = "provider-api-secret"
             extra_headers = { authorization = "provider-secret" }
 
             [model."acme/demo-v1"]
@@ -7625,6 +7872,8 @@ reasoning_effort = "low"
         let entry = &catalog["acme/demo-v1"];
         assert!(entry.info.extra_headers.is_empty());
         assert_eq!(entry.info.auth_scheme, AuthScheme::Bearer);
+        assert!(entry.api_key.is_none());
+        assert!(entry.env_key.is_none());
     }
 
     #[test]

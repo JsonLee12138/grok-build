@@ -15,7 +15,7 @@
 use indexmap::IndexMap;
 use serde::Serialize;
 
-use super::config::{ConfigModelOverride, ProviderConfig};
+use super::config::{ApiKeySource, ConfigModelOverride, ProviderConfig};
 
 /// Category for a [`ModelOverrideWarning`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -97,8 +97,31 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
             });
             continue;
         };
+        let mut parsed_entry_table = entry_table.clone();
+        let mut credentials_are_exclusive = false;
+        if entry_table.contains_key("provider") {
+            let credential =
+                match parse_provider_model_credentials(model_key, entry_table, &mut warnings) {
+                    Ok(credential) => credential,
+                    Err(()) => continue,
+                };
+            if let Some(credential) = credential {
+                credentials_are_exclusive = true;
+                parsed_entry_table.remove("api_key");
+                parsed_entry_table.remove("env_key");
+                match credential {
+                    ApiKeySource::Literal(value) => {
+                        parsed_entry_table.insert("api_key".to_owned(), toml::Value::String(value));
+                    }
+                    ApiKeySource::Environment { env } => {
+                        parsed_entry_table.insert("env_key".to_owned(), toml::Value::String(env));
+                    }
+                }
+            }
+        }
         let (mut entry, mut entry_warnings) =
-            parse_model_override_table(model_key, entry_table.clone());
+            parse_model_override_table(model_key, parsed_entry_table);
+        entry.credentials_are_exclusive = credentials_are_exclusive;
         // Provider references have stricter fail-closed validation below. Drop
         // the generic field-level parse warning so an invalid non-string
         // reference produces one stable, value-free warning.
@@ -167,7 +190,21 @@ fn parse_providers(
             unknown.push(path.to_string());
         }) {
             Ok(provider) if unknown.is_empty() => {
-                providers.insert(provider_id.clone(), provider);
+                let provider: ProviderConfig = provider;
+                if provider
+                    .api_key
+                    .as_ref()
+                    .is_some_and(|source| !source.is_valid())
+                {
+                    warnings.push(ModelOverrideWarning {
+                        model_key: None,
+                        field: Some(format!("provider.{provider_id}.api_key")),
+                        kind: ModelOverrideWarningKind::InvalidValue,
+                        reason: "provider api_key is invalid; provider ignored".to_owned(),
+                    });
+                } else {
+                    providers.insert(provider_id.clone(), provider);
+                }
             }
             Ok(_provider) => {
                 for field in unknown {
@@ -198,6 +235,44 @@ fn is_valid_provider_id(provider_id: &str) -> bool {
         && provider_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn parse_provider_model_credentials(
+    model_key: &str,
+    table: &toml::map::Map<String, toml::Value>,
+    warnings: &mut Vec<ModelOverrideWarning>,
+) -> Result<Option<ApiKeySource>, ()> {
+    if table.contains_key("env_key") {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("env_key".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+            reason: "provider model must use api_key union syntax; model entry dropped".to_owned(),
+        });
+        return Err(());
+    }
+    let Some(value) = table.get("api_key") else {
+        return Ok(None);
+    };
+    let Ok(source) = value.clone().try_into::<ApiKeySource>() else {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("api_key".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+            reason: "provider model api_key is invalid; model entry dropped".to_owned(),
+        });
+        return Err(());
+    };
+    if !source.is_valid() {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("api_key".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+            reason: "provider model api_key is invalid; model entry dropped".to_owned(),
+        });
+        return Err(());
+    }
+    Ok(Some(source))
 }
 
 /// Validate the explicit provider reference and materialize provider-owned
@@ -254,6 +329,20 @@ fn normalize_provider_model(
     }
 
     let changes_origin = model_changes_provider_origin(entry, provider);
+
+    if entry.api_key.is_none() && entry.env_key.is_none() {
+        if changes_origin {
+            entry.clear_credentials = true;
+        } else if let Some(api_key) = &provider.api_key {
+            entry.credentials_are_exclusive = true;
+            match api_key {
+                ApiKeySource::Literal(value) => entry.api_key = Some(value.clone()),
+                ApiKeySource::Environment { env } => {
+                    entry.env_key = Some(super::config::EnvKeys::single(env));
+                }
+            }
+        }
+    }
 
     entry.provider = Some(provider_id.to_owned());
     entry.model = Some(wire_model_id.to_owned());
@@ -711,6 +800,59 @@ mod tests {
     }
 
     #[test]
+    fn provider_model_invalid_provider_api_keys_are_redacted() {
+        let cases = [
+            ("blank literal", r#"api_key = "   ""#, None),
+            ("empty environment name", r#"api_key = { env = "" }"#, None),
+            (
+                "invalid environment name",
+                r#"api_key = { env = "9INVALID_PROVIDER_SECRET" }"#,
+                Some("9INVALID_PROVIDER_SECRET"),
+            ),
+            (
+                "inline table has extra member",
+                r#"api_key = { env = "VALID_ENV", extra = "provider-secret-extra-marker" }"#,
+                Some("provider-secret-extra-marker"),
+            ),
+            ("api_key has wrong type", "api_key = 28405", Some("28405")),
+        ];
+
+        for (case, provider_api_key, secret) in cases {
+            let raw: toml::Value = toml::from_str(&format!(
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                {provider_api_key}
+                [model."acme/demo-v1"]
+                provider = "acme"
+                "#
+            ))
+            .expect("case TOML parses");
+            let ParsedModelOverrides {
+                models,
+                providers,
+                warnings,
+            } = parse_model_overrides(&raw);
+            assert!(!providers.contains_key("acme"), "{case}");
+            assert!(!models.contains_key("acme/demo-v1"), "{case}");
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.kind == ModelOverrideWarningKind::InvalidValue),
+                "{case}: invalid api_key must warn"
+            );
+            let rendered = serde_json::to_string(&warnings).unwrap();
+            if let Some(secret) = secret {
+                assert!(!rendered.contains(secret), "{case}: warning leaked a value");
+            }
+            assert!(
+                !rendered.contains("api_key ="),
+                "{case}: warning leaked TOML"
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_compactions_keys_keeps_model() {
         let cfg = parse_cfg(
             r#"
@@ -966,6 +1108,8 @@ mod tests {
             compaction_at_tokens: Some(CompactionAtTokens::Fixed(100_000)),
             show_model_fingerprint: Some(true),
             stream_tool_calls: Some(false),
+            clear_credentials: false,
+            credentials_are_exclusive: false,
         }
     }
 

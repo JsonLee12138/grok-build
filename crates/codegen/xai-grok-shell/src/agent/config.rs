@@ -5092,6 +5092,10 @@ mod tests {
     use serial_test::serial;
     use xai_grok_test_support::EnvGuard;
     #[test]
+    fn provider_model_acceptance_ac_09() {
+        crate::agent::config_model_override_parse::tests::assert_provider_model_acceptance_ac_09();
+    }
+    #[test]
     fn main_cli_tools_override_preserves_profile_injection_policy() {
         let overrides = CliAgentOverrides {
             tools: Some(vec!["read_file".into()]),

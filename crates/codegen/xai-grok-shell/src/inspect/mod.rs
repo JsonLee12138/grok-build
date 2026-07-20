@@ -1235,12 +1235,13 @@ fn render_model_override_warnings(
             Some(key) => format!("[model.\"{key}\"]"),
             None => "[model]".to_owned(),
         };
+        let category = w.kind.as_str();
         match w.field.as_deref() {
             Some(field) => {
-                let _ = writeln!(out, "    {TREE} {target} {field} — {}", w.reason);
+                let _ = writeln!(out, "    {TREE} {target} {field} — {category}");
             }
             None => {
-                let _ = writeln!(out, "    {TREE} {target} — {}", w.reason);
+                let _ = writeln!(out, "    {TREE} {target} — {category}");
             }
         }
     }
@@ -1774,11 +1775,8 @@ mod tests {
             .expect("alias warning present in JSON");
         assert_eq!(alias_warning["modelKey"], "grok-4.5");
         assert_eq!(alias_warning["kind"], "duplicate-alias");
-        assert!(
-            alias_warning["reason"]
-                .as_str()
-                .is_some_and(|r| !r.is_empty())
-        );
+        assert!(alias_warning.get("reason").is_none());
+        assert!(human.contains("duplicate-alias"), "{human}");
     }
 
     // ── skill source mapping (skill_entry_source) ─────────────────────────

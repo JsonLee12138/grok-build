@@ -34,6 +34,18 @@ pub enum ModelOverrideWarningKind {
     UnparseableEntry,
 }
 
+impl ModelOverrideWarningKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownField => "unknown-field",
+            Self::InvalidValue => "invalid-value",
+            Self::DuplicateAlias => "duplicate-alias",
+            Self::NotATable => "not-a-table",
+            Self::UnparseableEntry => "unparseable-entry",
+        }
+    }
+}
+
 /// One skipped field or dropped entry from `[model.*]` parsing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,7 +57,6 @@ pub struct ModelOverrideWarning {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
     pub kind: ModelOverrideWarningKind,
-    pub reason: String,
 }
 
 /// Result of [`parse_model_overrides`].
@@ -73,10 +84,6 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
             model_key: None,
             field: None,
             kind: ModelOverrideWarningKind::NotATable,
-            reason: format!(
-                "`model` must be a table of [model.<id>] entries, got {}; all model overrides ignored",
-                section.type_str()
-            ),
         });
         return ParsedModelOverrides {
             models,
@@ -90,10 +97,6 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
                 model_key: Some(model_key.clone()),
                 field: None,
                 kind: ModelOverrideWarningKind::NotATable,
-                reason: format!(
-                    "expected a table like [model.\"{model_key}\"], got {}; entry dropped",
-                    value.type_str()
-                ),
             });
             continue;
         };
@@ -132,8 +135,6 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
                 model_key: Some(model_key.clone()),
                 field: Some("alias".to_owned()),
                 kind: ModelOverrideWarningKind::InvalidValue,
-                reason: "alias must use non-empty ASCII letters, digits, '.', '_', or '-'; alias ignored"
-                    .to_owned(),
             });
         }
         // Provider references have stricter fail-closed validation below. Drop
@@ -174,8 +175,6 @@ fn parse_providers(
             model_key: None,
             field: Some("provider".to_owned()),
             kind: ModelOverrideWarningKind::NotATable,
-            reason: "`provider` must be a table of [provider.<id>] entries; all providers ignored"
-                .to_owned(),
         });
         return providers;
     };
@@ -185,8 +184,6 @@ fn parse_providers(
                 model_key: None,
                 field: Some(format!("provider.{provider_id}")),
                 kind: ModelOverrideWarningKind::InvalidValue,
-                reason: "provider id must be a non-empty ASCII identifier containing only letters, digits, `.`, `_`, or `-`; provider ignored"
-                    .to_owned(),
             });
             continue;
         }
@@ -195,7 +192,6 @@ fn parse_providers(
                 model_key: None,
                 field: Some(format!("provider.{provider_id}")),
                 kind: ModelOverrideWarningKind::NotATable,
-                reason: "provider definition must be a table; provider ignored".to_owned(),
             });
             continue;
         };
@@ -214,7 +210,6 @@ fn parse_providers(
                         model_key: None,
                         field: Some(format!("provider.{provider_id}.api_key")),
                         kind: ModelOverrideWarningKind::InvalidValue,
-                        reason: "provider api_key is invalid; provider ignored".to_owned(),
                     });
                 } else {
                     providers.insert(provider_id.clone(), provider);
@@ -226,7 +221,6 @@ fn parse_providers(
                         model_key: None,
                         field: Some(format!("provider.{provider_id}.{field}")),
                         kind: ModelOverrideWarningKind::UnknownField,
-                        reason: "unknown provider field; provider ignored".to_owned(),
                     });
                 }
             }
@@ -234,10 +228,6 @@ fn parse_providers(
                 model_key: None,
                 field: Some(format!("provider.{provider_id}")),
                 kind: ModelOverrideWarningKind::InvalidValue,
-                // Do not include the deserializer error: future provider fields may
-                // contain credentials, and warning text must never echo values.
-                reason: "provider definition contains an invalid value; provider ignored"
-                    .to_owned(),
             }),
         }
     }
@@ -268,7 +258,6 @@ fn parse_provider_model_credentials(
             model_key: Some(model_key.to_owned()),
             field: Some("env_key".to_owned()),
             kind: ModelOverrideWarningKind::InvalidValue,
-            reason: "provider model must use api_key union syntax; model entry dropped".to_owned(),
         });
         return Err(());
     }
@@ -280,7 +269,6 @@ fn parse_provider_model_credentials(
             model_key: Some(model_key.to_owned()),
             field: Some("api_key".to_owned()),
             kind: ModelOverrideWarningKind::InvalidValue,
-            reason: "provider model api_key is invalid; model entry dropped".to_owned(),
         });
         return Err(());
     };
@@ -289,7 +277,6 @@ fn parse_provider_model_credentials(
             model_key: Some(model_key.to_owned()),
             field: Some("api_key".to_owned()),
             kind: ModelOverrideWarningKind::InvalidValue,
-            reason: "provider model api_key is invalid; model entry dropped".to_owned(),
         });
         return Err(());
     }
@@ -313,7 +300,6 @@ fn normalize_provider_model(
             model_key: Some(model_key.to_owned()),
             field: Some("provider".to_owned()),
             kind: ModelOverrideWarningKind::InvalidValue,
-            reason: "provider reference must be a string; model entry dropped".to_owned(),
         });
         return false;
     };
@@ -322,8 +308,6 @@ fn normalize_provider_model(
             model_key: Some(model_key.to_owned()),
             field: Some("provider".to_owned()),
             kind: ModelOverrideWarningKind::InvalidValue,
-            reason: "referenced provider does not exist or is invalid; model entry dropped"
-                .to_owned(),
         });
         return false;
     };
@@ -332,9 +316,6 @@ fn normalize_provider_model(
             model_key: Some(model_key.to_owned()),
             field: Some("provider".to_owned()),
             kind: ModelOverrideWarningKind::InvalidValue,
-            reason:
-                "provider model key must be `<provider-id>/<wire-model-id>`; model entry dropped"
-                    .to_owned(),
         });
         return false;
     };
@@ -343,8 +324,6 @@ fn normalize_provider_model(
             model_key: Some(model_key.to_owned()),
             field: Some("provider".to_owned()),
             kind: ModelOverrideWarningKind::InvalidValue,
-            reason: "provider model key does not match its provider or has no wire model id; model entry dropped"
-                .to_owned(),
         });
         return false;
     }
@@ -456,7 +435,6 @@ pub(crate) fn log_model_override_warnings(warnings: &[ModelOverrideWarning]) {
             model = warning.model_key.as_deref().unwrap_or("(section)"),
             field = warning.field.as_deref().unwrap_or("(entry)"),
             kind = ?warning.kind,
-            reason = %warning.reason,
             "model_override: skipped invalid config"
         );
     }
@@ -489,7 +467,7 @@ fn parse_model_override_table(
                     warnings.extend(unknown_field_warnings(model_key, unknown));
                     (entry, warnings)
                 }
-                Err(error) => {
+                Err(_) => {
                     // Reachable only when fields conflict jointly, e.g. an
                     // alias pair missing from `ALIASES`. Keep the model
                     // rather than dropping it.
@@ -497,9 +475,6 @@ fn parse_model_override_table(
                         model_key: Some(model_key.to_owned()),
                         field: None,
                         kind: ModelOverrideWarningKind::UnparseableEntry,
-                        reason: format!(
-                            "failed to parse after skipping invalid fields ({error}); using empty override"
-                        ),
                     });
                     (ConfigModelOverride::default(), warnings)
                 }
@@ -532,16 +507,14 @@ fn dedupe_aliases(
                     model_key: Some(model_key.to_owned()),
                     field: Some(legacy.to_owned()),
                     kind: ModelOverrideWarningKind::DuplicateAlias,
-                    reason: format!("legacy alias of {canonical}; skipped in favor of {canonical}"),
                 });
             }
-            Some(error) => {
+            Some(_) => {
                 table.remove(canonical);
                 warnings.push(ModelOverrideWarning {
                     model_key: Some(model_key.to_owned()),
                     field: Some(canonical.to_owned()),
                     kind: ModelOverrideWarningKind::InvalidValue,
-                    reason: format!("{error}; skipped in favor of {legacy}"),
                 });
             }
         }
@@ -567,7 +540,6 @@ fn unknown_field_warnings(model_key: &str, unknown: Vec<String>) -> Vec<ModelOve
             model_key: Some(model_key.to_owned()),
             field: Some(field),
             kind: ModelOverrideWarningKind::UnknownField,
-            reason: "unknown field".to_owned(),
         })
         .collect()
 }
@@ -581,12 +553,11 @@ fn prune_invalid_fields(
 ) {
     table.retain(|field, value| match field_parse_error(field, value) {
         None => true,
-        Some(error) => {
+        Some(_) => {
             warnings.push(ModelOverrideWarning {
                 model_key: Some(model_key.to_owned()),
                 field: Some(field.to_owned()),
                 kind: ModelOverrideWarningKind::InvalidValue,
-                reason: error.to_string(),
             });
             false
         }
@@ -603,7 +574,7 @@ fn field_parse_error(field: &str, value: &toml::Value) -> Option<toml::de::Error
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::agent) mod tests {
     use super::*;
     use crate::sampling::ApiBackend;
     use xai_grok_sampling_types::{
@@ -626,6 +597,127 @@ mod tests {
             models, warnings, ..
         } = parse_model_overrides(&raw);
         (models, warnings)
+    }
+
+    #[serial_test::serial]
+    pub(in crate::agent) fn assert_provider_model_acceptance_ac_09() {
+        let _env = xai_grok_test_support::EnvGuard::set(
+            "JSO_285_AC9_TOKEN",
+            "runtime-environment-secret-ac09",
+        );
+        let (_, warnings) = parse_raw(
+            r#"
+            [provider.literal]
+            base_url = "https://literal.example/v1"
+            api_key = "literal-provider-secret-ac09"
+            unknown_setting = "raw-provider-fragment-ac09"
+
+            [provider.environment]
+            base_url = "https://environment.example/v1"
+            api_key = { env = "JSO_285_AC9_TOKEN" }
+            unknown_setting = "environment-reference-fragment-ac09"
+
+            [provider.invalid]
+            base_url = "https://invalid.example/v1"
+            api_key = { env = "JSO_285_AC9_TOKEN", extra = "union-extra-secret-ac09" }
+
+            [model.ordinary]
+            api_key = "literal-model-secret-ac09"
+            env_key = { raw = "model-env-secret-ac09" }
+            reasoning_effort = "model-enum-secret-ac09"
+            future_field = "raw-model-fragment-ac09"
+
+            [model]
+            scalar = "raw-scalar-secret-ac09"
+            "#,
+        );
+        assert!(!warnings.is_empty(), "fixture must exercise warning paths");
+
+        let actual_warning_set: std::collections::HashSet<_> = warnings
+            .iter()
+            .map(|warning| {
+                (
+                    warning.model_key.clone(),
+                    warning.field.clone(),
+                    warning.kind,
+                )
+            })
+            .collect();
+        let expected_warning_set = std::collections::HashSet::from([
+            (
+                None,
+                Some("provider.literal.unknown_setting".to_owned()),
+                ModelOverrideWarningKind::UnknownField,
+            ),
+            (
+                None,
+                Some("provider.environment.unknown_setting".to_owned()),
+                ModelOverrideWarningKind::UnknownField,
+            ),
+            (
+                None,
+                Some("provider.invalid".to_owned()),
+                ModelOverrideWarningKind::InvalidValue,
+            ),
+            (
+                Some("ordinary".to_owned()),
+                Some("env_key".to_owned()),
+                ModelOverrideWarningKind::InvalidValue,
+            ),
+            (
+                Some("ordinary".to_owned()),
+                Some("reasoning_effort".to_owned()),
+                ModelOverrideWarningKind::InvalidValue,
+            ),
+            (
+                Some("ordinary".to_owned()),
+                Some("future_field".to_owned()),
+                ModelOverrideWarningKind::UnknownField,
+            ),
+            (
+                Some("scalar".to_owned()),
+                None,
+                ModelOverrideWarningKind::NotATable,
+            ),
+        ]);
+        assert_eq!(
+            actual_warning_set, expected_warning_set,
+            "every fixture warning path and category must remain observable"
+        );
+
+        let serialized = serde_json::to_value(&warnings).expect("warnings serialize");
+        for warning in serialized.as_array().expect("warning list") {
+            let keys = warning.as_object().expect("warning object").keys();
+            assert!(
+                keys.into_iter()
+                    .all(|key| matches!(key.as_str(), "modelKey" | "field" | "kind")),
+                "warning surfaces may contain only field-path components and the error category: {warning}"
+            );
+        }
+
+        let serialized = serialized.to_string();
+        let debug = format!("{warnings:?}");
+        for secret in [
+            "literal-provider-secret-ac09",
+            "raw-provider-fragment-ac09",
+            "environment-reference-fragment-ac09",
+            "union-extra-secret-ac09",
+            "literal-model-secret-ac09",
+            "model-env-secret-ac09",
+            "model-enum-secret-ac09",
+            "raw-model-fragment-ac09",
+            "raw-scalar-secret-ac09",
+            "JSO_285_AC9_TOKEN",
+            "runtime-environment-secret-ac09",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "serialized warning leaked {secret}"
+            );
+            assert!(!debug.contains(secret), "internal warning leaked {secret}");
+        }
+        assert!(!serialized.contains("api_key ="));
+        assert!(!serialized.contains("env_key ="));
     }
 
     #[test]
@@ -963,7 +1055,6 @@ mod tests {
                 model_key: Some("grok-4.5".to_owned()),
                 field: Some("future_field".to_owned()),
                 kind: ModelOverrideWarningKind::UnknownField,
-                reason: "unknown field".to_owned(),
             }]
         );
     }
@@ -1185,7 +1276,7 @@ mod tests {
             rest = after;
         }
         assert_eq!(
-            block.matches("alias").count(),
+            block.matches("#[serde(alias").count(),
             found.len(),
             "an alias on ConfigModelOverride was not recognized; write it as \
              `#[serde(alias = \"...\")]` on its own line, or update this scan"

@@ -909,16 +909,16 @@ impl acp::Agent for MvpAgent {
         let build_custom_model_id = if is_chat_kind { None } else { custom_model_id };
         let resolved_custom_model = build_custom_model_id
             .and_then(|custom_model| match self
-                .resolve_model_id(&acp::ModelId::new(custom_model))
+                .resolve_model_reference(&acp::ModelId::new(custom_model))
             {
-                Ok(model) if model.info.user_selectable => {
+                Ok((catalog_key, model)) if model.info.user_selectable => {
                     model_agent_type = Some(model.info().agent_type.clone());
                     let origin_client = self
                         .origin_client_info_from_meta(arguments.meta.as_ref());
                     session_sampling_override = Some(
                         self.prepare_sampling_config_for_model(&model, origin_client),
                     );
-                    Some(custom_model)
+                    Some(catalog_key.0.to_string())
                 }
                 Ok(_) => {
                     tracing::warn!(
@@ -984,6 +984,7 @@ impl acp::Agent for MvpAgent {
             Some(chat_model) => acp::ModelId::new(chat_model.clone()),
             None => {
                 resolved_custom_model
+                    .as_deref()
                     .map(acp::ModelId::new)
                     .unwrap_or_else(|| self.models_manager.current_model_id())
             }
@@ -1716,9 +1717,14 @@ impl acp::Agent for MvpAgent {
         }
         let persisted_model = summary.current_model_id.clone();
         let models = self.models_manager.models();
-        let available = self.models_manager.available();
+        let (available, persisted_resolution) = self
+            .models_manager
+            .persisted_model_snapshot(&persisted_model);
         self.model_unavailable_sessions.borrow_mut().remove(session_id.0.as_ref());
-        let resolved_catalog_key = resolve_catalog_key(&models, &persisted_model);
+        let resolved_catalog_key = self
+            .models_manager
+            .resolve_model_reference(&persisted_model)
+            .map(|(key, _)| key);
         tracing::debug!(
             session_id = % session_id.0, persisted = % persisted_model.0,
             resolved_catalog_key = ? resolved_catalog_key.as_ref().map(| k | k.0
@@ -1733,13 +1739,10 @@ impl acp::Agent for MvpAgent {
         } else {
             available.keys().find(|id| !id.0.starts_with("grok-build")).cloned()
         };
-        let selectable_catalog_key = selectable_catalog_key_for_persisted(
-            &models,
-            &available,
-            &persisted_model,
-        );
-        let model_id = if let Some(catalog_key) = selectable_catalog_key {
-            if catalog_key != persisted_model {
+        let model_id = if let PersistedModelResolution::Selected(ref catalog_key) =
+            persisted_resolution
+        {
+            if *catalog_key != persisted_model {
                 tracing::info!(
                     session_id = % session_id.0, persisted = % persisted_model.0,
                     catalog_key = % catalog_key.0,
@@ -1756,7 +1759,7 @@ impl acp::Agent for MvpAgent {
                     ),
                 );
             }
-            catalog_key
+            catalog_key.clone()
         } else if available.is_empty() {
             tracing::warn!(
                 session_id = % session_id.0, persisted = % persisted_model.0,
@@ -1771,8 +1774,10 @@ impl acp::Agent for MvpAgent {
                     ),
                 ),
             );
-            persisted_model
-        } else if let Some(fallback) = same_family_fallback {
+            persisted_model.clone()
+        } else if persisted_model_allows_family_fallback(&persisted_resolution)
+            && let Some(fallback) = same_family_fallback
+        {
             tracing::warn!(
                 session_id = % session_id.0, previous = % persisted_model.0, new = %
                 fallback.0,
@@ -1846,12 +1851,22 @@ impl acp::Agent for MvpAgent {
                     );
                     map
                 });
-            let _ = crate::agent::handlers::model_switch::apply(
+            if let Err(error) = crate::agent::handlers::model_switch::apply(
                     self,
                     acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)
                         .meta(restore_meta),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    session_id = % session_id.0, persisted_model = % persisted_model.0,
+                    error = ?error,
+                    "load_session: resolved model changed before exact restore; keeping session blocked"
+                );
+                self.model_unavailable_sessions
+                    .borrow_mut()
+                    .insert(session_id.0.to_string(), persisted_model.clone());
+            }
         }
         let mut response_meta_map = serde_json::Map::new();
         response_meta_map.insert("sessionId".to_string(), serde_json::json!(session_id));
@@ -2013,31 +2028,12 @@ impl acp::Agent for MvpAgent {
             .get(arguments.session_id.0.as_ref())
             .cloned();
         if let Some(unavailable_model) = latched_model {
-            let models = self.models_manager.models();
-            let available = self.models_manager.available();
-            let restore_model_id = selectable_catalog_key_for_persisted(
-                    &models,
-                    &available,
-                    &unavailable_model,
-                )
-                .unwrap_or(unavailable_model.clone());
-            if available.contains_key(&restore_model_id) {
-                tracing::info!(
-                    session_id = % arguments.session_id.0, model_id = % restore_model_id
-                    .0,
-                    "prompt: previously-unavailable model is back in the catalog; restoring it and unblocking the session"
-                );
-                xai_grok_telemetry::unified_log::info(
-                    "prompt: previously-unavailable model recovered, unblocking session",
-                    Some(arguments.session_id.0.as_ref()),
-                    Some(
-                        serde_json::json!({ "model_id" : restore_model_id.0.as_ref(), }),
-                    ),
-                );
-                self.model_unavailable_sessions
-                    .borrow_mut()
-                    .remove(arguments.session_id.0.as_ref());
-                if let Err(e) = crate::agent::handlers::model_switch::apply(
+            let (available, resolution) = self
+                .models_manager
+                .persisted_model_snapshot(&unavailable_model);
+            let restore_model_id = persisted_model_prompt_restore_key(resolution);
+            let restored = if let Some(restore_model_id) = restore_model_id {
+                match crate::agent::handlers::model_switch::apply(
                         self,
                         acp::SetSessionModelRequest::new(
                             arguments.session_id.clone(),
@@ -2046,13 +2042,35 @@ impl acp::Agent for MvpAgent {
                     )
                     .await
                 {
-                    tracing::warn!(
-                        session_id = % arguments.session_id.0, model_id = %
-                        restore_model_id.0, error = ? e,
-                        "prompt: failed to restore previously-unavailable model; continuing with the session's current model"
-                    );
+                    Ok(_) => {
+                        tracing::info!(
+                            session_id = % arguments.session_id.0, model_id = % restore_model_id
+                            .0,
+                            "prompt: previously-unavailable model is back in the catalog; restoring it and unblocking the session"
+                        );
+                        xai_grok_telemetry::unified_log::info(
+                            "prompt: previously-unavailable model recovered, unblocking session",
+                            Some(arguments.session_id.0.as_ref()),
+                            Some(serde_json::json!({ "model_id" : restore_model_id.0.as_ref(), })),
+                        );
+                        self.model_unavailable_sessions
+                            .borrow_mut()
+                            .remove(arguments.session_id.0.as_ref());
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id = % arguments.session_id.0, model_id = %
+                            restore_model_id.0, error = ? e,
+                            "prompt: failed to restore previously-unavailable model; keeping the session blocked"
+                        );
+                        false
+                    }
                 }
             } else {
+                false
+            };
+            if !restored {
                 tracing::warn!(
                     session_id = % arguments.session_id.0, unavailable_model = %
                     unavailable_model.0, available_count = available.len(),
@@ -3116,15 +3134,16 @@ impl acp::Agent for MvpAgent {
     }
     async fn set_session_model(
         &self,
-        args: acp::SetSessionModelRequest,
+        mut args: acp::SetSessionModelRequest,
     ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-        let model = self.resolve_model_id(&args.model_id)?;
+        let (canonical_key, model) = self.resolve_model_reference(&args.model_id)?;
         if !model.info.user_selectable {
             return Err(
                 acp::Error::invalid_params()
                     .data("This model isn't allowed by your allowed_models setting."),
-            );
+                );
         }
+        args.model_id = canonical_key;
         let session_id = args.session_id.clone();
         let res = crate::agent::handlers::model_switch::apply(self, args).await;
         if res.is_ok()

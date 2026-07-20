@@ -1,6 +1,7 @@
-//! Applies a model switch to a session — the ungated path. `set_session_model`
-//! enforces the `allowed_models` gate before delegating here; internal callers
-//! (`new_session`, `load_session`) call `apply` directly.
+//! Applies a canonical catalog-key model switch to a session. `set_session_model`
+//! resolves aliases and enforces `allowed_models` before delegating here; this
+//! boundary performs an exact-key lookup and repeats the gate defensively for
+//! internal callers and config reloads across await points.
 use crate::agent::config;
 use crate::agent::mvp_agent::{
     MvpAgent, agent_name_after_model_switch, harnesses_are_compatible, resolve_required_agent_type,
@@ -9,7 +10,7 @@ use crate::session::SessionCommand;
 use agent_client_protocol::{self as acp};
 use tokio::sync::oneshot;
 use xai_grok_sampling_types::parse_reasoning_effort_meta;
-/// Apply a model switch to a session (no gate — `set_session_model` gates first).
+/// Apply a model switch using an already-canonical catalog key.
 pub(crate) async fn apply(
     agent: &MvpAgent,
     args: acp::SetSessionModelRequest,
@@ -31,7 +32,14 @@ pub(crate) async fn apply(
         .session_handle_waiting_for_load(&session_id)
         .await
         .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
-    let model = agent.resolve_model_id(&model_id)?;
+    let model = agent
+        .models_manager
+        .model_entry_by_catalog_key(&model_id)
+        .ok_or_else(|| acp::Error::invalid_params().data("unknown model id"))?;
+    if !model.info.user_selectable {
+        return Err(acp::Error::invalid_params()
+            .data("This model isn't allowed by your allowed_models setting."));
+    }
     let use_concise = model.info().use_concise;
     let session_default = handle
         .session_default_agent_profile

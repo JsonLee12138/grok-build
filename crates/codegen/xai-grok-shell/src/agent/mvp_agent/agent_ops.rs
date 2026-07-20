@@ -1063,28 +1063,35 @@ impl MvpAgent {
         &self,
         requested: &acp::ModelId,
     ) -> Result<ModelEntry, acp::Error> {
+        self.resolve_model_reference(requested)
+            .map(|(_, entry)| entry)
+    }
+
+    /// Resolve a user-provided reference while retaining the canonical catalog
+    /// key that callers must store instead of an alias.
+    pub(crate) fn resolve_model_reference(
+        &self,
+        requested: &acp::ModelId,
+    ) -> Result<(acp::ModelId, ModelEntry), acp::Error> {
         let requested_str = requested.0.as_ref();
-        let models = self.models_manager.models();
-        let Some(catalog_key) = resolve_catalog_key(&models, requested) else {
+        let Some((catalog_key, entry)) = self.models_manager.resolve_model_reference(requested)
+        else {
             tracing::debug!(
-                requested = % requested_str, model_count = models.len(),
+                requested = % requested_str,
                 "resolve_model_id: unknown model id (not in models() by key or .model field)"
             );
             return Err(acp::Error::invalid_params().data("unknown model id"));
         };
-        let entry = models
-            .get(catalog_key.0.as_ref())
-            .expect("resolve_catalog_key returns a key present in models");
         let match_kind = if catalog_key.0.as_ref() == requested_str {
             "map key"
         } else {
-            "model field scan"
+            "alias or model field scan"
         };
         tracing::debug!(
             "resolve_model_id: matched by {}: requested={} model={}", match_kind,
             requested_str, entry.info.model
         );
-        Ok(entry.clone())
+        Ok((catalog_key, entry))
     }
     pub(crate) fn prepare_sampling_config_for_model(
         &self,
@@ -2284,10 +2291,10 @@ impl MvpAgent {
         session_id: Option<&acp::SessionId>,
         state: &acp::SessionModelState,
     ) -> Vec<session_config::SessionConfigOption> {
-        let model_id = resolve_catalog_key(
-                &self.models_manager.models(),
-                &state.current_model_id,
-            )
+        let model_id = self
+            .models_manager
+            .resolve_model_reference(&state.current_model_id)
+            .map(|(key, _)| key)
             .unwrap_or_else(|| state.current_model_id.clone());
         let supports_effort = self
             .models_manager
@@ -3201,8 +3208,8 @@ impl MvpAgent {
         {
             xai_grok_agent::config::ModelOverride::Override(id) => {
                 let mid = acp::ModelId::new(Arc::from(id.as_str()));
-                match self.resolve_model_id(&mid) {
-                    Ok(entry) => Some((mid, entry)),
+                match self.resolve_model_reference(&mid) {
+                    Ok((canonical_key, entry)) => Some((canonical_key, entry)),
                     Err(_) => {
                         tracing::warn!(
                             agent = % agent_definition.name, model = % id,

@@ -122,6 +122,20 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
         let (mut entry, mut entry_warnings) =
             parse_model_override_table(model_key, parsed_entry_table);
         entry.credentials_are_exclusive = credentials_are_exclusive;
+        if entry
+            .alias
+            .as_deref()
+            .is_some_and(|alias| !is_valid_alias(alias))
+        {
+            entry.alias = None;
+            entry_warnings.push(ModelOverrideWarning {
+                model_key: Some(model_key.clone()),
+                field: Some("alias".to_owned()),
+                kind: ModelOverrideWarningKind::InvalidValue,
+                reason: "alias must use non-empty ASCII letters, digits, '.', '_', or '-'; alias ignored"
+                    .to_owned(),
+            });
+        }
         // Provider references have stricter fail-closed validation below. Drop
         // the generic field-level parse warning so an invalid non-string
         // reference produces one stable, value-free warning.
@@ -237,6 +251,13 @@ fn is_valid_provider_id(provider_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+fn is_valid_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 fn parse_provider_model_credentials(
     model_key: &str,
     table: &toml::map::Map<String, toml::Value>,
@@ -306,7 +327,7 @@ fn normalize_provider_model(
         });
         return false;
     };
-    let Some((key_provider, wire_model_id)) = model_key.split_once('/') else {
+    let Some((key_provider, key_model_id)) = model_key.split_once('/') else {
         warnings.push(ModelOverrideWarning {
             model_key: Some(model_key.to_owned()),
             field: Some("provider".to_owned()),
@@ -317,7 +338,7 @@ fn normalize_provider_model(
         });
         return false;
     };
-    if key_provider != provider_id || wire_model_id.is_empty() {
+    if key_provider != provider_id || key_model_id.is_empty() {
         warnings.push(ModelOverrideWarning {
             model_key: Some(model_key.to_owned()),
             field: Some("provider".to_owned()),
@@ -345,7 +366,9 @@ fn normalize_provider_model(
     }
 
     entry.provider = Some(provider_id.to_owned());
-    entry.model = Some(wire_model_id.to_owned());
+    if entry.model.is_none() {
+        entry.model = Some(key_model_id.to_owned());
+    }
     if entry.base_url.is_none() {
         entry.base_url.clone_from(&provider.base_url);
     }
@@ -1068,6 +1091,7 @@ mod tests {
     fn fully_populated_override() -> ConfigModelOverride {
         ConfigModelOverride {
             provider: None,
+            alias: Some("fast".into()),
             model: Some("m".into()),
             base_url: Some("https://example.com".into()),
             name: Some("Model M".into()),

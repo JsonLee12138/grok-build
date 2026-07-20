@@ -1331,6 +1331,9 @@ pub struct Config {
     /// `[provider.*]` definitions referenced by provider-backed model entries.
     #[serde(skip)]
     pub providers: IndexMap<String, ProviderConfig>,
+    /// Derived alias lookup state. Aliases never become catalog entries.
+    #[serde(skip)]
+    pub model_aliases: AliasIndex,
     /// Warnings from `[model.*]` parsing; surfaced by `grok inspect`.
     #[serde(skip)]
     pub model_override_warnings: Vec<super::config_model_override_parse::ModelOverrideWarning>,
@@ -1760,6 +1763,7 @@ impl Default for Config {
             auto_mode: AutoModeConfig::default(),
             config_models: IndexMap::new(),
             providers: IndexMap::new(),
+            model_aliases: AliasIndex::default(),
             model_override_warnings: Vec::new(),
             grok_com_config: GrokComConfig::default(),
             shortcuts: None,
@@ -1924,6 +1928,7 @@ impl Config {
         }
         config.config_models = config_models;
         config.providers = providers;
+        config.model_aliases = AliasIndex::from_models(&config.config_models);
         config.model_override_warnings = model_override_warnings;
         if config.grok_com_config.oidc.is_none() {
             config.grok_com_config.oidc = OidcAuthConfig::from_env();
@@ -3375,9 +3380,66 @@ pub fn find_model_by_id<'a>(
     models: &'a IndexMap<String, ModelEntry>,
     model_id: &str,
 ) -> Option<&'a ModelEntry> {
-    models
-        .get(model_id)
-        .or_else(|| models.values().find(|m| m.model == model_id))
+    resolve_model_reference(models, &AliasIndex::default(), model_id).map(|(_, entry)| entry)
+}
+
+/// A configuration-derived, read-only alias index kept outside the model catalog.
+#[derive(Clone, Debug, Default)]
+pub struct AliasIndex {
+    pub(crate) targets: IndexMap<String, String>,
+    /// Reserved for aliases that must fail closed instead of falling through
+    /// to an identically named catalog key or wire slug.
+    pub(crate) blocked: std::collections::HashSet<String>,
+}
+
+impl AliasIndex {
+    fn from_models(models: &IndexMap<String, ConfigModelOverride>) -> Self {
+        let mut index = Self::default();
+        for (catalog_key, model) in models {
+            if model.provider.is_none() {
+                continue;
+            }
+            let Some(alias) = &model.alias else {
+                continue;
+            };
+            if index.blocked.contains(alias) {
+                continue;
+            }
+            if index.targets.shift_remove(alias).is_some() {
+                index.blocked.insert(alias.clone());
+            } else {
+                index.targets.insert(alias.clone(), catalog_key.clone());
+            }
+        }
+        index
+    }
+}
+
+/// Resolve `requested` in the single supported order: alias, exact catalog
+/// key, then the existing wire-model slug compatibility scan.
+pub fn resolve_model_reference<'a>(
+    entries: &'a IndexMap<String, ModelEntry>,
+    aliases: &AliasIndex,
+    requested: &str,
+) -> Option<(&'a str, &'a ModelEntry)> {
+    if aliases.blocked.contains(requested) {
+        return None;
+    }
+    if let Some(target) = aliases.targets.get(requested) {
+        return entries
+            .get_key_value(target)
+            .map(|(key, entry)| (key.as_str(), entry));
+    }
+    entries
+        .get_key_value(requested)
+        .map(|(key, entry)| (key.as_str(), entry))
+        .or_else(|| {
+            entries
+                .iter()
+                .rev()
+                .find(|(_, entry)| entry.info.model == requested)
+                .map(|(key, entry)| (key.as_str(), entry))
+        })
 }
 /// Whether the EFFECTIVE Auto-mode classifier model supports reasoning effort:
 /// the model actually routed to (`aux_model` when the aux sampler resolved) else
@@ -3646,6 +3708,8 @@ pub struct ConfigModelOverride {
     /// Explicit provider reference. Provider-backed keys must be
     /// `<provider-id>/<wire-model-id>`.
     pub provider: Option<String>,
+    /// Optional case-sensitive business identifier, resolved outside the catalog.
+    pub alias: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub name: Option<String>,
@@ -4506,7 +4570,7 @@ pub fn try_resolve_model_credentials(
         .map_err(|e| tracing::warn!(error = % e, "config parse failed for credential resolution"))
         .ok()?;
     let models = resolve_model_list(&cfg, None);
-    let entry = find_model_by_id(&models, model_id)?;
+    let (_, entry) = resolve_model_reference(&models, &cfg.model_aliases, model_id)?;
     let mut credentials = resolve_credentials(entry, session_key);
     enforce_disable_api_key_auth(
         &mut credentials,
@@ -4570,7 +4634,9 @@ fn with_resolved_model<T>(model_id: &str, f: impl FnOnce(ModelLookup) -> T) -> T
         return f(ModelLookup::ConfigUnavailable);
     };
     let models = resolve_model_list(&cfg, None);
-    f(ModelLookup::Loaded(find_model_by_id(&models, model_id)))
+    f(ModelLookup::Loaded(
+        resolve_model_reference(&models, &cfg.model_aliases, model_id).map(|(_, entry)| entry),
+    ))
 }
 /// Resolve a standalone `SamplerConfig` for an auxiliary model slug (image
 /// description, session summary, ...), resolved through the catalog so a
@@ -7751,6 +7817,90 @@ reasoning_effort = "low"
         .unwrap();
         let cfg = Config::new_from_toml_cfg(&raw).unwrap();
         assert!(!resolve_model_list(&cfg, None).contains_key("acme/demo-v1"));
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_10() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            None,
+        );
+
+        let (catalog_key, entry) =
+            resolve_model_reference(&catalog, &cfg.model_aliases, "acme/demo-v1")
+                .expect("canonical model reference must resolve");
+        assert_eq!(catalog_key, "acme/demo-v1");
+        assert_eq!(entry.info.model, "demo-v1");
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_11() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/demo-v1"]
+            provider = "acme"
+            alias = "fast"
+            "#,
+            None,
+        );
+
+        let (catalog_key, entry) = resolve_model_reference(&catalog, &cfg.model_aliases, "fast")
+            .expect("alias must resolve");
+        assert_eq!(catalog_key, "acme/demo-v1");
+        assert_eq!(entry.info.model, "demo-v1");
+        assert!(
+            !catalog.contains_key("fast"),
+            "alias must stay outside catalog"
+        );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_11_direct_model_alias_is_not_indexed() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [model."direct-demo"]
+            model = "upstream-direct"
+            alias = "direct-fast"
+            "#,
+            None,
+        );
+
+        assert!(catalog.contains_key("direct-demo"));
+        assert!(!catalog.contains_key("direct-fast"));
+        assert!(
+            resolve_model_reference(&catalog, &cfg.model_aliases, "direct-fast").is_none(),
+            "direct Model aliases are outside the Provider alias contract"
+        );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_14() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/demo-v1"]
+            provider = "acme"
+            model = "upstream-demo"
+            alias = "fast"
+            "#,
+            None,
+        );
+
+        for requested in ["acme/demo-v1", "fast"] {
+            let (catalog_key, entry) =
+                resolve_model_reference(&catalog, &cfg.model_aliases, requested)
+                    .expect("canonical key and alias must resolve");
+            assert_eq!(catalog_key, "acme/demo-v1");
+            assert_eq!(entry.info.model, "upstream-demo");
+        }
     }
 
     #[test]

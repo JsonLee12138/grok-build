@@ -1906,7 +1906,7 @@ impl Config {
             providers,
             warnings: model_override_warnings,
         } = super::config_model_override_parse::parse_model_overrides(raw_config);
-        super::config_model_override_parse::log_model_override_warnings(&model_override_warnings);
+        let mut model_override_warnings = model_override_warnings;
         let mut base = toml::Value::try_from(Self::default()).map_err(|e| e.to_string())?;
         if let toml::Value::Table(ref mut t) = base {
             t.remove("model");
@@ -1928,8 +1928,12 @@ impl Config {
         }
         config.config_models = config_models;
         config.providers = providers;
-        config.model_aliases = AliasIndex::from_models(&config.config_models);
+        config.model_aliases =
+            AliasIndex::from_models(&config.config_models, &mut model_override_warnings);
         config.model_override_warnings = model_override_warnings;
+        super::config_model_override_parse::log_model_override_warnings(
+            &config.model_override_warnings,
+        );
         if config.grok_com_config.oidc.is_none() {
             config.grok_com_config.oidc = OidcAuthConfig::from_env();
         }
@@ -3397,25 +3401,105 @@ pub struct AliasIndex {
 }
 
 impl AliasIndex {
-    fn from_models(models: &IndexMap<String, ConfigModelOverride>) -> Self {
+    fn from_models(
+        models: &IndexMap<String, ConfigModelOverride>,
+        warnings: &mut Vec<super::config_model_override_parse::ModelOverrideWarning>,
+    ) -> Self {
+        use super::config_model_override_parse::{ModelOverrideWarning, ModelOverrideWarningKind};
+
         let mut index = Self::default();
         for (catalog_key, model) in models {
-            if model.provider.is_none() {
+            // Direct Model aliases are outside the Provider alias contract,
+            // including when the Direct Model itself was rejected.
+            if !model.provider_alias_eligible && model.provider.is_none() {
+                continue;
+            }
+            if model.reject_model {
+                if let Some(alias) = &model.alias {
+                    index.targets.shift_remove(alias);
+                    index.blocked.insert(alias.clone());
+                    let warning = ModelOverrideWarning {
+                        model_key: Some(catalog_key.clone()),
+                        field: Some("alias".to_owned()),
+                        kind: ModelOverrideWarningKind::InvalidValue,
+                    };
+                    if !warnings.contains(&warning) {
+                        warnings.push(warning);
+                    }
+                }
                 continue;
             }
             let Some(alias) = &model.alias else {
                 continue;
             };
+            if !super::config_model_override_parse::is_valid_alias(alias) {
+                index.targets.shift_remove(alias);
+                index.blocked.insert(alias.clone());
+                let warning = ModelOverrideWarning {
+                    model_key: Some(catalog_key.clone()),
+                    field: Some("alias".to_owned()),
+                    kind: ModelOverrideWarningKind::InvalidValue,
+                };
+                if !warnings.contains(&warning) {
+                    warnings.push(warning);
+                }
+                continue;
+            }
             if index.blocked.contains(alias) {
+                warnings.push(ModelOverrideWarning {
+                    model_key: Some(catalog_key.clone()),
+                    field: Some("alias".to_owned()),
+                    kind: ModelOverrideWarningKind::DuplicateAlias,
+                });
                 continue;
             }
             if index.targets.shift_remove(alias).is_some() {
                 index.blocked.insert(alias.clone());
+                warnings.push(ModelOverrideWarning {
+                    model_key: Some(catalog_key.clone()),
+                    field: Some("alias".to_owned()),
+                    kind: ModelOverrideWarningKind::DuplicateAlias,
+                });
             } else {
                 index.targets.insert(alias.clone(), catalog_key.clone());
             }
         }
         index
+    }
+}
+
+impl Config {
+    /// Replace alias-shadow diagnostics using the catalog snapshot that will
+    /// actually be published. Static parsing cannot know a remote-only catalog
+    /// and must not report bundled entries that a prefetch replaces.
+    pub(crate) fn refresh_alias_shadow_warnings(&mut self, catalog: &IndexMap<String, ModelEntry>) {
+        let aliases = self.model_aliases.clone();
+        self.refresh_alias_shadow_warnings_for(catalog, &aliases);
+    }
+
+    pub(crate) fn refresh_alias_shadow_warnings_for(
+        &mut self,
+        catalog: &IndexMap<String, ModelEntry>,
+        aliases: &AliasIndex,
+    ) {
+        use super::config_model_override_parse::{ModelOverrideWarning, ModelOverrideWarningKind};
+
+        self.model_override_warnings
+            .retain(|warning| warning.kind != ModelOverrideWarningKind::AliasShadow);
+        let mut added = Vec::new();
+        for (alias, target) in &aliases.targets {
+            if catalog.contains_key(alias)
+                || catalog.values().any(|entry| entry.info.model == *alias)
+            {
+                added.push(ModelOverrideWarning {
+                    model_key: Some(target.clone()),
+                    field: Some("alias".to_owned()),
+                    kind: ModelOverrideWarningKind::AliasShadow,
+                });
+            }
+        }
+        super::config_model_override_parse::log_model_override_warnings(&added);
+        self.model_override_warnings.extend(added);
     }
 }
 
@@ -3762,6 +3846,10 @@ pub struct ConfigModelOverride {
     /// removes any default/prefetched entry with the same key.
     #[serde(skip)]
     pub(crate) reject_model: bool,
+    /// Raw entry contained a `provider` field, even when its value could not
+    /// be normalized into `provider`.
+    #[serde(skip)]
+    pub(crate) provider_alias_eligible: bool,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -7401,8 +7489,9 @@ reasoning_effort = "low"
         prefetched: Option<IndexMap<String, ModelEntry>>,
     ) -> (Config, IndexMap<String, ModelEntry>) {
         let raw: toml::Value = toml::from_str(toml_str).expect("test TOML should parse");
-        let cfg = Config::new_from_toml_cfg(&raw).expect("config should parse");
+        let mut cfg = Config::new_from_toml_cfg(&raw).expect("config should parse");
         let resolved = resolve_model_list(&cfg, prefetched);
+        cfg.refresh_alias_shadow_warnings(&resolved);
         (cfg, resolved)
     }
 
@@ -7878,6 +7967,267 @@ reasoning_effort = "low"
             resolve_model_reference(&catalog, &cfg.model_aliases, "direct-fast").is_none(),
             "direct Model aliases are outside the Provider alias contract"
         );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_12() {
+        use super::super::config_model_override_parse::ModelOverrideWarningKind;
+
+        let replaced_default = default_model_entries(&EndpointsConfig::default())
+            .into_keys()
+            .next()
+            .expect("bundled catalog is non-empty");
+        let mut prefetched = IndexMap::new();
+        prefetched.insert(
+            "shadow-key".to_owned(),
+            test_model_entry(
+                "remote-key-wire",
+                "https://remote.example/v1",
+                None,
+                None,
+                None,
+            ),
+        );
+        prefetched.insert(
+            "remote-wire-entry".to_owned(),
+            test_model_entry("shadow-wire", "https://remote.example/v1", None, None, None),
+        );
+        let (cfg, catalog) = resolve_models_from_toml(
+            &format!(
+                r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+
+            [model."acme/key-target"]
+            provider = "acme"
+            alias = "shadow-key"
+
+            [model."acme/wire-target"]
+            provider = "acme"
+            alias = "shadow-wire"
+
+            [model."acme/replaced-default-target"]
+            provider = "acme"
+            alias = "{replaced_default}"
+            "#
+            ),
+            Some(prefetched),
+        );
+
+        for (alias, expected_key) in [
+            ("shadow-key", "acme/key-target"),
+            ("shadow-wire", "acme/wire-target"),
+        ] {
+            let (catalog_key, _) = resolve_model_reference(&catalog, &cfg.model_aliases, alias)
+                .expect("a shadowing alias must resolve before a catalog key or wire slug");
+            assert_eq!(catalog_key, expected_key);
+        }
+        assert_eq!(
+            cfg.model_override_warnings
+                .iter()
+                .filter(|warning| {
+                    warning.kind == ModelOverrideWarningKind::AliasShadow
+                        && warning.field.as_deref() == Some("alias")
+                })
+                .count(),
+            2
+        );
+        assert!(
+            !cfg.model_override_warnings.iter().any(|warning| {
+                warning.kind == ModelOverrideWarningKind::AliasShadow
+                    && warning.model_key.as_deref() == Some("acme/replaced-default-target")
+            }),
+            "a bundled model replaced by the remote snapshot must not trigger a stale warning"
+        );
+        let rendered = serde_json::to_string(&cfg.model_override_warnings).unwrap();
+        assert!(!rendered.contains("shadow-key"));
+        assert!(!rendered.contains("shadow-wire"));
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_13() {
+        use super::super::config_model_override_parse::ModelOverrideWarningKind;
+
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+
+            [model."acme/duplicate-a"]
+            provider = "acme"
+            alias = "blocked-key"
+
+            [model."acme/duplicate-b"]
+            provider = "acme"
+            alias = "blocked-key"
+
+            [model."blocked-key"]
+            model = "direct-fallback"
+
+            [model."missing/invalid-target"]
+            provider = "missing"
+            alias = "blocked-wire"
+
+            [model."direct-wire-fallback"]
+            model = "blocked-wire"
+
+            [model."acme/invalid-credential-target"]
+            provider = "acme"
+            alias = "blocked-credential-wire"
+            api_key = { env = "VALID_ENV", extra = "never-log-this-alias-secret" }
+
+            [model."direct-credential-fallback"]
+            model = "blocked-credential-wire"
+
+            [model."acme/invalid-alias-exact"]
+            provider = "acme"
+            alias = "invalid exact"
+
+            [model."invalid exact"]
+            model = "direct-invalid-exact"
+
+            [model."acme/invalid-alias-wire"]
+            provider = "acme"
+            alias = "invalid/wire"
+
+            [model."direct-invalid-wire"]
+            model = "invalid/wire"
+
+            [model."rejected-direct-exact-source"]
+            alias = "direct-stays-exact"
+            env_key = "REJECTED_DIRECT_EXACT_ENV"
+
+            [model."direct-stays-exact"]
+            model = "direct-stays-exact-wire"
+
+            [model."rejected-direct-wire-source"]
+            alias = "direct-stays-wire"
+            env_key = "REJECTED_DIRECT_WIRE_ENV"
+
+            [model."direct-stays-wire-entry"]
+            model = "direct-stays-wire"
+
+            [model."raw-provider-invalid-exact-source"]
+            provider = 7
+            alias = "raw-provider-blocked-exact"
+
+            [model."raw-provider-blocked-exact"]
+            model = "raw-provider-exact-wire"
+
+            [model."raw-provider-invalid-wire-source"]
+            provider = 7
+            alias = "raw-provider-blocked-wire"
+
+            [model."raw-provider-wire-fallback"]
+            model = "raw-provider-blocked-wire"
+            "#,
+            None,
+        );
+
+        for requested in [
+            "blocked-key",
+            "blocked-wire",
+            "blocked-credential-wire",
+            "invalid exact",
+            "invalid/wire",
+            "raw-provider-blocked-exact",
+            "raw-provider-blocked-wire",
+        ] {
+            assert!(
+                resolve_model_reference(&catalog, &cfg.model_aliases, requested).is_none(),
+                "a blocked alias must not fall through to the same-name key or wire slug"
+            );
+            assert!(!cfg.model_aliases.targets.contains_key(requested));
+            assert!(cfg.model_aliases.blocked.contains(requested));
+        }
+        for (requested, expected_key) in [
+            ("direct-stays-exact", "direct-stays-exact"),
+            ("direct-stays-wire", "direct-stays-wire-entry"),
+        ] {
+            let (catalog_key, _) = resolve_model_reference(&catalog, &cfg.model_aliases, requested)
+                .expect("a rejected Direct Model alias must remain outside the alias contract");
+            assert_eq!(catalog_key, expected_key);
+            assert!(!cfg.model_aliases.blocked.contains(requested));
+        }
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.kind == ModelOverrideWarningKind::DuplicateAlias
+                && warning.field.as_deref() == Some("alias")
+        }));
+        let rendered = serde_json::to_string(&cfg.model_override_warnings).unwrap();
+        assert!(!rendered.contains("never-log-this-alias-secret"));
+        assert!(!rendered.contains("invalid exact"));
+        assert!(!rendered.contains("invalid/wire"));
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.kind == ModelOverrideWarningKind::InvalidValue
+                && warning.model_key.as_deref() == Some("missing/invalid-target")
+                && warning.field.as_deref() == Some("alias")
+        }));
+
+        let parse = |source: &str| {
+            let raw: toml::Value = toml::from_str(source).unwrap();
+            Config::new_from_toml_cfg(&raw).unwrap()
+        };
+        let target_cfg = parse(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/reload-target"]
+            provider = "acme"
+            alias = "reload-name"
+            [model."reload-name"]
+            model = "direct-reload-fallback"
+            "#,
+        );
+        let blocked_cfg = parse(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/reload-a"]
+            provider = "acme"
+            alias = "reload-name"
+            [model."acme/reload-b"]
+            provider = "acme"
+            alias = "reload-name"
+            [model."reload-name"]
+            model = "direct-reload-fallback"
+            "#,
+        );
+        let manager = crate::agent::models::ModelsManager::default();
+        manager.apply_config(blocked_cfg.clone());
+        assert!(
+            manager
+                .resolve_model_reference(&acp::ModelId::new("reload-name"))
+                .is_none()
+        );
+        manager.apply_config(target_cfg.clone());
+        assert_eq!(
+            manager
+                .resolve_model_reference(&acp::ModelId::new("reload-name"))
+                .map(|(key, _)| key),
+            Some(acp::ModelId::new("acme/reload-target"))
+        );
+
+        let writer_manager = manager.clone();
+        let writer = std::thread::spawn(move || {
+            for iteration in 0..64 {
+                writer_manager.apply_config(if iteration % 2 == 0 {
+                    blocked_cfg.clone()
+                } else {
+                    target_cfg.clone()
+                });
+            }
+        });
+        for _ in 0..1024 {
+            let resolved = manager.resolve_model_reference(&acp::ModelId::new("reload-name"));
+            assert!(
+                resolved.is_none()
+                    || resolved
+                        .as_ref()
+                        .is_some_and(|(key, _)| key.0.as_ref() == "acme/reload-target"),
+                "reload must publish alias targets and blocked names atomically"
+            );
+        }
+        writer.join().unwrap();
     }
 
     #[test]

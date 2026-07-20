@@ -198,8 +198,9 @@ impl ModelsManager {
         models: IndexMap<String, ModelEntry>,
         current_model_id: acp::ModelId,
         auth_manager: Arc<AuthManager>,
-        cfg: config::Config,
+        mut cfg: config::Config,
     ) -> Self {
+        cfg.refresh_alias_shadow_warnings(&models);
         let has_session = auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, has_session);
         let current_reasoning_effort = cfg.models.default_reasoning_effort;
@@ -333,7 +334,6 @@ impl ModelsManager {
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
         *self.inner.fetch_auth.write() =
             ModelFetchAuth::resolve(&new_config.endpoints, has_session);
-        *self.inner.cfg.write() = new_config.clone();
         // Recompute the prompt-block flag so a corrective reload unblocks.
         if has_real_catalog {
             let excludes_all = allowlist_matches_nothing(&new_config, &new_catalog);
@@ -341,7 +341,11 @@ impl ModelsManager {
                 .allowlist_excludes_all
                 .store(excludes_all, Ordering::Relaxed);
         }
-        self.replace_catalog(new_catalog, new_config.model_aliases.clone());
+        self.replace_catalog(
+            new_catalog,
+            new_config.model_aliases.clone(),
+            Some(new_config.clone()),
+        );
 
         // A preferred-model flip caused only by a campaign overlay appearing or
         // disappearing must not yank an in-flight session whose current model is
@@ -626,6 +630,7 @@ impl ModelsManager {
         self.replace_catalog(
             resolve_model_catalog(cfg, prefetched),
             cfg.model_aliases.clone(),
+            None,
         );
     }
 
@@ -633,9 +638,19 @@ impl ModelsManager {
     /// All alias-aware readers acquire these locks in the same models→aliases
     /// order, so they cannot observe a new alias index with an old catalog (or
     /// vice versa).
-    fn replace_catalog(&self, catalog: IndexMap<String, ModelEntry>, aliases: config::AliasIndex) {
+    fn replace_catalog(
+        &self,
+        catalog: IndexMap<String, ModelEntry>,
+        aliases: config::AliasIndex,
+        new_config: Option<config::Config>,
+    ) {
         let mut models_guard = self.inner.models.write();
         let mut aliases_guard = self.inner.aliases.write();
+        let mut cfg_guard = self.inner.cfg.write();
+        if let Some(new_config) = new_config {
+            *cfg_guard = new_config;
+        }
+        cfg_guard.refresh_alias_shadow_warnings_for(&catalog, &aliases);
         *models_guard = catalog;
         *aliases_guard = aliases;
     }
@@ -999,7 +1014,7 @@ impl ModelsManager {
     /// Wipe in-memory state so a previous identity's catalog doesn't leak.
     fn clear(&self) {
         *self.inner.prefetched.write() = None;
-        self.replace_catalog(IndexMap::new(), config::AliasIndex::default());
+        self.replace_catalog(IndexMap::new(), config::AliasIndex::default(), None);
         *self.inner.etag.write() = None;
         *self.inner.has_fetched_real_catalog.write() = false;
         self.inner
@@ -2180,6 +2195,110 @@ mod tests {
             !entry.info.user_selectable,
             "the canonical target returned after rebinding must still pass the caller's selectable gate"
         );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_12_remote_snapshot_refreshes_shadow_warning() {
+        use crate::agent::config_model_override_parse::ModelOverrideWarningKind;
+
+        let mgr = test_manager();
+        let cfg = config_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/target"]
+            provider = "acme"
+            alias = "remote-shadow"
+            "#,
+        );
+        mgr.apply_config(cfg.clone());
+        assert!(
+            !mgr.inner
+                .cfg
+                .read()
+                .model_override_warnings
+                .iter()
+                .any(|warning| warning.kind == ModelOverrideWarningKind::AliasShadow)
+        );
+
+        let remote_collision = make_prefetched(&["remote-shadow"]);
+        assert!(mgr.apply_refresh_result(&cfg, Some(remote_collision), None));
+        assert!(
+            mgr.inner
+                .cfg
+                .read()
+                .model_override_warnings
+                .iter()
+                .any(|warning| {
+                    warning.kind == ModelOverrideWarningKind::AliasShadow
+                        && warning.model_key.as_deref() == Some("acme/target")
+                        && warning.field.as_deref() == Some("alias")
+                })
+        );
+
+        let remote_replacement = make_prefetched(&["remote-other"]);
+        assert!(mgr.apply_refresh_result(&cfg, Some(remote_replacement), None));
+        assert!(
+            !mgr.inner
+                .cfg
+                .read()
+                .model_override_warnings
+                .iter()
+                .any(|warning| warning.kind == ModelOverrideWarningKind::AliasShadow),
+            "a later snapshot must remove stale shadow warnings"
+        );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_12_concurrent_snapshot_keeps_warning_consistent() {
+        use crate::agent::config_model_override_parse::ModelOverrideWarningKind;
+
+        let mgr = test_manager();
+        let cfg = config_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/target"]
+            provider = "acme"
+            alias = "snapshot-shadow"
+            "#,
+        );
+        let collision_catalog =
+            resolve_model_catalog(&cfg, Some(make_prefetched(&["snapshot-shadow"])));
+        let clear_catalog = resolve_model_catalog(&cfg, Some(make_prefetched(&["snapshot-other"])));
+
+        let writer_mgr = mgr.clone();
+        let writer_cfg = cfg.clone();
+        let writer = std::thread::spawn(move || {
+            for iteration in 0..128 {
+                let catalog = if iteration % 2 == 0 {
+                    collision_catalog.clone()
+                } else {
+                    clear_catalog.clone()
+                };
+                writer_mgr.replace_catalog(
+                    catalog,
+                    writer_cfg.model_aliases.clone(),
+                    Some(writer_cfg.clone()),
+                );
+            }
+        });
+
+        for _ in 0..2048 {
+            let models = mgr.inner.models.read();
+            let aliases = mgr.inner.aliases.read();
+            let live_cfg = mgr.inner.cfg.read();
+            let collision = aliases.targets.keys().any(|alias| {
+                models.contains_key(alias)
+                    || models.values().any(|entry| entry.info.model == *alias)
+            });
+            let warned = live_cfg
+                .model_override_warnings
+                .iter()
+                .any(|warning| warning.kind == ModelOverrideWarningKind::AliasShadow);
+            assert_eq!(warned, collision, "warning and catalog snapshots diverged");
+        }
+        writer.join().unwrap();
     }
 
     #[test]

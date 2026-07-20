@@ -28,6 +28,8 @@ pub enum ModelOverrideWarningKind {
     InvalidValue,
     /// Legacy alias given alongside its canonical key; alias skipped.
     DuplicateAlias,
+    /// Alias shadows an existing catalog key or wire-model slug; alias wins.
+    AliasShadow,
     /// Entry value is not a TOML table; entry dropped.
     NotATable,
     /// Entry failed to parse even after skipping invalid fields; the model
@@ -41,6 +43,7 @@ impl ModelOverrideWarningKind {
             Self::UnknownField => "unknown-field",
             Self::InvalidValue => "invalid-value",
             Self::DuplicateAlias => "duplicate-alias",
+            Self::AliasShadow => "alias-shadow",
             Self::NotATable => "not-a-table",
             Self::UnparseableEntry => "unparseable-entry",
         }
@@ -110,16 +113,23 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
                 let mut noncredential_fields = entry_table.clone();
                 noncredential_fields.remove("api_key");
                 noncredential_fields.remove("env_key");
-                let (_, extra_warnings) =
+                let (mut rejected_entry, mut extra_warnings) =
                     parse_model_override_table(model_key, noncredential_fields);
+                rejected_entry.provider_alias_eligible = entry_table.contains_key("provider");
+                if rejected_entry
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| !is_valid_alias(alias))
+                {
+                    extra_warnings.push(ModelOverrideWarning {
+                        model_key: Some(model_key.clone()),
+                        field: Some("alias".to_owned()),
+                        kind: ModelOverrideWarningKind::InvalidValue,
+                    });
+                }
                 warnings.extend(extra_warnings);
-                models.insert(
-                    model_key.clone(),
-                    ConfigModelOverride {
-                        reject_model: true,
-                        ..ConfigModelOverride::default()
-                    },
-                );
+                rejected_entry.reject_model = true;
+                models.insert(model_key.clone(), rejected_entry);
                 continue;
             }
         };
@@ -138,12 +148,12 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
         }
         let (mut entry, mut entry_warnings) =
             parse_model_override_table(model_key, parsed_entry_table);
+        entry.provider_alias_eligible = entry_table.contains_key("provider");
         if entry
             .alias
             .as_deref()
             .is_some_and(|alias| !is_valid_alias(alias))
         {
-            entry.alias = None;
             entry_warnings.push(ModelOverrideWarning {
                 model_key: Some(model_key.clone()),
                 field: Some("alias".to_owned()),
@@ -164,13 +174,8 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
             &mut entry,
             &mut warnings,
         ) {
-            models.insert(
-                model_key.clone(),
-                ConfigModelOverride {
-                    reject_model: true,
-                    ..ConfigModelOverride::default()
-                },
-            );
+            entry.reject_model = true;
+            models.insert(model_key.clone(), entry);
             continue;
         }
         models.insert(model_key.clone(), entry);
@@ -261,7 +266,7 @@ fn is_valid_provider_id(provider_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn is_valid_alias(alias: &str) -> bool {
+pub(crate) fn is_valid_alias(alias: &str) -> bool {
     !alias.is_empty()
         && alias
             .bytes()
@@ -1253,6 +1258,7 @@ pub(in crate::agent) mod tests {
             stream_tool_calls: Some(false),
             clear_credentials: false,
             reject_model: false,
+            provider_alias_eligible: false,
         }
     }
 

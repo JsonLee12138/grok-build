@@ -1,3 +1,8 @@
 /target
 **/*.rs.bk
 .DS_Store
+.grok-dev/
+.envrc
+# Added by code-review-graph
+.code-review-graph/
+.worktrees/

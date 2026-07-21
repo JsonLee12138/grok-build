@@ -600,6 +600,9 @@ pub enum Action {
     SwitchAccount,
     /// User pressed login on the welcome screen.
     Login,
+    /// Explicitly select xAI as the authentication provider. This first tries
+    /// a cached xAI session without opening an interactive browser flow.
+    SelectXaiProvider,
     /// Cancel an in-progress login that was started from inside a session
     /// (`/login` or a 401 re-auth prompt) and return to the previous view.
     /// Distinct from `Quit`: abandoning a mid-session re-auth must not exit

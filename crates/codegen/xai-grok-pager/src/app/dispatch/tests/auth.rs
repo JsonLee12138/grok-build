@@ -438,6 +438,100 @@ fn login_with_empty_auth_methods_fails_closed() {
     assert!(app.login_method_id.is_none());
 }
 
+#[test]
+fn provider_xai_uses_cached_token_without_forcing_interactive_login() {
+    let mut app = test_app_with_agent();
+    app.auth_methods.insert(
+        0,
+        acp::AuthMethod::Agent(acp::AuthMethodAgent::new(
+            acp::AuthMethodId::new(xai_grok_shell::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID),
+            "Cached token".to_string(),
+        )),
+    );
+
+    let effects = dispatch(Action::SelectXaiProvider, &mut app);
+
+    assert_eq!(app.active_view, ActiveView::Welcome);
+    assert_eq!(app.auth_return_view, Some(ActiveView::Agent(AgentId(0))));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Authenticate {
+            method_id,
+            force_interactive: false,
+            ..
+        }] if method_id.0.as_ref()
+            == xai_grok_shell::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID
+    ));
+}
+
+#[test]
+fn provider_xai_without_cached_token_uses_interactive_login() {
+    let mut app = test_app_with_agent();
+
+    let effects = dispatch(Action::SelectXaiProvider, &mut app);
+
+    assert!(matches!(
+        effects.as_slice(),
+        [
+            Effect::Authenticate {
+                force_interactive: true,
+                ..
+            },
+            Effect::PollAuthUrl { .. }
+        ]
+    ));
+    assert_eq!(app.active_view, ActiveView::Welcome);
+    assert_eq!(app.auth_return_view, Some(ActiveView::Agent(AgentId(0))));
+}
+
+#[test]
+fn cancelling_provider_xai_cached_authentication_restores_view() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.reauth_stashed_prompt = Some(crate::app::agent::InFlightPrompt {
+            text: "keep this prompt".into(),
+            images: Vec::new(),
+            scrollback_entry: crate::scrollback::EntryId::new(0),
+            chip_elements: Vec::new(),
+        });
+        agent
+            .scrollback
+            .push_block(RenderBlock::session_event(SessionEvent::ReAuthRequired));
+    }
+    app.auth_methods.insert(
+        0,
+        acp::AuthMethod::Agent(acp::AuthMethodAgent::new(
+            acp::AuthMethodId::new(xai_grok_shell::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID),
+            "Cached token".to_string(),
+        )),
+    );
+    dispatch(Action::SelectXaiProvider, &mut app);
+
+    let effects = dispatch(Action::CancelLogin, &mut app);
+
+    assert!(effects.is_empty());
+    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
+    assert_eq!(app.auth_return_view, None);
+    assert!(matches!(app.auth_state, AuthState::Done));
+    assert_eq!(
+        app.agents[&id]
+            .reauth_stashed_prompt
+            .as_ref()
+            .map(|prompt| prompt.text.as_str()),
+        Some("keep this prompt"),
+        "provider-selection cancellation must not discard session re-auth work"
+    );
+    assert!((0..app.agents[&id].scrollback.len()).any(|index| {
+        matches!(
+            app.agents[&id].scrollback.entry(index).map(|entry| &entry.block),
+            Some(RenderBlock::SessionEvent(event))
+                if matches!(event.event, SessionEvent::ReAuthRequired)
+        )
+    }));
+}
+
 /// Cancelling a mid-session login returns to the session rather than
 /// quitting the app, and clears the stashed view + auth state.
 #[test]

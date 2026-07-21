@@ -579,6 +579,16 @@ pub fn startup_auth_metadata(
     Option<acp::AuthMethodId>,
     AuthStartMode,
 ) {
+    // Startup must remain useful without credentials.  Provider selection and
+    // interactive authentication are explicit user actions (`/provider xai`),
+    // so an advertised grok.com method is not a global login gate.
+    if auth_methods
+        .first()
+        .is_some_and(|m| AuthMethodKind::from_id(m.id()).needs_interactive_login())
+    {
+        return (false, None, None, AuthStartMode::Pending);
+    }
+
     let first_method = auth_methods.first();
     let needs_login = first_method
         .map(|m| AuthMethodKind::from_id(m.id()).needs_interactive_login())
@@ -674,7 +684,11 @@ async fn eager_auth_or_login_fallback(
         // preferred_method pin unavailable — fail closed, no invented method.
         return (true, None, None, AuthStartMode::Pending, None);
     }
-    if needs_login {
+    if !should_eager_authenticate(auth_methods, needs_login) {
+        // Interactive xAI authentication is an explicit `/provider xai` action.
+        // In particular, do not turn an empty-credential startup into an
+        // AuthenticateRequest merely because `startup_auth_metadata` correctly
+        // reports that no login screen should be shown.
         return (
             needs_login,
             login_label,
@@ -704,6 +718,18 @@ async fn eager_auth_or_login_fallback(
             (true, label, method_id, mode, None)
         }
     }
+}
+
+/// Whether startup may issue an `AuthenticateRequest`.
+///
+/// Browser-based methods are deliberately excluded even when accompanied by
+/// other advertised methods: selecting and authenticating with xAI is an
+/// explicit user action through `/provider xai`.
+fn should_eager_authenticate(auth_methods: &[acp::AuthMethod], needs_login: bool) -> bool {
+    !needs_login
+        && !auth_methods
+            .iter()
+            .any(|method| AuthMethodKind::from_id(method.id()).needs_interactive_login())
 }
 
 /// Authenticate with the agent using the agent's chosen default method.
@@ -854,12 +880,12 @@ mod tests {
     }
 
     #[test]
-    fn startup_auth_grok_com_no_provider_needs_login_pending() {
+    fn startup_auth_grok_com_no_provider_does_not_gate_startup() {
         let methods = vec![make_auth_method("grok.com", "grok.com", None)];
         let (needs, label, method_id, mode) = startup_auth_metadata(&methods);
-        assert!(needs);
-        assert_eq!(label.as_deref(), Some("grok.com"));
-        assert_eq!(method_id.as_ref().unwrap().0.as_ref(), "grok.com");
+        assert!(!needs);
+        assert!(label.is_none());
+        assert!(method_id.is_none());
         assert_eq!(mode, AuthStartMode::Pending);
     }
 
@@ -868,10 +894,10 @@ mod tests {
         let meta = serde_json::json!({ "external_provider": true });
         let methods = vec![make_auth_method("grok.com", "Acme Corp", Some(meta))];
         let (needs, label, method_id, mode) = startup_auth_metadata(&methods);
-        assert!(needs);
-        assert_eq!(label.as_deref(), Some("Acme Corp"));
-        assert_eq!(method_id.as_ref().unwrap().0.as_ref(), "grok.com");
-        assert_eq!(mode, AuthStartMode::Command);
+        assert!(!needs);
+        assert!(label.is_none());
+        assert!(method_id.is_none());
+        assert_eq!(mode, AuthStartMode::Pending);
     }
 
     #[test]
@@ -882,6 +908,33 @@ mod tests {
         assert!(label.is_none());
         assert!(method_id.is_none());
         assert_eq!(mode, AuthStartMode::Pending);
+    }
+
+    #[test]
+    fn interactive_xai_method_disables_eager_authentication() {
+        use xai_grok_shell::agent::auth_method::{GROK_COM_METHOD_ID, XAI_API_KEY_METHOD_ID};
+
+        let methods = vec![
+            make_auth_method(XAI_API_KEY_METHOD_ID, "xai.api_key", None),
+            make_auth_method(GROK_COM_METHOD_ID, "Grok", None),
+        ];
+
+        assert!(
+            !should_eager_authenticate(&methods, false),
+            "an advertised interactive xAI method must not cause startup to send AuthenticateRequest"
+        );
+    }
+
+    #[test]
+    fn non_interactive_credentials_still_authenticate_eagerly() {
+        use xai_grok_shell::agent::auth_method::{
+            CACHED_TOKEN_AUTH_METHOD_ID, XAI_API_KEY_METHOD_ID,
+        };
+
+        for method_id in [XAI_API_KEY_METHOD_ID, CACHED_TOKEN_AUTH_METHOD_ID] {
+            let methods = vec![make_auth_method(method_id, method_id, None)];
+            assert!(should_eager_authenticate(&methods, false));
+        }
     }
 
     /// CROSS-CRATE REGRESSION GUARD:
@@ -935,17 +988,10 @@ mod tests {
         assert_eq!(mode, AuthStartMode::Pending);
     }
 
-    /// Inverse direction: when `xai.api_key` is NOT in the list, the pager
-    /// MUST show the login screen. We assert this with `xai.api_key` present
-    /// LATER in the list (the shape of a past regression) and confirm the
-    /// pager still requires login -- because the pager only inspects
-    /// `auth_methods.first()`. This locks the failure mode of the regression:
-    /// if a future refactor makes the pager scan past `.first()`, this test
-    /// stops being equivalent to
-    /// `startup_auth_grok_com_no_provider_needs_login_pending` above and
-    /// either passes or fails on a meaningful new code path.
+    /// An absent credential must not turn the startup path into a global
+    /// login gate. Authentication is now explicit through `/provider xai`.
     #[test]
-    fn startup_auth_xai_api_key_not_first_still_requires_login() {
+    fn startup_auth_xai_api_key_not_first_does_not_require_login() {
         use xai_grok_shell::agent::auth_method::{GROK_COM_METHOD_ID, XAI_API_KEY_METHOD_ID};
 
         let methods = vec![
@@ -953,19 +999,14 @@ mod tests {
             make_auth_method(XAI_API_KEY_METHOD_ID, "xai.api_key", None),
         ];
         let (needs, _, _, _) = startup_auth_metadata(&methods);
-        assert!(
-            needs,
-            "with grok.com first, the pager must require login -- pinning \
-             the BAD-ordering failure mode (xai.api_key not first)",
-        );
+        assert!(!needs);
     }
 
     #[test]
-    fn startup_auth_method_id_is_copied_not_synthesized() {
+    fn startup_auth_interactive_method_does_not_publish_a_login_target() {
         let methods = vec![make_auth_method("grok.com", "My Login", None)];
         let (_, _, method_id, _) = startup_auth_metadata(&methods);
-        // Verify it's the exact same ID from the method, not hardcoded
-        assert_eq!(&method_id.unwrap(), methods[0].id());
+        assert!(method_id.is_none());
     }
 
     #[test]

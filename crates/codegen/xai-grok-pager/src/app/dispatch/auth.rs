@@ -7,7 +7,7 @@ use super::session::lifecycle::{clear_startup_actions, drain_startup_actions};
 use crate::app::actions::{Action, Effect};
 use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentView;
-use crate::app::app_view::{ActiveView, AppView, AuthMode, AuthState};
+use crate::app::app_view::{ActiveView, AppView, AuthFlowOrigin, AuthMode, AuthState};
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::SessionEvent;
 
@@ -189,9 +189,49 @@ pub(super) fn dispatch_login(app: &mut AppView) -> Vec<Effect> {
         return vec![];
     };
 
-    // Surface the auth UI when triggered from inside a session. `show_welcome`
-    // resets ephemeral state here, covering the AuthComplete / cancel-login
-    // fallbacks too (`auth_return_view` is only ever set here).
+    begin_authentication(
+        app,
+        method_id,
+        true,
+        app.auth_start_mode,
+        AuthFlowOrigin::Login,
+    )
+}
+
+/// Explicit `/provider xai` selection.
+///
+/// A cached xAI token is a non-interactive credential: give the agent a
+/// chance to refresh or invalidate it through its existing authentication
+/// fallthrough before opening a browser. Without one, use the regular
+/// grok.com/OIDC login path unchanged.
+pub(super) fn dispatch_select_xai_provider(app: &mut AppView) -> Vec<Effect> {
+    let cached_token = app.auth_methods.iter().find_map(|method| {
+        (xai_grok_shell::agent::auth_method::AuthMethodKind::from_id(method.id())
+            == xai_grok_shell::agent::auth_method::AuthMethodKind::CachedToken)
+            .then(|| method.id().clone())
+    });
+
+    let Some(method_id) = cached_token else {
+        return dispatch_login(app);
+    };
+
+    begin_authentication(
+        app,
+        method_id,
+        false,
+        AuthMode::Pending,
+        AuthFlowOrigin::ProviderSelection,
+    )
+}
+
+/// Move the auth UI to Welcome and issue the requested authentication effect.
+fn begin_authentication(
+    app: &mut AppView,
+    method_id: agent_client_protocol::AuthMethodId,
+    force_interactive: bool,
+    mode: AuthMode,
+    origin: AuthFlowOrigin,
+) -> Vec<Effect> {
     if !matches!(app.active_view, ActiveView::Welcome) {
         app.auth_return_view = Some(app.active_view);
         show_welcome(app);
@@ -200,22 +240,24 @@ pub(super) fn dispatch_login(app: &mut AppView) -> Vec<Effect> {
     let request_seq = app.next_auth_request_seq;
     app.next_auth_request_seq += 1;
     app.auth_code_input.clear();
+    app.auth_flow_origin = origin;
     app.auth_state = AuthState::Authenticating {
         request_seq,
         handle: None,
         auth_url: None,
-        mode: app.auth_start_mode,
+        mode,
     };
 
-    vec![
-        Effect::Authenticate {
-            request_seq,
-            method_id,
-            use_oauth: app.auth_use_oauth,
-            force_interactive: true,
-        },
-        Effect::PollAuthUrl { request_seq },
-    ]
+    let mut effects = vec![Effect::Authenticate {
+        request_seq,
+        method_id,
+        use_oauth: app.auth_use_oauth,
+        force_interactive,
+    }];
+    if force_interactive {
+        effects.push(Effect::PollAuthUrl { request_seq });
+    }
+    effects
 }
 
 /// Cancel a login that was started from inside a session and restore the
@@ -229,11 +271,16 @@ pub(super) fn dispatch_cancel_login(app: &mut AppView) -> Vec<Effect> {
     let Some(return_view) = app.auth_return_view.take() else {
         return vec![];
     };
+    let preserve_reauth_state = app.auth_flow_origin == AuthFlowOrigin::ProviderSelection;
+    app.auth_flow_origin = AuthFlowOrigin::Login;
     app.next_auth_request_seq += 1;
     app.auth_state = AuthState::Done;
     app.auth_show_raw_url = false;
     app.auth_code_input.clear();
     restore_auth_return_view(app, return_view);
+    if preserve_reauth_state {
+        return vec![];
+    }
     // The user bailed out of re-auth — drop stashed prompts and strip the
     // stale re-auth prompt from scrollback (on all agents: the login may
     // have been started from the dashboard). Clearing the stash alone is
@@ -279,6 +326,7 @@ pub(super) fn handle_auth_complete(
         }
 
         app.auth_state = AuthState::Done;
+        app.auth_flow_origin = AuthFlowOrigin::Login;
         app.auth_show_raw_url = false;
         app.welcome_prompt_focused = !app.is_access_blocked();
         app.auth_code_input.clear();

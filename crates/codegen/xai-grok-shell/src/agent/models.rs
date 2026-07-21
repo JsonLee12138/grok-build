@@ -69,10 +69,39 @@ pub(crate) fn task_model_error_for_catalog(
     available: &IndexMap<String, ModelEntry>,
     is_session_auth: bool,
 ) -> Option<String> {
+    task_model_error_for_catalog_with_aliases(
+        requested,
+        available,
+        &config::AliasIndex::default(),
+        is_session_auth,
+    )
+}
+
+fn available_from_catalog(
+    models: &IndexMap<String, ModelEntry>,
+    is_session_auth: bool,
+) -> IndexMap<acp::ModelId, acp::ModelInfo> {
+    let selectable: IndexMap<_, _> = models
+        .iter()
+        .filter(|(_, entry)| entry.info.user_selectable)
+        .map(|(key, entry)| (key.clone(), entry.clone()))
+        .collect();
+    available_models(&selectable, is_session_auth)
+}
+
+fn task_model_error_for_catalog_with_aliases(
+    requested: &str,
+    available: &IndexMap<String, ModelEntry>,
+    aliases: &config::AliasIndex,
+    is_session_auth: bool,
+) -> Option<String> {
     let is_available = |entry: &ModelEntry| {
         entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
     };
-    if config::find_model_by_id(available, requested).is_some_and(&is_available) {
+    if config::resolve_model_reference(available, aliases, requested)
+        .map(|(_, entry)| entry)
+        .is_some_and(&is_available)
+    {
         return None;
     }
 
@@ -106,6 +135,7 @@ pub struct ModelsManager {
 struct Inner {
     prefetched: RwLock<Option<IndexMap<String, ModelEntry>>>,
     models: RwLock<IndexMap<String, ModelEntry>>,
+    aliases: RwLock<config::AliasIndex>,
     current_model_id: RwLock<acp::ModelId>,
     current_reasoning_effort: RwLock<Option<ReasoningEffort>>,
     etag: RwLock<Option<String>>,
@@ -168,15 +198,18 @@ impl ModelsManager {
         models: IndexMap<String, ModelEntry>,
         current_model_id: acp::ModelId,
         auth_manager: Arc<AuthManager>,
-        cfg: config::Config,
+        mut cfg: config::Config,
     ) -> Self {
+        cfg.refresh_alias_shadow_warnings(&models);
         let has_session = auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, has_session);
         let current_reasoning_effort = cfg.models.default_reasoning_effort;
+        let aliases = cfg.model_aliases.clone();
         Self {
             inner: Arc::new(Inner {
                 prefetched: RwLock::new(prefetched),
                 models: RwLock::new(models),
+                aliases: RwLock::new(aliases),
                 current_model_id: RwLock::new(current_model_id),
                 current_reasoning_effort: RwLock::new(current_reasoning_effort),
                 etag: RwLock::new(None),
@@ -301,7 +334,6 @@ impl ModelsManager {
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
         *self.inner.fetch_auth.write() =
             ModelFetchAuth::resolve(&new_config.endpoints, has_session);
-        *self.inner.cfg.write() = new_config.clone();
         // Recompute the prompt-block flag so a corrective reload unblocks.
         if has_real_catalog {
             let excludes_all = allowlist_matches_nothing(&new_config, &new_catalog);
@@ -309,7 +341,11 @@ impl ModelsManager {
                 .allowlist_excludes_all
                 .store(excludes_all, Ordering::Relaxed);
         }
-        *self.inner.models.write() = new_catalog;
+        self.replace_catalog(
+            new_catalog,
+            new_config.model_aliases.clone(),
+            Some(new_config.clone()),
+        );
 
         // A preferred-model flip caused only by a campaign overlay appearing or
         // disappearing must not yank an in-flight session whose current model is
@@ -357,6 +393,46 @@ impl ModelsManager {
         self.inner.models.read().clone()
     }
 
+    /// Resolve a user-provided model reference and return an owned canonical
+    /// catalog key plus the existing catalog entry.
+    pub(crate) fn resolve_model_reference(
+        &self,
+        requested: &acp::ModelId,
+    ) -> Option<(acp::ModelId, ModelEntry)> {
+        let models = self.inner.models.read();
+        let aliases = self.inner.aliases.read();
+        config::resolve_model_reference(&models, &aliases, requested.0.as_ref())
+            .map(|(catalog_key, entry)| (acp::ModelId::new(catalog_key.to_owned()), entry.clone()))
+    }
+
+    /// Fetch a previously resolved canonical catalog key without interpreting
+    /// it as an alias or wire slug. Used across await boundaries.
+    pub(crate) fn model_entry_by_catalog_key(
+        &self,
+        catalog_key: &acp::ModelId,
+    ) -> Option<ModelEntry> {
+        self.inner
+            .models
+            .read()
+            .get(catalog_key.0.as_ref())
+            .cloned()
+    }
+
+    pub(crate) fn persisted_model_snapshot(
+        &self,
+        requested: &acp::ModelId,
+    ) -> (
+        IndexMap<acp::ModelId, acp::ModelInfo>,
+        PersistedModelResolution,
+    ) {
+        let is_session_auth = self.is_session_auth();
+        let models = self.inner.models.read();
+        let aliases = self.inner.aliases.read();
+        let available = available_from_catalog(&models, is_session_auth);
+        let resolution = persisted_model_resolution(&models, &aliases, &available, requested);
+        (available, resolution)
+    }
+
     pub fn endpoints(&self) -> config::EndpointsConfig {
         self.inner.cfg.read().endpoints.clone()
     }
@@ -373,23 +449,16 @@ impl ModelsManager {
     /// The catalog coming from `resolve_model_catalog` already has
     /// allowed_models + disabled_models + hidden_models applied.
     pub fn available(&self) -> IndexMap<acp::ModelId, acp::ModelInfo> {
-        let snapshot = {
-            let models = self.inner.models.read();
-            models.clone()
-        };
-
-        let selectable: IndexMap<_, _> = snapshot
-            .into_iter()
-            .filter(|(_, e)| e.info.user_selectable)
-            .collect();
-
-        available_models(&selectable, self.is_session_auth())
+        let is_session_auth = self.is_session_auth();
+        let models = self.inner.models.read();
+        available_from_catalog(&models, is_session_auth)
     }
 
     pub(crate) fn task_model_error(&self, requested: &str) -> Option<String> {
         let is_session_auth = self.is_session_auth();
         let models = self.inner.models.read();
-        task_model_error_for_catalog(requested, &models, is_session_auth)
+        let aliases = self.inner.aliases.read();
+        task_model_error_for_catalog_with_aliases(requested, &models, &aliases, is_session_auth)
     }
 
     pub fn current_model_id(&self) -> acp::ModelId {
@@ -519,7 +588,8 @@ impl ModelsManager {
     /// caller still finds the opted-in entry.
     pub fn model_show_model_fingerprint(&self, model_id: &str) -> bool {
         let models = self.inner.models.read();
-        resolve_catalog_key(&models, &acp::ModelId::new(model_id))
+        let aliases = self.inner.aliases.read();
+        resolve_catalog_key(&models, &aliases, &acp::ModelId::new(model_id))
             .and_then(|key| models.get(key.0.as_ref()))
             .map(|e| e.info().show_model_fingerprint)
             .unwrap_or(false)
@@ -540,7 +610,8 @@ impl ModelsManager {
     /// non-selectable entries are still sampleable.
     pub fn model_in_catalog(&self, model_id: &str) -> bool {
         let models = self.inner.models.read();
-        resolve_catalog_key(&models, &acp::ModelId::new(model_id)).is_some()
+        let aliases = self.inner.aliases.read();
+        resolve_catalog_key(&models, &aliases, &acp::ModelId::new(model_id)).is_some()
     }
 
     #[cfg(test)]
@@ -556,7 +627,32 @@ impl ModelsManager {
     // ── Mutations ───────────────────────────────────────────────────
 
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
-        *self.inner.models.write() = resolve_model_catalog(cfg, prefetched);
+        self.replace_catalog(
+            resolve_model_catalog(cfg, prefetched),
+            cfg.model_aliases.clone(),
+            None,
+        );
+    }
+
+    /// Publish catalog entries and their derived alias index as one snapshot.
+    /// All alias-aware readers acquire these locks in the same models→aliases
+    /// order, so they cannot observe a new alias index with an old catalog (or
+    /// vice versa).
+    fn replace_catalog(
+        &self,
+        catalog: IndexMap<String, ModelEntry>,
+        aliases: config::AliasIndex,
+        new_config: Option<config::Config>,
+    ) {
+        let mut models_guard = self.inner.models.write();
+        let mut aliases_guard = self.inner.aliases.write();
+        let mut cfg_guard = self.inner.cfg.write();
+        if let Some(new_config) = new_config {
+            *cfg_guard = new_config;
+        }
+        cfg_guard.refresh_alias_shadow_warnings_for(&catalog, &aliases);
+        *models_guard = catalog;
+        *aliases_guard = aliases;
     }
 
     /// Refresh models when the etag changes.
@@ -918,7 +1014,7 @@ impl ModelsManager {
     /// Wipe in-memory state so a previous identity's catalog doesn't leak.
     fn clear(&self) {
         *self.inner.prefetched.write() = None;
-        *self.inner.models.write() = IndexMap::new();
+        self.replace_catalog(IndexMap::new(), config::AliasIndex::default(), None);
         *self.inner.etag.write() = None;
         *self.inner.has_fetched_real_catalog.write() = false;
         self.inner
@@ -1615,17 +1711,11 @@ fn spawn_prefetch_thread(env: PrefetchEnv) -> EarlyPrefetchHandle {
 /// Last slug match wins so user overrides beat defaults (matches `MvpAgent::resolve_model_id`).
 pub(crate) fn resolve_catalog_key(
     models: &IndexMap<String, ModelEntry>,
+    aliases: &config::AliasIndex,
     id: &acp::ModelId,
 ) -> Option<acp::ModelId> {
-    let id_str = id.0.as_ref();
-    if models.contains_key(id_str) {
-        return Some(id.clone());
-    }
-    models
-        .iter()
-        .rev()
-        .find(|(_, entry)| entry.info.model == id_str)
-        .map(|(key, _)| acp::ModelId::new(key.clone()))
+    config::resolve_model_reference(models, aliases, id.0.as_ref())
+        .map(|(key, _)| acp::ModelId::new(key.to_owned()))
 }
 
 /// Catalog key for a persisted session model id, restricted to **selectable**
@@ -1634,19 +1724,76 @@ pub(crate) fn resolve_catalog_key(
 /// non-selectable exact-key entry never shadows a selectable slug match.
 pub(crate) fn selectable_catalog_key_for_persisted(
     models: &IndexMap<String, ModelEntry>,
+    aliases: &config::AliasIndex,
     available: &IndexMap<acp::ModelId, acp::ModelInfo>,
     id: &acp::ModelId,
 ) -> Option<acp::ModelId> {
-    if available.contains_key(id) {
-        return Some(id.clone());
+    match persisted_model_resolution(models, aliases, available, id) {
+        PersistedModelResolution::Selected(key) => Some(key),
+        PersistedModelResolution::AuthoritativeAliasUnavailable
+        | PersistedModelResolution::OrdinaryMissing => None,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PersistedModelResolution {
+    Selected(acp::ModelId),
+    AuthoritativeAliasUnavailable,
+    OrdinaryMissing,
+}
+
+pub(crate) fn persisted_model_allows_family_fallback(
+    resolution: &PersistedModelResolution,
+) -> bool {
+    matches!(resolution, PersistedModelResolution::OrdinaryMissing)
+}
+
+pub(crate) fn persisted_model_prompt_restore_key(
+    resolution: PersistedModelResolution,
+) -> Option<acp::ModelId> {
+    match resolution {
+        PersistedModelResolution::Selected(catalog_key) => Some(catalog_key),
+        PersistedModelResolution::AuthoritativeAliasUnavailable
+        | PersistedModelResolution::OrdinaryMissing => None,
+    }
+}
+
+fn persisted_model_resolution(
+    models: &IndexMap<String, ModelEntry>,
+    aliases: &config::AliasIndex,
+    available: &IndexMap<acp::ModelId, acp::ModelInfo>,
+    id: &acp::ModelId,
+) -> PersistedModelResolution {
     let id_str = id.0.as_ref();
+    let is_authoritative_alias =
+        aliases.targets.contains_key(id_str) || aliases.blocked.contains(id_str);
+    let Some(resolved) = resolve_catalog_key(models, aliases, id) else {
+        return if is_authoritative_alias {
+            PersistedModelResolution::AuthoritativeAliasUnavailable
+        } else {
+            PersistedModelResolution::OrdinaryMissing
+        };
+    };
+    if available.contains_key(&resolved) {
+        return PersistedModelResolution::Selected(resolved);
+    }
+
+    // A declared alias is authoritative even when its target is currently
+    // non-selectable: never fall through to a selectable exact key or slug
+    // with the same spelling.
+    if is_authoritative_alias {
+        return PersistedModelResolution::AuthoritativeAliasUnavailable;
+    }
+
+    // Persisted legacy ids retain their historical compatibility behavior:
+    // when an exact key is non-selectable, a selectable entry with the same
+    // wire slug may restore the session.
     if let Some((key, _)) = models.iter().rev().find(|(key, entry)| {
         available.contains_key(&acp::ModelId::new((*key).clone())) && entry.info.model == id_str
     }) {
-        return Some(acp::ModelId::new(key.clone()));
+        return PersistedModelResolution::Selected(acp::ModelId::new(key.clone()));
     }
-    resolve_catalog_key(models, id).filter(|key| available.contains_key(key))
+    PersistedModelResolution::OrdinaryMissing
 }
 
 /// A "campaign-only" preferred flip: the default changed and either side's value
@@ -1719,12 +1866,10 @@ pub(crate) fn resolve_default_model(
             (key, first, config::ConfigSource::Default)
         }
         Some(pref) => {
-            let found = visible
-                .get_key_value(&pref.value)
-                .or_else(|| visible.iter().find(|(_, m)| m.model == pref.value));
+            let found = config::resolve_model_reference(&visible, &cfg.model_aliases, &pref.value);
 
             if let Some((key, entry)) = found {
-                (key.clone(), entry.clone(), pref.source)
+                (key.to_owned(), entry.clone(), pref.source)
             } else {
                 let is_explicit = matches!(
                     pref.source,
@@ -1756,15 +1901,14 @@ pub(crate) fn resolve_default_model(
                         .pre_campaign_default
                         .as_deref()
                         .filter(|s| !s.is_empty())
-                    && let Some((key, entry)) = visible
-                        .get_key_value(prev)
-                        .or_else(|| visible.iter().find(|(_, m)| m.model == prev))
+                    && let Some((key, entry)) =
+                        config::resolve_model_reference(&visible, &cfg.model_aliases, prev)
                 {
                     tracing::info!(
                         unavailable = %pref.value, fallback = %prev,
                         "campaign-driven default unavailable in catalog; recovering the pre-campaign default"
                     );
-                    return (key.clone(), entry.clone(), config::ConfigSource::Config);
+                    return (key.to_owned(), entry.clone(), config::ConfigSource::Config);
                 }
                 let (key, first) = first_or_fallback();
                 (key, first, config::ConfigSource::Default)
@@ -2004,6 +2148,286 @@ mod tests {
 
     fn config_from_toml(toml: &str) -> config::Config {
         config::Config::new_from_toml_cfg(&toml::from_str(toml).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_11_reload_rebinds_alias_atomically() {
+        let mgr = test_manager();
+        let config_a = config_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/a"]
+            provider = "acme"
+            alias = "fast"
+            "#,
+        );
+        mgr.apply_config(config_a);
+        assert_eq!(
+            mgr.resolve_model_reference(&acp::ModelId::new("fast"))
+                .expect("initial alias must resolve")
+                .0
+                .0
+                .as_ref(),
+            "acme/a"
+        );
+
+        let config_b = config_from_toml(
+            r#"
+            [models]
+            allowed_models = ["acme/a"]
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/a"]
+            provider = "acme"
+            [model."acme/b"]
+            provider = "acme"
+            alias = "fast"
+            "#,
+        );
+        mgr.apply_config(config_b);
+        let (catalog_key, entry) = mgr
+            .resolve_model_reference(&acp::ModelId::new("fast"))
+            .expect("rebound alias must resolve");
+        assert_eq!(catalog_key.0.as_ref(), "acme/b");
+        assert_eq!(entry.info.model, "b");
+        assert!(
+            !entry.info.user_selectable,
+            "the canonical target returned after rebinding must still pass the caller's selectable gate"
+        );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_12_remote_snapshot_refreshes_shadow_warning() {
+        use crate::agent::config_model_override_parse::ModelOverrideWarningKind;
+
+        let mgr = test_manager();
+        let cfg = config_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/target"]
+            provider = "acme"
+            alias = "remote-shadow"
+            "#,
+        );
+        mgr.apply_config(cfg.clone());
+        assert!(
+            !mgr.inner
+                .cfg
+                .read()
+                .model_override_warnings
+                .iter()
+                .any(|warning| warning.kind == ModelOverrideWarningKind::AliasShadow)
+        );
+
+        let remote_collision = make_prefetched(&["remote-shadow"]);
+        assert!(mgr.apply_refresh_result(&cfg, Some(remote_collision), None));
+        assert!(
+            mgr.inner
+                .cfg
+                .read()
+                .model_override_warnings
+                .iter()
+                .any(|warning| {
+                    warning.kind == ModelOverrideWarningKind::AliasShadow
+                        && warning.model_key.as_deref() == Some("acme/target")
+                        && warning.field.as_deref() == Some("alias")
+                })
+        );
+
+        let remote_replacement = make_prefetched(&["remote-other"]);
+        assert!(mgr.apply_refresh_result(&cfg, Some(remote_replacement), None));
+        assert!(
+            !mgr.inner
+                .cfg
+                .read()
+                .model_override_warnings
+                .iter()
+                .any(|warning| warning.kind == ModelOverrideWarningKind::AliasShadow),
+            "a later snapshot must remove stale shadow warnings"
+        );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_12_concurrent_snapshot_keeps_warning_consistent() {
+        use crate::agent::config_model_override_parse::ModelOverrideWarningKind;
+
+        let mgr = test_manager();
+        let cfg = config_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/target"]
+            provider = "acme"
+            alias = "snapshot-shadow"
+            "#,
+        );
+        let collision_catalog =
+            resolve_model_catalog(&cfg, Some(make_prefetched(&["snapshot-shadow"])));
+        let clear_catalog = resolve_model_catalog(&cfg, Some(make_prefetched(&["snapshot-other"])));
+
+        let writer_mgr = mgr.clone();
+        let writer_cfg = cfg.clone();
+        let writer = std::thread::spawn(move || {
+            for iteration in 0..128 {
+                let catalog = if iteration % 2 == 0 {
+                    collision_catalog.clone()
+                } else {
+                    clear_catalog.clone()
+                };
+                writer_mgr.replace_catalog(
+                    catalog,
+                    writer_cfg.model_aliases.clone(),
+                    Some(writer_cfg.clone()),
+                );
+            }
+        });
+
+        for _ in 0..2048 {
+            let models = mgr.inner.models.read();
+            let aliases = mgr.inner.aliases.read();
+            let live_cfg = mgr.inner.cfg.read();
+            let collision = aliases.targets.keys().any(|alias| {
+                models.contains_key(alias)
+                    || models.values().any(|entry| entry.info.model == *alias)
+            });
+            let warned = live_cfg
+                .model_override_warnings
+                .iter()
+                .any(|warning| warning.kind == ModelOverrideWarningKind::AliasShadow);
+            assert_eq!(warned, collision, "warning and catalog snapshots diverged");
+        }
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_11_concurrent_reload_keeps_key_and_entry_together() {
+        let mgr = test_manager();
+        let config_a = config_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/a"]
+            provider = "acme"
+            alias = "fast"
+            "#,
+        );
+        let config_b = config_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/b"]
+            provider = "acme"
+            alias = "fast"
+            "#,
+        );
+        mgr.apply_config(config_a.clone());
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writer_mgr = mgr.clone();
+        let writer_barrier = barrier.clone();
+        let writer = std::thread::spawn(move || {
+            writer_barrier.wait();
+            for index in 0..64 {
+                writer_mgr.apply_config(if index % 2 == 0 {
+                    config_b.clone()
+                } else {
+                    config_a.clone()
+                });
+                std::thread::yield_now();
+            }
+        });
+
+        barrier.wait();
+        for _ in 0..2_048 {
+            let (key, entry) = mgr
+                .resolve_model_reference(&acp::ModelId::new("fast"))
+                .expect("alias must always resolve to a published snapshot");
+            assert!(
+                matches!(
+                    (key.0.as_ref(), entry.info.model.as_str()),
+                    ("acme/a", "a") | ("acme/b", "b")
+                ),
+                "catalog key and entry came from different reload snapshots"
+            );
+            let (available, persisted) = mgr.persisted_model_snapshot(&acp::ModelId::new("fast"));
+            let PersistedModelResolution::Selected(snapshot_key) = persisted else {
+                panic!("published selectable alias must resolve in its catalog snapshot");
+            };
+            assert!(
+                available.contains_key(&snapshot_key),
+                "persisted resolution and available projection came from different snapshots"
+            );
+            std::thread::yield_now();
+        }
+        writer.join().expect("reload thread must finish");
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_11_canonical_handoff_gates_before_state_change() {
+        let mgr = test_manager();
+        let selectable = config_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/a"]
+            provider = "acme"
+            alias = "fast"
+            "#,
+        );
+        mgr.apply_config(selectable);
+
+        let (canonical, entry) = mgr
+            .resolve_model_reference(&acp::ModelId::new("fast"))
+            .expect("selectable alias must resolve");
+        assert!(entry.info.user_selectable);
+        assert_eq!(canonical.0.as_ref(), "acme/a");
+        assert_eq!(
+            mgr.model_entry_by_catalog_key(&canonical)
+                .expect("handler exact-key handoff must resolve")
+                .info
+                .model,
+            "a"
+        );
+        // `apply_config` may already reselect the only catalog entry. Reset the
+        // starting point so this assertion measures the canonical handoff itself.
+        mgr.set_current_model_id(acp::ModelId::new("default"));
+        let generation = mgr.model_switch_generation();
+        mgr.set_current_model_id(canonical.clone());
+        mgr.set_current_model_id(canonical.clone());
+        assert_eq!(mgr.current_model_id(), canonical);
+        assert_eq!(mgr.model_switch_generation(), generation + 1);
+
+        let nonselectable = config_from_toml(
+            r#"
+            [models]
+            allowed_models = ["acme/a"]
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/a"]
+            provider = "acme"
+            [model."acme/b"]
+            provider = "acme"
+            alias = "fast"
+            "#,
+        );
+        mgr.apply_config(nonselectable);
+        let before_rejected_switch = mgr.current_model_id();
+        let before_rejected_generation = mgr.model_switch_generation();
+        let (rebound_canonical, rebound_entry) = mgr
+            .resolve_model_reference(&acp::ModelId::new("fast"))
+            .expect("rebound alias must resolve before the selectable gate");
+        assert_eq!(rebound_canonical.0.as_ref(), "acme/b");
+        assert!(!rebound_entry.info.user_selectable);
+        assert!(
+            !mgr.model_entry_by_catalog_key(&rebound_canonical)
+                .expect("handler exact lookup must see rebound canonical")
+                .info
+                .user_selectable
+        );
+        assert_eq!(mgr.current_model_id(), before_rejected_switch);
+        assert_eq!(mgr.model_switch_generation(), before_rejected_generation);
     }
 
     #[test]
@@ -3489,7 +3913,8 @@ mod tests {
         models.insert("grok-4.3".to_string(), make_model_entry("grok-4.3"));
 
         let persisted = acp::ModelId::new("grok-4.5");
-        let key = resolve_catalog_key(&models, &persisted).expect("slug must resolve");
+        let key = resolve_catalog_key(&models, &config::AliasIndex::default(), &persisted)
+            .expect("slug must resolve");
         assert_eq!(key.0.as_ref(), "enterprise-grok-build");
     }
 
@@ -3499,7 +3924,8 @@ mod tests {
         models.insert("grok-4.5".to_string(), make_model_entry("grok-4.5"));
 
         let persisted = acp::ModelId::new("grok-4.5");
-        let key = resolve_catalog_key(&models, &persisted).expect("exact key must resolve");
+        let key = resolve_catalog_key(&models, &config::AliasIndex::default(), &persisted)
+            .expect("exact key must resolve");
         assert_eq!(key.0.as_ref(), "grok-4.5");
     }
 
@@ -3513,7 +3939,8 @@ mod tests {
         models.insert("user-grok-build".to_string(), make_model_entry("grok-4.5"));
 
         let persisted = acp::ModelId::new("grok-4.5");
-        let key = resolve_catalog_key(&models, &persisted).expect("slug must resolve");
+        let key = resolve_catalog_key(&models, &config::AliasIndex::default(), &persisted)
+            .expect("slug must resolve");
         assert_eq!(key.0.as_ref(), "user-grok-build");
     }
 
@@ -3527,7 +3954,97 @@ mod tests {
 
         let available: IndexMap<_, _> = IndexMap::new();
         let persisted = acp::ModelId::new("grok-4.5");
-        assert!(selectable_catalog_key_for_persisted(&models, &available, &persisted).is_none());
+        assert!(
+            selectable_catalog_key_for_persisted(
+                &models,
+                &config::AliasIndex::default(),
+                &available,
+                &persisted,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_11_alias_precedes_selectable_exact_key_and_slug() {
+        let mut models = IndexMap::new();
+        models.insert("acme/demo-v1".to_owned(), make_model_entry("upstream-demo"));
+        models.insert("fast".to_owned(), make_model_entry("exact-other"));
+        models.insert("slug-other".to_owned(), make_model_entry("fast"));
+        let available = test_available_keys(&["acme/demo-v1", "fast", "slug-other"]);
+        let aliases = config::AliasIndex {
+            targets: [("fast".to_owned(), "acme/demo-v1".to_owned())]
+                .into_iter()
+                .collect(),
+            blocked: Default::default(),
+        };
+
+        let requested = acp::ModelId::new("fast");
+        assert_eq!(
+            resolve_catalog_key(&models, &aliases, &requested)
+                .expect("alias must resolve")
+                .0
+                .as_ref(),
+            "acme/demo-v1"
+        );
+        assert_eq!(
+            selectable_catalog_key_for_persisted(&models, &aliases, &available, &requested)
+                .expect("selectable alias target must win")
+                .0
+                .as_ref(),
+            "acme/demo-v1"
+        );
+        assert_eq!(
+            persisted_model_prompt_restore_key(persisted_model_resolution(
+                &models, &aliases, &available, &requested,
+            ))
+            .expect("selected canonical alias target may restore the prompt latch")
+            .0
+            .as_ref(),
+            "acme/demo-v1"
+        );
+
+        let available_without_alias_target = test_available_keys(&["fast", "slug-other"]);
+        assert!(
+            selectable_catalog_key_for_persisted(
+                &models,
+                &aliases,
+                &available_without_alias_target,
+                &requested,
+            )
+            .is_none(),
+            "nonselectable alias target must not fall through to a selectable exact key or wire slug"
+        );
+        let authoritative_unavailable = persisted_model_resolution(
+            &models,
+            &aliases,
+            &available_without_alias_target,
+            &requested,
+        );
+        assert_eq!(
+            authoritative_unavailable,
+            PersistedModelResolution::AuthoritativeAliasUnavailable
+        );
+        assert!(
+            !persisted_model_allows_family_fallback(&authoritative_unavailable),
+            "load_session must block an unavailable authoritative alias instead of family fallback"
+        );
+        assert!(
+            persisted_model_prompt_restore_key(authoritative_unavailable.clone()).is_none(),
+            "prompt latch must remain blocked even when an exact key with the alias spelling is available"
+        );
+
+        let ordinary_missing = persisted_model_resolution(
+            &models,
+            &aliases,
+            &available_without_alias_target,
+            &acp::ModelId::new("ordinary-missing"),
+        );
+        assert_eq!(ordinary_missing, PersistedModelResolution::OrdinaryMissing);
+        assert!(
+            persisted_model_allows_family_fallback(&ordinary_missing),
+            "ordinary missing persisted ids retain the existing family fallback"
+        );
     }
 
     #[test]
@@ -3544,14 +4061,19 @@ mod tests {
 
         let persisted = acp::ModelId::new("grok-build");
         assert_eq!(
-            resolve_catalog_key(&models, &persisted)
+            resolve_catalog_key(&models, &config::AliasIndex::default(), &persisted)
                 .expect("exact key exists")
                 .0
                 .as_ref(),
             "grok-build"
         );
-        let key = selectable_catalog_key_for_persisted(&models, &available, &persisted)
-            .expect("must resolve to selectable section");
+        let key = selectable_catalog_key_for_persisted(
+            &models,
+            &config::AliasIndex::default(),
+            &available,
+            &persisted,
+        )
+        .expect("must resolve to selectable section");
         assert_eq!(key.0.as_ref(), "enterprise-grok-build");
     }
 
@@ -3567,8 +4089,13 @@ mod tests {
         let available = test_available_keys(&["enterprise-grok-build", "grok-4.3"]);
 
         let persisted = acp::ModelId::new("grok-build");
-        let key = selectable_catalog_key_for_persisted(&models, &available, &persisted)
-            .expect("slug must resolve to selectable key");
+        let key = selectable_catalog_key_for_persisted(
+            &models,
+            &config::AliasIndex::default(),
+            &available,
+            &persisted,
+        )
+        .expect("slug must resolve to selectable key");
         assert_eq!(key.0.as_ref(), "enterprise-grok-build");
     }
 
@@ -3583,8 +4110,13 @@ mod tests {
         let available = test_available_keys(&["grok-build", "other"]);
 
         let persisted = acp::ModelId::new("grok-build");
-        let key = selectable_catalog_key_for_persisted(&models, &available, &persisted)
-            .expect("exact selectable key must win");
+        let key = selectable_catalog_key_for_persisted(
+            &models,
+            &config::AliasIndex::default(),
+            &available,
+            &persisted,
+        )
+        .expect("exact selectable key must win");
         assert_eq!(key.0.as_ref(), "grok-build");
     }
 

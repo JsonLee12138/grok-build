@@ -1311,7 +1311,8 @@ impl ConfigTestHarness {
 // ── Enterprise managed config tests ────────────────────────────────────────
 
 /// Enterprise BYOK: managed_config.toml overrides grok-build with a custom
-/// endpoint + env_key. Mock rejects unauthenticated requests with 401.
+/// endpoint + `api_key = { env = "..." }`. Mock rejects unauthenticated
+/// requests with 401.
 /// Regression guard for the 0.1.220 authentication regression.
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
@@ -1336,7 +1337,7 @@ xai_api_base_url = "{url}"
 api_backend = "responses"
 base_url = "{url}"
 context_window = 500000
-env_key = "GROK_TEST_BYOK_TOKEN"
+api_key = {{ env = "GROK_TEST_BYOK_TOKEN" }}
 model = "grok-4.5"
 
 [models]

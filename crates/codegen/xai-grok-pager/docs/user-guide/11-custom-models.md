@@ -79,8 +79,7 @@ model = "model-id"                        # Model identifier sent to the API
 base_url = "https://api.example.com/v1"   # OpenAI-compatible endpoint
 name = "Display Name"                     # Shown in the model picker
 description = "Model description"          # Optional description
-api_key = "sk-..."                        # API key for this provider (optional)
-env_key = "XAI_API_KEY"                   # Env var holding the API key (optional; string or array)
+api_key = { env = "XAI_API_KEY" }         # API key: literal string or env reference (optional)
 api_backend = "chat_completions"          # "chat_completions", "responses", or "messages"
 temperature = 0.7                         # Sampling temperature
 top_p = 0.95                              # Nucleus sampling parameter
@@ -93,10 +92,9 @@ extra_headers = { "x-api-key" = "sk-..." } # Extra request headers, sent verbati
 
 Grok resolves the API key in this order:
 
-1. The `api_key` field in the model config
-2. The environment variable(s) named by `env_key` — a single string or an array of names. The first set, non-empty value wins (for example `env_key = ["ANTHROPIC_AUTH_TOKEN", "LC_ANTHROPIC_AUTH_TOKEN"]` for SSH `LC_*` forwarding)
-3. Your signed-in session token (from `grok login`), for a model with no `api_key`/`env_key` of its own
-4. The `XAI_API_KEY` environment variable (global fallback; Grok also accepts `GROK_CODE_XAI_API_KEY` for backward compatibility)
+1. The model's `api_key`, either a literal string or `{ env = "NAME" }`
+2. Your signed-in session token (from `grok login`) when the model has no `api_key`
+3. The `XAI_API_KEY` environment variable (global fallback; Grok also accepts `GROK_CODE_XAI_API_KEY` for backward compatibility)
 
 ### Context Window
 
@@ -183,7 +181,7 @@ The `messages` backend uses the Anthropic Messages protocol. Anthropic authentic
 model = "gpt-4o"
 base_url = "https://api.openai.com/v1"
 name = "GPT-4o"
-env_key = "OPENAI_API_KEY"
+api_key = { env = "OPENAI_API_KEY" }
 ```
 
 `api_backend` defaults to `"chat_completions"`, so you don't need to set it explicitly for OpenAI.
@@ -198,7 +196,7 @@ model = "gpt-4o"
 base_url = "https://api.openai.com/v1"
 name = "GPT-4o (Responses)"
 api_backend = "responses"
-env_key = "OPENAI_API_KEY"
+api_key = { env = "OPENAI_API_KEY" }
 ```
 
 ### Ollama (Local Models)
@@ -221,7 +219,7 @@ Make sure Ollama is running (`ollama serve`) and the model is pulled (`ollama pu
 model = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 base_url = "https://api.together.xyz/v1"
 name = "Mixtral 8x7B"
-env_key = "TOGETHER_API_KEY"
+api_key = { env = "TOGETHER_API_KEY" }
 ```
 
 ### Local OpenAI-Compatible Server

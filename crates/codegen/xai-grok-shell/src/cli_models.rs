@@ -197,7 +197,7 @@ mod tests {
             r#"
             [model."{dm}"]
             model = "{dm}"
-            env_key = "{TEST_ENV}"
+            api_key = {{ env = "{TEST_ENV}" }}
             "#
         ));
 

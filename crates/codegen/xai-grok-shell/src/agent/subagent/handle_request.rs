@@ -231,13 +231,19 @@ pub(crate) async fn handle_subagent_request(
             return;
         }
     }
-    if let Some(error) = task_model_override_error(
-        request.runtime_overrides.model.as_deref(),
-        request.runtime_overrides.model_override_provenance,
-        resume_source.is_some(),
-        &ctx.available_models,
-        ctx.auth_manager.current_or_expired().is_some_and(|a| a.is_session_auth()),
-    ) {
+    let task_model_error = if request.runtime_overrides.model_override_provenance
+        == ModelOverrideProvenance::Tool
+        && resume_source.is_none()
+    {
+        request
+            .runtime_overrides
+            .model
+            .as_deref()
+            .and_then(|requested| ctx.models_manager.task_model_error(requested))
+    } else {
+        None
+    };
+    if let Some(error) = task_model_error {
         pending_guard.set_error(error.clone());
         send_failure(request, &error);
         return;
@@ -433,9 +439,12 @@ pub(crate) async fn handle_subagent_request(
     );
     {
         let model_str = &effective_sampling_config.model;
-        let model_unknown = !model_str.is_empty() && !ctx.available_models.is_empty()
-            && !ctx.available_models.contains_key(model_str)
-            && !ctx.available_models.values().any(|e| e.info().model == *model_str);
+        let model_unknown = !model_str.is_empty()
+            && !ctx.available_models.is_empty()
+            && ctx
+                .models_manager
+                .resolve_model_reference(&acp::ModelId::new(model_str.as_str()))
+                .is_none();
         if model_unknown {
             let (parent_config, parent_mid) = read_parent_sampling_config(&ctx).await;
             tracing::warn!(

@@ -778,7 +778,7 @@ mod tests {
             model = "{dm}"
             base_url = "https://inference.example.com/v1"
             context_window = 200000
-            env_key = "{TEST_ENV_VAR}"
+            api_key = {{ env = "{TEST_ENV_VAR}" }}
             "#,
         ))
         .unwrap();

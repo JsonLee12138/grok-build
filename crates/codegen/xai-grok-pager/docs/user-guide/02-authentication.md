@@ -247,7 +247,7 @@ Grok picks up changes to `~/.grok/auth.json` automatically. If you update creden
 
 Grok resolves credentials for each request in this order, highest to lowest:
 
-1. **Per-model `api_key` or `env_key`** -- set under `[model.<name>]` in `config.toml`. Wins whenever present.
+1. **Per-model `api_key`** -- set to a literal or `{ env = "NAME" }` under `[model.<name>]` in `config.toml`. Wins whenever present.
 2. **Active session token** -- obtained through browser, OIDC/OAuth2, or external-provider login and stored in `~/.grok/auth.json`.
 3. **`XAI_API_KEY`** -- fallback when no session token is active.
 

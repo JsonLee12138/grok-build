@@ -124,6 +124,56 @@ impl EnvKeys {
         None
     }
 }
+
+/// The single supported API-key configuration syntax.
+///
+/// A string is always a literal secret; `{ env = "NAME" }` is a delayed
+/// environment reference and is never read while parsing configuration.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ApiKeySource {
+    Literal(String),
+    Environment { env: String },
+}
+
+impl<'de> Deserialize<'de> for ApiKeySource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct EnvironmentSource {
+            env: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawSource {
+            Literal(String),
+            Environment(EnvironmentSource),
+        }
+
+        Ok(match RawSource::deserialize(deserializer)? {
+            RawSource::Literal(value) => Self::Literal(value),
+            RawSource::Environment(EnvironmentSource { env }) => Self::Environment { env },
+        })
+    }
+}
+
+impl ApiKeySource {
+    pub(crate) fn is_valid(&self) -> bool {
+        match self {
+            Self::Literal(value) => !value.trim().is_empty(),
+            Self::Environment { env } => {
+                let mut bytes = env.bytes();
+                bytes
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                    && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            }
+        }
+    }
+}
 /// Semantic equality: compares the ordered name lists, so `One("X")` and
 /// `Many(["X"])` (the shape serde produces for `["X"]`) compare equal.
 impl PartialEq for EnvKeys {
@@ -1278,6 +1328,12 @@ pub struct Config {
     /// `[model.*]` overrides from config.toml. Resolve via `resolve_model_list()`.
     #[serde(skip)]
     pub config_models: IndexMap<String, ConfigModelOverride>,
+    /// `[provider.*]` definitions referenced by provider-backed model entries.
+    #[serde(skip)]
+    pub providers: IndexMap<String, ProviderConfig>,
+    /// Derived alias lookup state. Aliases never become catalog entries.
+    #[serde(skip)]
+    pub model_aliases: AliasIndex,
     /// Warnings from `[model.*]` parsing; surfaced by `grok inspect`.
     #[serde(skip)]
     pub model_override_warnings: Vec<super::config_model_override_parse::ModelOverrideWarning>,
@@ -1706,6 +1762,8 @@ impl Default for Config {
             doom_loop_recovery: crate::util::config::DoomLoopRecoverySettings::default(),
             auto_mode: AutoModeConfig::default(),
             config_models: IndexMap::new(),
+            providers: IndexMap::new(),
+            model_aliases: AliasIndex::default(),
             model_override_warnings: Vec::new(),
             grok_com_config: GrokComConfig::default(),
             shortcuts: None,
@@ -1845,16 +1903,19 @@ impl Config {
         let raw_config = &Self::expand_auth_alias(raw_config);
         let super::config_model_override_parse::ParsedModelOverrides {
             models: config_models,
+            providers,
             warnings: model_override_warnings,
         } = super::config_model_override_parse::parse_model_overrides(raw_config);
-        super::config_model_override_parse::log_model_override_warnings(&model_override_warnings);
+        let mut model_override_warnings = model_override_warnings;
         let mut base = toml::Value::try_from(Self::default()).map_err(|e| e.to_string())?;
         if let toml::Value::Table(ref mut t) = base {
             t.remove("model");
+            t.remove("provider");
         }
         let mut raw_without_model_sections = raw_config.clone();
         if let toml::Value::Table(ref mut t) = raw_without_model_sections {
             t.remove("model");
+            t.remove("provider");
         }
         crate::config::deep_merge_toml(&mut base, &raw_without_model_sections);
         let (mut config, user_unused) =
@@ -1866,7 +1927,13 @@ impl Config {
             );
         }
         config.config_models = config_models;
+        config.providers = providers;
+        config.model_aliases =
+            AliasIndex::from_models(&config.config_models, &mut model_override_warnings);
         config.model_override_warnings = model_override_warnings;
+        super::config_model_override_parse::log_model_override_warnings(
+            &config.model_override_warnings,
+        );
         if config.grok_com_config.oidc.is_none() {
             config.grok_com_config.oidc = OidcAuthConfig::from_env();
         }
@@ -3176,6 +3243,10 @@ pub fn resolve_model_list(
         resolved = prefetched;
     }
     for (key, model_override) in &cfg.config_models {
+        if model_override.reject_model {
+            resolved.shift_remove(key);
+            continue;
+        }
         let had_base = resolved.contains_key(key);
         let base = resolved.shift_remove(key);
         if !had_base {
@@ -3317,9 +3388,146 @@ pub fn find_model_by_id<'a>(
     models: &'a IndexMap<String, ModelEntry>,
     model_id: &str,
 ) -> Option<&'a ModelEntry> {
-    models
-        .get(model_id)
-        .or_else(|| models.values().find(|m| m.model == model_id))
+    resolve_model_reference(models, &AliasIndex::default(), model_id).map(|(_, entry)| entry)
+}
+
+/// A configuration-derived, read-only alias index kept outside the model catalog.
+#[derive(Clone, Debug, Default)]
+pub struct AliasIndex {
+    pub(crate) targets: IndexMap<String, String>,
+    /// Reserved for aliases that must fail closed instead of falling through
+    /// to an identically named catalog key or wire slug.
+    pub(crate) blocked: std::collections::HashSet<String>,
+}
+
+impl AliasIndex {
+    fn from_models(
+        models: &IndexMap<String, ConfigModelOverride>,
+        warnings: &mut Vec<super::config_model_override_parse::ModelOverrideWarning>,
+    ) -> Self {
+        use super::config_model_override_parse::{ModelOverrideWarning, ModelOverrideWarningKind};
+
+        let mut index = Self::default();
+        for (catalog_key, model) in models {
+            // Direct Model aliases are outside the Provider alias contract,
+            // including when the Direct Model itself was rejected.
+            if !model.provider_alias_eligible && model.provider.is_none() {
+                continue;
+            }
+            if model.reject_model {
+                if let Some(alias) = &model.alias {
+                    index.targets.shift_remove(alias);
+                    index.blocked.insert(alias.clone());
+                    let warning = ModelOverrideWarning {
+                        model_key: Some(catalog_key.clone()),
+                        field: Some("alias".to_owned()),
+                        kind: ModelOverrideWarningKind::InvalidValue,
+                    };
+                    if !warnings.contains(&warning) {
+                        warnings.push(warning);
+                    }
+                }
+                continue;
+            }
+            let Some(alias) = &model.alias else {
+                continue;
+            };
+            if !super::config_model_override_parse::is_valid_alias(alias) {
+                index.targets.shift_remove(alias);
+                index.blocked.insert(alias.clone());
+                let warning = ModelOverrideWarning {
+                    model_key: Some(catalog_key.clone()),
+                    field: Some("alias".to_owned()),
+                    kind: ModelOverrideWarningKind::InvalidValue,
+                };
+                if !warnings.contains(&warning) {
+                    warnings.push(warning);
+                }
+                continue;
+            }
+            if index.blocked.contains(alias) {
+                warnings.push(ModelOverrideWarning {
+                    model_key: Some(catalog_key.clone()),
+                    field: Some("alias".to_owned()),
+                    kind: ModelOverrideWarningKind::DuplicateAlias,
+                });
+                continue;
+            }
+            if index.targets.shift_remove(alias).is_some() {
+                index.blocked.insert(alias.clone());
+                warnings.push(ModelOverrideWarning {
+                    model_key: Some(catalog_key.clone()),
+                    field: Some("alias".to_owned()),
+                    kind: ModelOverrideWarningKind::DuplicateAlias,
+                });
+            } else {
+                index.targets.insert(alias.clone(), catalog_key.clone());
+            }
+        }
+        index
+    }
+}
+
+impl Config {
+    /// Replace alias-shadow diagnostics using the catalog snapshot that will
+    /// actually be published. Static parsing cannot know a remote-only catalog
+    /// and must not report bundled entries that a prefetch replaces.
+    pub(crate) fn refresh_alias_shadow_warnings(&mut self, catalog: &IndexMap<String, ModelEntry>) {
+        let aliases = self.model_aliases.clone();
+        self.refresh_alias_shadow_warnings_for(catalog, &aliases);
+    }
+
+    pub(crate) fn refresh_alias_shadow_warnings_for(
+        &mut self,
+        catalog: &IndexMap<String, ModelEntry>,
+        aliases: &AliasIndex,
+    ) {
+        use super::config_model_override_parse::{ModelOverrideWarning, ModelOverrideWarningKind};
+
+        self.model_override_warnings
+            .retain(|warning| warning.kind != ModelOverrideWarningKind::AliasShadow);
+        let mut added = Vec::new();
+        for (alias, target) in &aliases.targets {
+            if catalog.contains_key(alias)
+                || catalog.values().any(|entry| entry.info.model == *alias)
+            {
+                added.push(ModelOverrideWarning {
+                    model_key: Some(target.clone()),
+                    field: Some("alias".to_owned()),
+                    kind: ModelOverrideWarningKind::AliasShadow,
+                });
+            }
+        }
+        super::config_model_override_parse::log_model_override_warnings(&added);
+        self.model_override_warnings.extend(added);
+    }
+}
+
+/// Resolve `requested` in the single supported order: alias, exact catalog
+/// key, then the existing wire-model slug compatibility scan.
+pub fn resolve_model_reference<'a>(
+    entries: &'a IndexMap<String, ModelEntry>,
+    aliases: &AliasIndex,
+    requested: &str,
+) -> Option<(&'a str, &'a ModelEntry)> {
+    if aliases.blocked.contains(requested) {
+        return None;
+    }
+    if let Some(target) = aliases.targets.get(requested) {
+        return entries
+            .get_key_value(target)
+            .map(|(key, entry)| (key.as_str(), entry));
+    }
+    entries
+        .get_key_value(requested)
+        .map(|(key, entry)| (key.as_str(), entry))
+        .or_else(|| {
+            entries
+                .iter()
+                .rev()
+                .find(|(_, entry)| entry.info.model == requested)
+                .map(|(key, entry)| (key.as_str(), entry))
+        })
 }
 /// Whether the EFFECTIVE Auto-mode classifier model supports reasoning effort:
 /// the model actually routed to (`aux_model` when the aux sampler resolved) else
@@ -3561,14 +3769,35 @@ pub struct ModelEntryConfig {
 fn is_default_laziness_detector(cfg: &LazinessDetectorPerModelConfig) -> bool {
     cfg == &LazinessDetectorPerModelConfig::default()
 }
+/// A named upstream provider from `[provider.<id>]`.
+///
+/// Provider-backed models are still materialized as the existing
+/// [`ModelEntry`] type; this configuration type does not cross into request
+/// handling.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProviderConfig {
+    pub base_url: Option<String>,
+    pub api_base_url: Option<String>,
+    pub api_backend: Option<ApiBackend>,
+    pub auth_scheme: Option<AuthScheme>,
+    pub api_key: Option<ApiKeySource>,
+    #[serde(default)]
+    pub extra_headers: IndexMap<String, String>,
+}
 /// A `[model.foo]` entry from config.toml, parsed directly from raw TOML
 /// (bypassing deep merge). Scalar fields are `Option` so absent means "inherit
-/// from defaults/prefetched"; the collection fields (`extra_headers`,
-/// `reasoning_efforts`) merge only when non-empty and so cannot express
-/// "override to empty."
+/// from defaults/prefetched". `extra_headers` retains presence so an explicit
+/// empty table can clear inherited headers; `reasoning_efforts` still merges
+/// only when non-empty and cannot express "override to empty."
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ConfigModelOverride {
+    /// Explicit provider reference. Provider-backed keys must be
+    /// `<provider-id>/<wire-model-id>`.
+    pub provider: Option<String>,
+    /// Optional case-sensitive business identifier, resolved outside the catalog.
+    pub alias: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub name: Option<String>,
@@ -3581,8 +3810,9 @@ pub struct ConfigModelOverride {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: Option<ApiBackend>,
-    #[serde(default)]
-    pub extra_headers: IndexMap<String, String>,
+    pub auth_scheme: Option<AuthScheme>,
+    /// `None` means inherit; `Some(empty)` explicitly clears inherited headers.
+    pub extra_headers: Option<IndexMap<String, String>>,
     pub context_window: Option<u64>,
     /// Per-model auto-compact threshold override (0-100) from `[model.<id>]`.
     /// Read directly by `resolve_auto_compact_threshold_percent`; intentionally
@@ -3608,6 +3838,18 @@ pub struct ConfigModelOverride {
     pub compaction_at_tokens: Option<CompactionAtTokens>,
     pub show_model_fingerprint: Option<bool>,
     pub stream_tool_calls: Option<bool>,
+    /// Adapter-only marker used to clear credentials inherited from a
+    /// prefetched/base entry when Provider credentials cannot cross origin.
+    #[serde(skip)]
+    pub(crate) clear_credentials: bool,
+    /// Fail-closed tombstone for an invalid credential declaration. Resolution
+    /// removes any default/prefetched entry with the same key.
+    #[serde(skip)]
+    pub(crate) reject_model: bool,
+    /// Raw entry contained a `provider` field, even when its value could not
+    /// be normalized into `provider`.
+    #[serde(skip)]
+    pub(crate) provider_alias_eligible: bool,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -3644,8 +3886,11 @@ impl ConfigModelOverride {
         if let Some(ref v) = self.api_backend {
             entry.info.api_backend = v.clone();
         }
-        if !self.extra_headers.is_empty() {
-            entry.info.extra_headers = self.extra_headers.clone();
+        if let Some(v) = self.auth_scheme {
+            entry.info.auth_scheme = v;
+        }
+        if let Some(extra_headers) = &self.extra_headers {
+            entry.info.extra_headers.clone_from(extra_headers);
         }
         if let Some(cw) = self.context_window.and_then(NonZeroU64::new) {
             entry.info.context_window = cw;
@@ -3696,10 +3941,14 @@ impl ConfigModelOverride {
         if self.stream_tool_calls.is_some() {
             entry.info.stream_tool_calls = self.stream_tool_calls;
         }
-        if self.api_key.is_some() {
+        if self.clear_credentials {
+            entry.api_key = None;
+            entry.env_key = None;
+        } else if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
-        }
-        if self.env_key.is_some() {
+            entry.env_key = None;
+        } else if self.env_key.is_some() {
+            entry.api_key = None;
             entry.env_key.clone_from(&self.env_key);
         }
         if self.api_base_url.is_some() {
@@ -4402,7 +4651,7 @@ pub fn try_resolve_model_credentials(
         .map_err(|e| tracing::warn!(error = % e, "config parse failed for credential resolution"))
         .ok()?;
     let models = resolve_model_list(&cfg, None);
-    let entry = find_model_by_id(&models, model_id)?;
+    let (_, entry) = resolve_model_reference(&models, &cfg.model_aliases, model_id)?;
     let mut credentials = resolve_credentials(entry, session_key);
     enforce_disable_api_key_auth(
         &mut credentials,
@@ -4466,7 +4715,9 @@ fn with_resolved_model<T>(model_id: &str, f: impl FnOnce(ModelLookup) -> T) -> T
         return f(ModelLookup::ConfigUnavailable);
     };
     let models = resolve_model_list(&cfg, None);
-    f(ModelLookup::Loaded(find_model_by_id(&models, model_id)))
+    f(ModelLookup::Loaded(
+        resolve_model_reference(&models, &cfg.model_aliases, model_id).map(|(_, entry)| entry),
+    ))
 }
 /// Resolve a standalone `SamplerConfig` for an auxiliary model slug (image
 /// description, session summary, ...), resolved through the catalog so a
@@ -4921,6 +5172,10 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use xai_grok_test_support::EnvGuard;
+    #[test]
+    fn provider_model_acceptance_ac_09() {
+        crate::agent::config_model_override_parse::tests::assert_provider_model_acceptance_ac_09();
+    }
     #[test]
     fn main_cli_tools_override_preserves_profile_injection_policy() {
         let overrides = CliAgentOverrides {
@@ -5684,9 +5939,9 @@ reasoning_effort = "low"
     }
     #[test]
     #[serial]
-    fn config_toml_env_key_array_parses() {
+    fn config_toml_env_key_array_fails_closed() {
         let dm = crate::models::default_model();
-        let (_, models) = resolve_models_from_toml(
+        let (cfg, models) = resolve_models_from_toml(
             &format!(
                 r#"
             [model."{dm}"]
@@ -5697,11 +5952,13 @@ reasoning_effort = "low"
             ),
             None,
         );
-        let model = models.get(dm).expect("model should exist");
-        assert_eq!(
-            model.env_key.as_ref().map(|k| k.names()),
-            Some(vec!["ANTHROPIC_AUTH_TOKEN", "LC_ANTHROPIC_AUTH_TOKEN"])
-        );
+        assert!(!models.contains_key(dm));
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some(dm)
+                && warning.field.as_deref() == Some("env_key")
+                && warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+        }));
     }
     #[test]
     fn resolve_credentials_sets_auth_type() {
@@ -7232,10 +7489,1197 @@ reasoning_effort = "low"
         prefetched: Option<IndexMap<String, ModelEntry>>,
     ) -> (Config, IndexMap<String, ModelEntry>) {
         let raw: toml::Value = toml::from_str(toml_str).expect("test TOML should parse");
-        let cfg = Config::new_from_toml_cfg(&raw).expect("config should parse");
+        let mut cfg = Config::new_from_toml_cfg(&raw).expect("config should parse");
         let resolved = resolve_model_list(&cfg, prefetched);
+        cfg.refresh_alias_shadow_warnings(&resolved);
         (cfg, resolved)
     }
+
+    #[test]
+    fn direct_model_legacy_dual_credentials_fail_closed() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [model."legacy-direct"]
+            model = "wire-direct"
+            api_key = "literal-key"
+            env_key = "FALLBACK_ENV"
+            "#,
+            None,
+        );
+
+        assert!(!catalog.contains_key("legacy-direct"));
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some("legacy-direct")
+                && warning.field.as_deref() == Some("env_key")
+                && warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+        }));
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_01() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            None,
+        );
+
+        assert!(cfg.providers.contains_key("acme"));
+        assert_eq!(
+            catalog
+                .keys()
+                .filter(|key| key.as_str() == "acme/demo-v1")
+                .count(),
+            1
+        );
+        let entry = catalog.get("acme/demo-v1").expect("provider model exists");
+        assert_eq!(entry.info.model, "demo-v1");
+        assert_eq!(entry.info.base_url, "https://api.acme.example/v1");
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_02() {
+        use crate::agent::models::ModelsManager;
+
+        let config_with_url = |base_url: &str| {
+            let raw: toml::Value = toml::from_str(&format!(
+                r#"
+                [provider.acme]
+                base_url = "{base_url}"
+
+                [model."acme/demo-v1"]
+                provider = "acme"
+                "#
+            ))
+            .expect("test TOML parses");
+            Config::new_from_toml_cfg(&raw).expect("config parses")
+        };
+
+        let mgr = ModelsManager::default();
+        mgr.apply_config(config_with_url("https://a.acme.example/v1"));
+        let before = mgr.models();
+        mgr.apply_config(config_with_url("https://b.acme.example/v1"));
+        let after = mgr.models();
+
+        assert_eq!(
+            before["acme/demo-v1"].info.base_url,
+            "https://a.acme.example/v1"
+        );
+        assert_eq!(
+            after["acme/demo-v1"].info.base_url,
+            "https://b.acme.example/v1"
+        );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_03() {
+        use crate::agent::models::ModelsManager;
+
+        let parse_config = |input: &str| {
+            let raw: toml::Value = toml::from_str(input).expect("test TOML parses");
+            Config::new_from_toml_cfg(&raw).expect("config parses")
+        };
+        let mgr = ModelsManager::default();
+        mgr.apply_config(parse_config(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+        ));
+        let before = mgr.models();
+        mgr.apply_config(parse_config(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            "#,
+        ));
+        let after = mgr.models();
+
+        assert!(before.contains_key("acme/demo-v1"));
+        assert!(!after.contains_key("acme/demo-v1"));
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_04() {
+        fn existing_backend_name(backend: &ApiBackend) -> &'static str {
+            match backend {
+                ApiBackend::ChatCompletions => "chat_completions",
+                ApiBackend::Responses => "responses",
+                ApiBackend::Messages => "messages",
+            }
+        }
+
+        let cases = [
+            ("chat_completions", ApiBackend::ChatCompletions),
+            ("messages", ApiBackend::Messages),
+            ("responses", ApiBackend::Responses),
+        ];
+        for (configured, expected) in cases {
+            let (_, catalog) = resolve_models_from_toml(
+                &format!(
+                    r#"
+                    [provider.acme]
+                    base_url = "https://api.acme.example/v1"
+                    api_backend = "{configured}"
+
+                    [model."acme/demo-v1"]
+                    provider = "acme"
+                    "#
+                ),
+                None,
+            );
+            let actual = &catalog["acme/demo-v1"].info.api_backend;
+            assert_eq!(actual, &expected, "provider backend must be preserved");
+            assert_eq!(existing_backend_name(actual), configured);
+        }
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_05() {
+        let (_, inherited_catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            api_key = "literal-secret"
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            None,
+        );
+        let inherited = &inherited_catalog["acme/demo-v1"];
+        assert_eq!(inherited.api_key.as_deref(), Some("literal-secret"));
+        assert!(inherited.env_key.is_none());
+
+        let (_, overridden_catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            api_key = "provider-secret"
+            [model."acme/demo-v1"]
+            provider = "acme"
+            api_key = { env = "MODEL_API_KEY" }
+            "#,
+            None,
+        );
+        let overridden = &overridden_catalog["acme/demo-v1"];
+        assert!(overridden.api_key.is_none());
+        assert_eq!(
+            overridden.env_key.as_ref().and_then(EnvKeys::primary),
+            Some("MODEL_API_KEY")
+        );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_06() {
+        let (_, inherited_catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            api_key = { env = "JSO_284_AC_06_UNSET_ENV_REFERENCE" }
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            None,
+        );
+        let inherited = &inherited_catalog["acme/demo-v1"];
+        assert!(inherited.api_key.is_none());
+        assert_eq!(
+            inherited.env_key.as_ref().and_then(EnvKeys::primary),
+            Some("JSO_284_AC_06_UNSET_ENV_REFERENCE")
+        );
+
+        let (_, overridden_catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            api_key = { env = "PROVIDER_API_KEY" }
+            [model."acme/demo-v1"]
+            provider = "acme"
+            api_key = "model-secret"
+            "#,
+            None,
+        );
+        let overridden = &overridden_catalog["acme/demo-v1"];
+        assert_eq!(overridden.api_key.as_deref(), Some("model-secret"));
+        assert!(overridden.env_key.is_none());
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_07() {
+        let (_, inherited_catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://provider.example/v1"
+            api_base_url = "https://provider-api.example/v1"
+            api_backend = "messages"
+            auth_scheme = "x_api_key"
+            extra_headers = { x-route = "provider" }
+
+            [model."acme/inherited"]
+            provider = "acme"
+            "#,
+            None,
+        );
+        let inherited = &inherited_catalog["acme/inherited"];
+        assert_eq!(inherited.info.base_url, "https://provider.example/v1");
+        assert_eq!(
+            inherited.api_base_url.as_deref(),
+            Some("https://provider-api.example/v1")
+        );
+        assert_eq!(inherited.info.api_backend, ApiBackend::Messages);
+        assert_eq!(inherited.info.auth_scheme, AuthScheme::XApiKey);
+        assert_eq!(
+            inherited
+                .info
+                .extra_headers
+                .get("x-route")
+                .map(String::as_str),
+            Some("provider")
+        );
+
+        enum ConnectionField {
+            BaseUrl,
+            ApiBaseUrl,
+            ApiBackend,
+            AuthScheme,
+            ExtraHeaders,
+        }
+
+        let cases = [
+            (
+                ConnectionField::BaseUrl,
+                r#"
+                [provider.acme]
+                base_url = "https://provider.example/v1"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                base_url = "https://model.example/v1"
+                "#,
+            ),
+            (
+                ConnectionField::ApiBaseUrl,
+                r#"
+                [provider.acme]
+                base_url = "https://provider.example/v1"
+                api_base_url = "https://provider-api.example/v1"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                api_base_url = "https://model-api.example/v1"
+                "#,
+            ),
+            (
+                ConnectionField::ApiBackend,
+                r#"
+                [provider.acme]
+                base_url = "https://provider.example/v1"
+                api_backend = "messages"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                api_backend = "responses"
+                "#,
+            ),
+            (
+                ConnectionField::AuthScheme,
+                r#"
+                [provider.acme]
+                base_url = "https://provider.example/v1"
+                auth_scheme = "x_api_key"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                auth_scheme = "bearer"
+                "#,
+            ),
+            (
+                ConnectionField::ExtraHeaders,
+                r#"
+                [provider.acme]
+                base_url = "https://provider.example/v1"
+                extra_headers = { x-route = "provider" }
+                [model."acme/demo-v1"]
+                provider = "acme"
+                extra_headers = { x-route = "model" }
+                "#,
+            ),
+        ];
+
+        for (field, input) in cases {
+            let (_, catalog) = resolve_models_from_toml(input, None);
+            let entry = &catalog["acme/demo-v1"];
+            match field {
+                ConnectionField::BaseUrl => {
+                    assert_eq!(entry.info.base_url, "https://model.example/v1")
+                }
+                ConnectionField::ApiBaseUrl => assert_eq!(
+                    entry.api_base_url.as_deref(),
+                    Some("https://model-api.example/v1")
+                ),
+                ConnectionField::ApiBackend => {
+                    assert_eq!(entry.info.api_backend, ApiBackend::Responses)
+                }
+                ConnectionField::AuthScheme => {
+                    assert_eq!(entry.info.auth_scheme, AuthScheme::Bearer)
+                }
+                ConnectionField::ExtraHeaders => assert_eq!(
+                    entry.info.extra_headers.get("x-route").map(String::as_str),
+                    Some("model")
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_08() {
+        let cases = [
+            (
+                "independent env_key",
+                r#"api_key = "model-secret"
+                env_key = "SECRET_ENV_VALUE""#,
+                "env_key",
+                "SECRET_ENV_VALUE",
+            ),
+            (
+                "independent env_key without api_key",
+                r#"env_key = "ONLY_SECRET_ENV_VALUE""#,
+                "env_key",
+                "ONLY_SECRET_ENV_VALUE",
+            ),
+            (
+                "invalid environment name",
+                r#"api_key = { env = "9INVALID_SECRET_ENV" }"#,
+                "api_key",
+                "9INVALID_SECRET_ENV",
+            ),
+            (
+                "inline table has extra member",
+                r#"api_key = { env = "VALID_ENV", extra = "secret-ac-08-extra-marker" }"#,
+                "api_key",
+                "secret-ac-08-extra-marker",
+            ),
+            (
+                "api_key has wrong type",
+                "api_key = 28408",
+                "api_key",
+                "28408",
+            ),
+        ];
+
+        for (case, model_credentials, expected_field, secret) in cases {
+            let raw: toml::Value = toml::from_str(&format!(
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                {model_credentials}
+                "#
+            ))
+            .expect("case TOML parses");
+            let cfg = Config::new_from_toml_cfg(&raw).expect("config parses");
+            let catalog = resolve_model_list(&cfg, None);
+            assert!(
+                !catalog.contains_key("acme/demo-v1"),
+                "{case}: invalid provider model must be dropped"
+            );
+            assert!(cfg.model_override_warnings.iter().any(|warning| {
+                warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+                    && warning.model_key.as_deref() == Some("acme/demo-v1")
+                    && warning.field.as_deref() == Some(expected_field)
+            }));
+            let rendered = serde_json::to_string(&cfg.model_override_warnings).unwrap();
+            assert!(!rendered.contains(secret), "{case}: warning leaked a value");
+        }
+
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/demo-v1"]
+            provider = "acme"
+            api_key = "   "
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        assert!(!resolve_model_list(&cfg, None).contains_key("acme/demo-v1"));
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_10() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            None,
+        );
+
+        let (catalog_key, entry) =
+            resolve_model_reference(&catalog, &cfg.model_aliases, "acme/demo-v1")
+                .expect("canonical model reference must resolve");
+        assert_eq!(catalog_key, "acme/demo-v1");
+        assert_eq!(entry.info.model, "demo-v1");
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_11() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/demo-v1"]
+            provider = "acme"
+            alias = "fast"
+            "#,
+            None,
+        );
+
+        let (catalog_key, entry) = resolve_model_reference(&catalog, &cfg.model_aliases, "fast")
+            .expect("alias must resolve");
+        assert_eq!(catalog_key, "acme/demo-v1");
+        assert_eq!(entry.info.model, "demo-v1");
+        assert!(
+            !catalog.contains_key("fast"),
+            "alias must stay outside catalog"
+        );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_11_direct_model_alias_is_not_indexed() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [model."direct-demo"]
+            model = "upstream-direct"
+            alias = "direct-fast"
+            "#,
+            None,
+        );
+
+        assert!(catalog.contains_key("direct-demo"));
+        assert!(!catalog.contains_key("direct-fast"));
+        assert!(
+            resolve_model_reference(&catalog, &cfg.model_aliases, "direct-fast").is_none(),
+            "direct Model aliases are outside the Provider alias contract"
+        );
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_12() {
+        use super::super::config_model_override_parse::ModelOverrideWarningKind;
+
+        let replaced_default = default_model_entries(&EndpointsConfig::default())
+            .into_keys()
+            .next()
+            .expect("bundled catalog is non-empty");
+        let mut prefetched = IndexMap::new();
+        prefetched.insert(
+            "shadow-key".to_owned(),
+            test_model_entry(
+                "remote-key-wire",
+                "https://remote.example/v1",
+                None,
+                None,
+                None,
+            ),
+        );
+        prefetched.insert(
+            "remote-wire-entry".to_owned(),
+            test_model_entry("shadow-wire", "https://remote.example/v1", None, None, None),
+        );
+        let (cfg, catalog) = resolve_models_from_toml(
+            &format!(
+                r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+
+            [model."acme/key-target"]
+            provider = "acme"
+            alias = "shadow-key"
+
+            [model."acme/wire-target"]
+            provider = "acme"
+            alias = "shadow-wire"
+
+            [model."acme/replaced-default-target"]
+            provider = "acme"
+            alias = "{replaced_default}"
+            "#
+            ),
+            Some(prefetched),
+        );
+
+        for (alias, expected_key) in [
+            ("shadow-key", "acme/key-target"),
+            ("shadow-wire", "acme/wire-target"),
+        ] {
+            let (catalog_key, _) = resolve_model_reference(&catalog, &cfg.model_aliases, alias)
+                .expect("a shadowing alias must resolve before a catalog key or wire slug");
+            assert_eq!(catalog_key, expected_key);
+        }
+        assert_eq!(
+            cfg.model_override_warnings
+                .iter()
+                .filter(|warning| {
+                    warning.kind == ModelOverrideWarningKind::AliasShadow
+                        && warning.field.as_deref() == Some("alias")
+                })
+                .count(),
+            2
+        );
+        assert!(
+            !cfg.model_override_warnings.iter().any(|warning| {
+                warning.kind == ModelOverrideWarningKind::AliasShadow
+                    && warning.model_key.as_deref() == Some("acme/replaced-default-target")
+            }),
+            "a bundled model replaced by the remote snapshot must not trigger a stale warning"
+        );
+        let rendered = serde_json::to_string(&cfg.model_override_warnings).unwrap();
+        assert!(!rendered.contains("shadow-key"));
+        assert!(!rendered.contains("shadow-wire"));
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_13() {
+        use super::super::config_model_override_parse::ModelOverrideWarningKind;
+
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+
+            [model."acme/duplicate-a"]
+            provider = "acme"
+            alias = "blocked-key"
+
+            [model."acme/duplicate-b"]
+            provider = "acme"
+            alias = "blocked-key"
+
+            [model."blocked-key"]
+            model = "direct-fallback"
+
+            [model."missing/invalid-target"]
+            provider = "missing"
+            alias = "blocked-wire"
+
+            [model."direct-wire-fallback"]
+            model = "blocked-wire"
+
+            [model."acme/invalid-credential-target"]
+            provider = "acme"
+            alias = "blocked-credential-wire"
+            api_key = { env = "VALID_ENV", extra = "never-log-this-alias-secret" }
+
+            [model."direct-credential-fallback"]
+            model = "blocked-credential-wire"
+
+            [model."acme/invalid-alias-exact"]
+            provider = "acme"
+            alias = "invalid exact"
+
+            [model."invalid exact"]
+            model = "direct-invalid-exact"
+
+            [model."acme/invalid-alias-wire"]
+            provider = "acme"
+            alias = "invalid/wire"
+
+            [model."direct-invalid-wire"]
+            model = "invalid/wire"
+
+            [model."rejected-direct-exact-source"]
+            alias = "direct-stays-exact"
+            env_key = "REJECTED_DIRECT_EXACT_ENV"
+
+            [model."direct-stays-exact"]
+            model = "direct-stays-exact-wire"
+
+            [model."rejected-direct-wire-source"]
+            alias = "direct-stays-wire"
+            env_key = "REJECTED_DIRECT_WIRE_ENV"
+
+            [model."direct-stays-wire-entry"]
+            model = "direct-stays-wire"
+
+            [model."raw-provider-invalid-exact-source"]
+            provider = 7
+            alias = "raw-provider-blocked-exact"
+
+            [model."raw-provider-blocked-exact"]
+            model = "raw-provider-exact-wire"
+
+            [model."raw-provider-invalid-wire-source"]
+            provider = 7
+            alias = "raw-provider-blocked-wire"
+
+            [model."raw-provider-wire-fallback"]
+            model = "raw-provider-blocked-wire"
+            "#,
+            None,
+        );
+
+        for requested in [
+            "blocked-key",
+            "blocked-wire",
+            "blocked-credential-wire",
+            "invalid exact",
+            "invalid/wire",
+            "raw-provider-blocked-exact",
+            "raw-provider-blocked-wire",
+        ] {
+            assert!(
+                resolve_model_reference(&catalog, &cfg.model_aliases, requested).is_none(),
+                "a blocked alias must not fall through to the same-name key or wire slug"
+            );
+            assert!(!cfg.model_aliases.targets.contains_key(requested));
+            assert!(cfg.model_aliases.blocked.contains(requested));
+        }
+        for (requested, expected_key) in [
+            ("direct-stays-exact", "direct-stays-exact"),
+            ("direct-stays-wire", "direct-stays-wire-entry"),
+        ] {
+            let (catalog_key, _) = resolve_model_reference(&catalog, &cfg.model_aliases, requested)
+                .expect("a rejected Direct Model alias must remain outside the alias contract");
+            assert_eq!(catalog_key, expected_key);
+            assert!(!cfg.model_aliases.blocked.contains(requested));
+        }
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.kind == ModelOverrideWarningKind::DuplicateAlias
+                && warning.field.as_deref() == Some("alias")
+        }));
+        let rendered = serde_json::to_string(&cfg.model_override_warnings).unwrap();
+        assert!(!rendered.contains("never-log-this-alias-secret"));
+        assert!(!rendered.contains("invalid exact"));
+        assert!(!rendered.contains("invalid/wire"));
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.kind == ModelOverrideWarningKind::InvalidValue
+                && warning.model_key.as_deref() == Some("missing/invalid-target")
+                && warning.field.as_deref() == Some("alias")
+        }));
+
+        let parse = |source: &str| {
+            let raw: toml::Value = toml::from_str(source).unwrap();
+            Config::new_from_toml_cfg(&raw).unwrap()
+        };
+        let target_cfg = parse(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/reload-target"]
+            provider = "acme"
+            alias = "reload-name"
+            [model."reload-name"]
+            model = "direct-reload-fallback"
+            "#,
+        );
+        let blocked_cfg = parse(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/reload-a"]
+            provider = "acme"
+            alias = "reload-name"
+            [model."acme/reload-b"]
+            provider = "acme"
+            alias = "reload-name"
+            [model."reload-name"]
+            model = "direct-reload-fallback"
+            "#,
+        );
+        let manager = crate::agent::models::ModelsManager::default();
+        manager.apply_config(blocked_cfg.clone());
+        assert!(
+            manager
+                .resolve_model_reference(&acp::ModelId::new("reload-name"))
+                .is_none()
+        );
+        manager.apply_config(target_cfg.clone());
+        assert_eq!(
+            manager
+                .resolve_model_reference(&acp::ModelId::new("reload-name"))
+                .map(|(key, _)| key),
+            Some(acp::ModelId::new("acme/reload-target"))
+        );
+
+        let writer_manager = manager.clone();
+        let writer = std::thread::spawn(move || {
+            for iteration in 0..64 {
+                writer_manager.apply_config(if iteration % 2 == 0 {
+                    blocked_cfg.clone()
+                } else {
+                    target_cfg.clone()
+                });
+            }
+        });
+        for _ in 0..1024 {
+            let resolved = manager.resolve_model_reference(&acp::ModelId::new("reload-name"));
+            assert!(
+                resolved.is_none()
+                    || resolved
+                        .as_ref()
+                        .is_some_and(|(key, _)| key.0.as_ref() == "acme/reload-target"),
+                "reload must publish alias targets and blocked names atomically"
+            );
+        }
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_14() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            [model."acme/demo-v1"]
+            provider = "acme"
+            model = "upstream-demo"
+            alias = "fast"
+            "#,
+            None,
+        );
+
+        for requested in ["acme/demo-v1", "fast"] {
+            let (catalog_key, entry) =
+                resolve_model_reference(&catalog, &cfg.model_aliases, requested)
+                    .expect("canonical key and alias must resolve");
+            assert_eq!(catalog_key, "acme/demo-v1");
+            assert_eq!(entry.info.model, "upstream-demo");
+        }
+    }
+
+    #[test]
+    fn provider_model_acceptance_ac_15() {
+        let (literal_cfg, literal_catalog) = resolve_models_from_toml(
+            r#"
+            [model."direct-literal"]
+            model = "wire-literal"
+            api_key = "direct-literal-secret"
+            "#,
+            None,
+        );
+        for requested in ["direct-literal", "wire-literal"] {
+            let (catalog_key, entry) =
+                resolve_model_reference(&literal_catalog, &literal_cfg.model_aliases, requested)
+                    .expect("direct literal model resolves by table key and wire slug");
+            assert_eq!(catalog_key, "direct-literal");
+            assert_eq!(entry.api_key.as_deref(), Some("direct-literal-secret"));
+            assert!(entry.env_key.is_none());
+        }
+
+        let (env_cfg, env_catalog) = resolve_models_from_toml(
+            r#"
+            [model."direct-env"]
+            model = "wire-env"
+            api_key = { env = "DIRECT_MODEL_API_KEY" }
+            "#,
+            None,
+        );
+        for requested in ["direct-env", "wire-env"] {
+            let (catalog_key, entry) =
+                resolve_model_reference(&env_catalog, &env_cfg.model_aliases, requested)
+                    .expect("direct env model resolves by table key and wire slug");
+            assert_eq!(catalog_key, "direct-env");
+            assert!(entry.api_key.is_none());
+            assert_eq!(
+                entry.env_key.as_ref().and_then(EnvKeys::primary),
+                Some("DIRECT_MODEL_API_KEY")
+            );
+        }
+
+        let mut prefetched = IndexMap::new();
+        prefetched.insert(
+            "blocked-direct".to_owned(),
+            test_model_entry(
+                "wire-default-fallback",
+                "https://fallback.example/v1",
+                Some("default-fallback-secret"),
+                Some("DEFAULT_FALLBACK_ENV"),
+                None,
+            ),
+        );
+        let (blocked_cfg, blocked_catalog) = resolve_models_from_toml(
+            r#"
+            [model."blocked-direct"]
+            model = "wire-blocked"
+            env_key = "INDEPENDENT_ENV_MUST_FAIL_CLOSED"
+            "#,
+            Some(prefetched),
+        );
+        assert!(
+            resolve_model_reference(
+                &blocked_catalog,
+                &blocked_cfg.model_aliases,
+                "blocked-direct"
+            )
+            .is_none(),
+            "invalid direct Model must remove same-key prefetched/default fallback"
+        );
+        assert!(
+            resolve_model_reference(
+                &blocked_catalog,
+                &blocked_cfg.model_aliases,
+                "wire-default-fallback"
+            )
+            .is_none(),
+            "invalid direct Model must not remain reachable by the fallback wire slug"
+        );
+        assert!(blocked_cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some("blocked-direct")
+                && warning.field.as_deref() == Some("env_key")
+                && warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+        }));
+        let warning_json = serde_json::to_string(&blocked_cfg.model_override_warnings).unwrap();
+        for secret in [
+            "INDEPENDENT_ENV_MUST_FAIL_CLOSED",
+            "default-fallback-secret",
+            "DEFAULT_FALLBACK_ENV",
+        ] {
+            assert!(!warning_json.contains(secret), "warning leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn provider_model_invalid_provider_union_rejects_prefetched_fallback() {
+        let mut prefetched = IndexMap::new();
+        prefetched.insert(
+            "acme/demo-v1".to_owned(),
+            test_model_entry(
+                "old-wire-slug",
+                "https://fallback.example/v1",
+                Some("old-default-secret"),
+                Some("OLD_DEFAULT_ENV"),
+                None,
+            ),
+        );
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+            api_key = { env = "VALID_PROVIDER_ENV", extra = "provider-union-secret" }
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            Some(prefetched),
+        );
+
+        for requested in ["acme/demo-v1", "old-wire-slug"] {
+            assert!(
+                resolve_model_reference(&catalog, &cfg.model_aliases, requested).is_none(),
+                "invalid Provider normalization must reject fallback reference {requested}"
+            );
+        }
+        assert!(cfg.config_models["acme/demo-v1"].reject_model);
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some("acme/demo-v1")
+                && warning.field.as_deref() == Some("provider")
+                && warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+        }));
+        let warnings = serde_json::to_string(&cfg.model_override_warnings).unwrap();
+        for secret in [
+            "provider-union-secret",
+            "old-default-secret",
+            "OLD_DEFAULT_ENV",
+        ] {
+            assert!(!warnings.contains(secret), "warning leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn provider_model_missing_effective_base_url_is_removed_from_catalog() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            api_backend = "messages"
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            None,
+        );
+
+        assert!(
+            !catalog.contains_key("acme/demo-v1"),
+            "a provider model without an effective base_url must not enter the catalog"
+        );
+        assert!(
+            resolve_model_reference(&catalog, &cfg.model_aliases, "acme/demo-v1").is_none(),
+            "the rejected catalog key must not resolve"
+        );
+    }
+
+    #[test]
+    fn provider_model_missing_effective_base_url_tombstones_prefetched_entry_and_wire_slug() {
+        let mut prefetched = IndexMap::new();
+        prefetched.insert(
+            "acme/demo-v1".to_owned(),
+            test_model_entry(
+                "old-wire-slug",
+                "https://prefetched.example/v1",
+                Some("prefetched-secret"),
+                Some("PREFETCHED_ENV"),
+                None,
+            ),
+        );
+
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            api_backend = "messages"
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            Some(prefetched),
+        );
+
+        for requested in ["acme/demo-v1", "old-wire-slug"] {
+            assert!(
+                resolve_model_reference(&catalog, &cfg.model_aliases, requested).is_none(),
+                "the fail-closed tombstone must remove prefetched reference {requested}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_model_explicit_model_base_url_is_accepted_without_provider_base_url() {
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            api_backend = "messages"
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            base_url = "https://model.example/v1"
+            "#,
+            None,
+        );
+
+        let entry = catalog
+            .get("acme/demo-v1")
+            .expect("an explicit Model.base_url is a valid effective endpoint");
+        assert_eq!(entry.info.base_url, "https://model.example/v1");
+        assert_eq!(entry.info.api_backend, ApiBackend::Messages);
+    }
+
+    #[test]
+    fn provider_model_origin_bound_headers_do_not_cross_origins() {
+        let cases = [
+            (
+                "base_url changes origin",
+                r#"
+                base_url = "https://other.example/v1"
+                "#,
+            ),
+            (
+                "api_base_url changes origin",
+                r#"
+                api_base_url = "https://other.example/v1"
+                "#,
+            ),
+        ];
+
+        for (case, model_fields) in cases {
+            let (_, catalog) = resolve_models_from_toml(
+                &format!(
+                    r#"
+                    [provider.acme]
+                    base_url = "https://provider.example/session/v1"
+                    api_base_url = "https://provider.example/api/v1"
+                    auth_scheme = "x_api_key"
+                    extra_headers = {{ authorization = "provider-secret" }}
+
+                    [model."acme/demo-v1"]
+                    provider = "acme"
+                    {model_fields}
+                    "#
+                ),
+                None,
+            );
+            let entry = &catalog["acme/demo-v1"];
+            assert!(
+                entry.info.extra_headers.is_empty(),
+                "{case}: provider headers must not cross origin"
+            );
+            assert_eq!(
+                entry.info.auth_scheme,
+                AuthScheme::Bearer,
+                "{case}: provider auth scheme must not cross origin"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_model_provider_api_base_url_cannot_replace_base_url() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            api_base_url = "https://provider.example/api/v1"
+            auth_scheme = "x_api_key"
+            api_key = "provider-api-secret"
+            extra_headers = { authorization = "provider-secret" }
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            None,
+        );
+        assert!(
+            !catalog.contains_key("acme/demo-v1"),
+            "Provider.api_base_url cannot stand in for the required effective base_url"
+        );
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some("acme/demo-v1")
+                && warning.field.as_deref() == Some("provider")
+                && warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+        }));
+    }
+
+    #[test]
+    fn provider_model_model_api_base_url_cannot_replace_base_url() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            auth_scheme = "x_api_key"
+            api_key = "provider-api-secret"
+            extra_headers = { authorization = "provider-secret" }
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            api_base_url = "https://model.example/api/v1"
+            "#,
+            None,
+        );
+        assert!(
+            !catalog.contains_key("acme/demo-v1"),
+            "Model.api_base_url cannot stand in for the required effective base_url"
+        );
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some("acme/demo-v1")
+                && warning.field.as_deref() == Some("provider")
+                && warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+        }));
+    }
+
+    #[test]
+    fn provider_model_cross_origin_clears_prefetched_auth_and_headers() {
+        let endpoints = EndpointsConfig::default();
+        let mut stale = ModelEntry::fallback("demo-v1", &endpoints);
+        stale.info.base_url = "https://provider.example/v1".to_owned();
+        stale.info.auth_scheme = AuthScheme::XApiKey;
+        stale.api_key = Some("stale-api-secret".to_owned());
+        stale.env_key = Some(EnvKeys::single("STALE_API_ENV"));
+        stale
+            .info
+            .extra_headers
+            .insert("authorization".to_owned(), "stale-secret".to_owned());
+        let prefetched = [("acme/demo-v1".to_owned(), stale)].into_iter().collect();
+
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://provider.example/v1"
+            auth_scheme = "x_api_key"
+            api_key = "provider-api-secret"
+            extra_headers = { authorization = "provider-secret" }
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            base_url = "https://other.example/v1"
+            "#,
+            Some(prefetched),
+        );
+        let entry = &catalog["acme/demo-v1"];
+        assert!(entry.info.extra_headers.is_empty());
+        assert_eq!(entry.info.auth_scheme, AuthScheme::Bearer);
+        assert!(entry.api_key.is_none());
+        assert!(entry.env_key.is_none());
+    }
+
+    #[test]
+    fn provider_model_explicit_headers_control_origin_bound_behavior() {
+        let cases = [
+            (
+                "same origin inherits provider headers",
+                r#"
+                base_url = "https://provider.example/model/v1"
+                "#,
+                Some("provider-secret"),
+                AuthScheme::XApiKey,
+            ),
+            (
+                "cross origin uses explicit model headers",
+                r#"
+                base_url = "https://other.example/v1"
+                extra_headers = { authorization = "model-secret" }
+                "#,
+                Some("model-secret"),
+                AuthScheme::Bearer,
+            ),
+            (
+                "explicit empty headers clear same-origin inheritance",
+                r#"
+                extra_headers = {}
+                "#,
+                None,
+                AuthScheme::XApiKey,
+            ),
+            (
+                "explicit empty headers remain empty across origin",
+                r#"
+                base_url = "https://other.example/v1"
+                extra_headers = {}
+                "#,
+                None,
+                AuthScheme::Bearer,
+            ),
+        ];
+
+        for (case, model_fields, expected_header, expected_auth) in cases {
+            let (_, catalog) = resolve_models_from_toml(
+                &format!(
+                    r#"
+                    [provider.acme]
+                    base_url = "https://provider.example/session/v1"
+                    api_base_url = "https://provider.example/api/v1"
+                    auth_scheme = "x_api_key"
+                    extra_headers = {{ authorization = "provider-secret" }}
+
+                    [model."acme/demo-v1"]
+                    provider = "acme"
+                    {model_fields}
+                    "#
+                ),
+                None,
+            );
+            let entry = &catalog["acme/demo-v1"];
+            assert_eq!(
+                entry
+                    .info
+                    .extra_headers
+                    .get("authorization")
+                    .map(String::as_str),
+                expected_header,
+                "{case}"
+            );
+            assert_eq!(entry.info.auth_scheme, expected_auth, "{case}");
+        }
+    }
+
     fn resolve_sampling(model: &ModelEntry, session_key: Option<&str>) -> SamplerConfig {
         let credentials = resolve_credentials(model, session_key);
         sampling_config_for_model(model, credentials, None, None, None, None)
@@ -7251,7 +8695,7 @@ reasoning_effort = "low"
             model = "{dm}"
             base_url = "https://inference.example.com/v1"
             context_window = 200000
-            env_key = "ENTERPRISE_AUTH_TOKEN"
+            api_key = {{ env = "ENTERPRISE_AUTH_TOKEN" }}
             "#,
             ),
             None,
@@ -7370,7 +8814,7 @@ reasoning_effort = "low"
             model = "grok-4.5"
             base_url = "https://inference.example.com/v1"
             context_window = 256000
-            env_key = "ENTERPRISE_AUTH_TOKEN"
+            api_key = { env = "ENTERPRISE_AUTH_TOKEN" }
             "#,
             None,
         );
@@ -11015,7 +12459,7 @@ default = "grok-4.5"
             [model.grok-build]
             model = "grok-4.5"
             base_url = "https://inference.company.com/v1"
-            env_key = "COMPANY_TOKEN"
+            api_key = { env = "COMPANY_TOKEN" }
             "#,
         )
         .unwrap();

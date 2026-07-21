@@ -1008,12 +1008,9 @@ fn resolve_model_override_to_config(
     ctx: &SubagentSpawnContext,
 ) -> Option<(xai_grok_sampler::SamplerConfig, acp::ModelId)> {
     use crate::agent::config::{resolve_credentials, sampling_config_for_model};
-    let entry = crate::agent::config::find_model_by_id(&ctx.available_models, model_id).cloned()?;
-    let canonical_model_id = if ctx.available_models.contains_key(model_id) {
-        acp::ModelId::new(model_id)
-    } else {
-        acp::ModelId::new(entry.info().model.clone())
-    };
+    let (canonical_model_id, entry) = ctx
+        .models_manager
+        .resolve_model_reference(&acp::ModelId::new(model_id))?;
     let session_key = ctx.auth.as_ref().map(|a| a.key.as_str());
     let has_session_key = session_key.is_some();
     let mut credentials = resolve_credentials(&entry, session_key);

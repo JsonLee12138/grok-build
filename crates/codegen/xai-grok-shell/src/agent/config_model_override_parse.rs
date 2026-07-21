@@ -1,7 +1,8 @@
 //! Resilient parsing for `[model.<id>]` TOML overrides.
 //!
-//! A model entry must survive a bad field: warn and skip the field, never
-//! drop the model (managed configs must not lose catalog entries).
+//! Ordinary bad fields are warned and skipped so the model survives. Invalid
+//! credential declarations are the exception: they reject the entire model
+//! to prevent fallback to inherited/default credentials.
 //!
 //! Every table is deserialized through `serde_ignored`, so unknown fields
 //! warn on every path and [`ConfigModelOverride`] stays the single source of
@@ -15,7 +16,7 @@
 use indexmap::IndexMap;
 use serde::Serialize;
 
-use super::config::ConfigModelOverride;
+use super::config::{ApiKeySource, ConfigModelOverride, ProviderConfig};
 
 /// Category for a [`ModelOverrideWarning`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -27,11 +28,26 @@ pub enum ModelOverrideWarningKind {
     InvalidValue,
     /// Legacy alias given alongside its canonical key; alias skipped.
     DuplicateAlias,
+    /// Alias shadows an existing catalog key or wire-model slug; alias wins.
+    AliasShadow,
     /// Entry value is not a TOML table; entry dropped.
     NotATable,
     /// Entry failed to parse even after skipping invalid fields; the model
     /// keeps an empty override.
     UnparseableEntry,
+}
+
+impl ModelOverrideWarningKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownField => "unknown-field",
+            Self::InvalidValue => "invalid-value",
+            Self::DuplicateAlias => "duplicate-alias",
+            Self::AliasShadow => "alias-shadow",
+            Self::NotATable => "not-a-table",
+            Self::UnparseableEntry => "unparseable-entry",
+        }
+    }
 }
 
 /// One skipped field or dropped entry from `[model.*]` parsing.
@@ -45,12 +61,12 @@ pub struct ModelOverrideWarning {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
     pub kind: ModelOverrideWarningKind,
-    pub reason: String,
 }
 
 /// Result of [`parse_model_overrides`].
 pub(crate) struct ParsedModelOverrides {
     pub models: IndexMap<String, ConfigModelOverride>,
+    pub providers: IndexMap<String, ProviderConfig>,
     pub warnings: Vec<ModelOverrideWarning>,
 }
 
@@ -59,20 +75,25 @@ pub(crate) struct ParsedModelOverrides {
 pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOverrides {
     let mut models = IndexMap::new();
     let mut warnings = Vec::new();
+    let providers = parse_providers(raw_config, &mut warnings);
     let Some(section) = raw_config.get("model") else {
-        return ParsedModelOverrides { models, warnings };
+        return ParsedModelOverrides {
+            models,
+            providers,
+            warnings,
+        };
     };
     let Some(table) = section.as_table() else {
         warnings.push(ModelOverrideWarning {
             model_key: None,
             field: None,
             kind: ModelOverrideWarningKind::NotATable,
-            reason: format!(
-                "`model` must be a table of [model.<id>] entries, got {}; all model overrides ignored",
-                section.type_str()
-            ),
         });
-        return ParsedModelOverrides { models, warnings };
+        return ParsedModelOverrides {
+            models,
+            providers,
+            warnings,
+        };
     };
     for (model_key, value) in table {
         let Some(entry_table) = value.as_table() else {
@@ -80,18 +101,351 @@ pub(crate) fn parse_model_overrides(raw_config: &toml::Value) -> ParsedModelOver
                 model_key: Some(model_key.clone()),
                 field: None,
                 kind: ModelOverrideWarningKind::NotATable,
-                reason: format!(
-                    "expected a table like [model.\"{model_key}\"], got {}; entry dropped",
-                    value.type_str()
-                ),
             });
             continue;
         };
-        let (entry, entry_warnings) = parse_model_override_table(model_key, entry_table.clone());
+        let credential = match parse_model_credentials(model_key, entry_table, &mut warnings) {
+            Ok(credential) => credential,
+            Err(()) => {
+                // The credential error rejects the whole model, but retain
+                // independent non-credential diagnostics without ever feeding
+                // credential values to the generic TOML error path.
+                let mut noncredential_fields = entry_table.clone();
+                noncredential_fields.remove("api_key");
+                noncredential_fields.remove("env_key");
+                let (mut rejected_entry, mut extra_warnings) =
+                    parse_model_override_table(model_key, noncredential_fields);
+                rejected_entry.provider_alias_eligible = entry_table.contains_key("provider");
+                if rejected_entry
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| !is_valid_alias(alias))
+                {
+                    extra_warnings.push(ModelOverrideWarning {
+                        model_key: Some(model_key.clone()),
+                        field: Some("alias".to_owned()),
+                        kind: ModelOverrideWarningKind::InvalidValue,
+                    });
+                }
+                warnings.extend(extra_warnings);
+                rejected_entry.reject_model = true;
+                models.insert(model_key.clone(), rejected_entry);
+                continue;
+            }
+        };
+        let mut parsed_entry_table = entry_table.clone();
+        if let Some(credential) = credential {
+            parsed_entry_table.remove("api_key");
+            parsed_entry_table.remove("env_key");
+            match credential {
+                ApiKeySource::Literal(value) => {
+                    parsed_entry_table.insert("api_key".to_owned(), toml::Value::String(value));
+                }
+                ApiKeySource::Environment { env } => {
+                    parsed_entry_table.insert("env_key".to_owned(), toml::Value::String(env));
+                }
+            }
+        }
+        let (mut entry, mut entry_warnings) =
+            parse_model_override_table(model_key, parsed_entry_table);
+        entry.provider_alias_eligible = entry_table.contains_key("provider");
+        if entry
+            .alias
+            .as_deref()
+            .is_some_and(|alias| !is_valid_alias(alias))
+        {
+            entry_warnings.push(ModelOverrideWarning {
+                model_key: Some(model_key.clone()),
+                field: Some("alias".to_owned()),
+                kind: ModelOverrideWarningKind::InvalidValue,
+            });
+        }
+        // Provider references have stricter fail-closed validation below. Drop
+        // the generic field-level parse warning so an invalid non-string
+        // reference produces one stable, value-free warning.
+        if entry_table.get("provider").is_some_and(|v| !v.is_str()) {
+            entry_warnings.retain(|warning| warning.field.as_deref() != Some("provider"));
+        }
         warnings.extend(entry_warnings);
+        if !normalize_provider_model(
+            model_key,
+            entry_table.get("provider"),
+            &providers,
+            &mut entry,
+            &mut warnings,
+        ) {
+            entry.reject_model = true;
+            models.insert(model_key.clone(), entry);
+            continue;
+        }
         models.insert(model_key.clone(), entry);
     }
-    ParsedModelOverrides { models, warnings }
+    ParsedModelOverrides {
+        models,
+        providers,
+        warnings,
+    }
+}
+
+fn parse_providers(
+    raw_config: &toml::Value,
+    warnings: &mut Vec<ModelOverrideWarning>,
+) -> IndexMap<String, ProviderConfig> {
+    let mut providers = IndexMap::new();
+    let Some(section) = raw_config.get("provider") else {
+        return providers;
+    };
+    let Some(table) = section.as_table() else {
+        warnings.push(ModelOverrideWarning {
+            model_key: None,
+            field: Some("provider".to_owned()),
+            kind: ModelOverrideWarningKind::NotATable,
+        });
+        return providers;
+    };
+    for (provider_id, value) in table {
+        if !is_valid_provider_id(provider_id) {
+            warnings.push(ModelOverrideWarning {
+                model_key: None,
+                field: Some(format!("provider.{provider_id}")),
+                kind: ModelOverrideWarningKind::InvalidValue,
+            });
+            continue;
+        }
+        let Some(provider_table) = value.as_table() else {
+            warnings.push(ModelOverrideWarning {
+                model_key: None,
+                field: Some(format!("provider.{provider_id}")),
+                kind: ModelOverrideWarningKind::NotATable,
+            });
+            continue;
+        };
+        let mut unknown = Vec::new();
+        match serde_ignored::deserialize(toml::Value::Table(provider_table.clone()), |path| {
+            unknown.push(path.to_string());
+        }) {
+            Ok(provider) if unknown.is_empty() => {
+                let provider: ProviderConfig = provider;
+                if provider
+                    .api_key
+                    .as_ref()
+                    .is_some_and(|source| !source.is_valid())
+                {
+                    warnings.push(ModelOverrideWarning {
+                        model_key: None,
+                        field: Some(format!("provider.{provider_id}.api_key")),
+                        kind: ModelOverrideWarningKind::InvalidValue,
+                    });
+                } else {
+                    providers.insert(provider_id.clone(), provider);
+                }
+            }
+            Ok(_provider) => {
+                for field in unknown {
+                    warnings.push(ModelOverrideWarning {
+                        model_key: None,
+                        field: Some(format!("provider.{provider_id}.{field}")),
+                        kind: ModelOverrideWarningKind::UnknownField,
+                    });
+                }
+            }
+            Err(_) => warnings.push(ModelOverrideWarning {
+                model_key: None,
+                field: Some(format!("provider.{provider_id}")),
+                kind: ModelOverrideWarningKind::InvalidValue,
+            }),
+        }
+    }
+    providers
+}
+
+fn is_valid_provider_id(provider_id: &str) -> bool {
+    !provider_id.is_empty()
+        && provider_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+pub(crate) fn is_valid_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn parse_model_credentials(
+    model_key: &str,
+    table: &toml::map::Map<String, toml::Value>,
+    warnings: &mut Vec<ModelOverrideWarning>,
+) -> Result<Option<ApiKeySource>, ()> {
+    if table.contains_key("env_key") {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("env_key".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+        });
+        return Err(());
+    }
+    let Some(value) = table.get("api_key") else {
+        return Ok(None);
+    };
+    let Ok(source) = value.clone().try_into::<ApiKeySource>() else {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("api_key".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+        });
+        return Err(());
+    };
+    if !source.is_valid() {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("api_key".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+        });
+        return Err(());
+    }
+    Ok(Some(source))
+}
+
+/// Validate the explicit provider reference and materialize provider-owned
+/// identity/endpoint fields into the existing model override representation.
+fn normalize_provider_model(
+    model_key: &str,
+    raw_provider: Option<&toml::Value>,
+    providers: &IndexMap<String, ProviderConfig>,
+    entry: &mut ConfigModelOverride,
+    warnings: &mut Vec<ModelOverrideWarning>,
+) -> bool {
+    let Some(raw_provider) = raw_provider else {
+        return true;
+    };
+    let Some(provider_id) = raw_provider.as_str() else {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("provider".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+        });
+        return false;
+    };
+    let Some(provider) = providers.get(provider_id) else {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("provider".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+        });
+        return false;
+    };
+    let Some((key_provider, key_model_id)) = model_key.split_once('/') else {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("provider".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+        });
+        return false;
+    };
+    if key_provider != provider_id || key_model_id.is_empty() {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("provider".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+        });
+        return false;
+    }
+
+    // Provider-backed models must have an effective session endpoint.  Do not
+    // let the downstream catalog builder fill in the default cli-chat-proxy
+    // URL when neither side supplies a session `base_url`; the override must
+    // fail closed and its caller will tombstone any stale catalog entries.
+    if entry.base_url.is_none() && provider.base_url.is_none() {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("provider".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+        });
+        return false;
+    }
+
+    let changes_origin = model_changes_provider_origin(entry, provider);
+
+    if entry.api_key.is_none() && entry.env_key.is_none() {
+        if changes_origin {
+            entry.clear_credentials = true;
+        } else if let Some(api_key) = &provider.api_key {
+            match api_key {
+                ApiKeySource::Literal(value) => entry.api_key = Some(value.clone()),
+                ApiKeySource::Environment { env } => {
+                    entry.env_key = Some(super::config::EnvKeys::single(env));
+                }
+            }
+        }
+    }
+
+    entry.provider = Some(provider_id.to_owned());
+    if entry.model.is_none() {
+        entry.model = Some(key_model_id.to_owned());
+    }
+    if entry.base_url.is_none() {
+        entry.base_url.clone_from(&provider.base_url);
+    }
+    if entry.api_base_url.is_none() {
+        entry.api_base_url.clone_from(&provider.api_base_url);
+    }
+    if entry.api_backend.is_none() {
+        entry.api_backend.clone_from(&provider.api_backend);
+    }
+    if entry.auth_scheme.is_none() {
+        entry.auth_scheme = if changes_origin {
+            Some(xai_grok_sampler::AuthScheme::default())
+        } else {
+            provider.auth_scheme
+        };
+    }
+    if entry.extra_headers.is_none() {
+        if changes_origin {
+            // ModelEntry has one shared header map for both endpoints. Once
+            // either endpoint crosses origin, inherited provider headers must
+            // be cleared from any prefetched/base entry as well.
+            entry.extra_headers = Some(IndexMap::new());
+        } else if !provider.extra_headers.is_empty() {
+            entry.extra_headers = Some(provider.extra_headers.clone());
+        }
+    }
+    true
+}
+
+fn model_changes_provider_origin(model: &ConfigModelOverride, provider: &ProviderConfig) -> bool {
+    // Without a provider-owned session endpoint, the eventual base URL comes
+    // from ModelEntry fallback/default state. Provider headers and auth cannot
+    // be proven to belong to that origin, even if api_base_url is configured.
+    let Some(provider_base_url) = provider.base_url.as_deref() else {
+        return true;
+    };
+    let base_changed = model
+        .base_url
+        .as_deref()
+        .is_some_and(|model_url| !urls_have_same_origin(model_url, provider_base_url));
+    let provider_api_url = provider
+        .api_base_url
+        .as_deref()
+        .unwrap_or(provider_base_url);
+    let api_base_changed = model
+        .api_base_url
+        .as_deref()
+        .is_some_and(|model_url| !urls_have_same_origin(model_url, provider_api_url));
+    base_changed || api_base_changed
+}
+
+fn urls_have_same_origin(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let (Ok(left), Ok(right)) = (url::Url::parse(left), url::Url::parse(right)) else {
+        return false;
+    };
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 /// Logs the warnings when they differ from the previous parse, so a
@@ -118,7 +472,6 @@ pub(crate) fn log_model_override_warnings(warnings: &[ModelOverrideWarning]) {
             model = warning.model_key.as_deref().unwrap_or("(section)"),
             field = warning.field.as_deref().unwrap_or("(entry)"),
             kind = ?warning.kind,
-            reason = %warning.reason,
             "model_override: skipped invalid config"
         );
     }
@@ -151,7 +504,7 @@ fn parse_model_override_table(
                     warnings.extend(unknown_field_warnings(model_key, unknown));
                     (entry, warnings)
                 }
-                Err(error) => {
+                Err(_) => {
                     // Reachable only when fields conflict jointly, e.g. an
                     // alias pair missing from `ALIASES`. Keep the model
                     // rather than dropping it.
@@ -159,9 +512,6 @@ fn parse_model_override_table(
                         model_key: Some(model_key.to_owned()),
                         field: None,
                         kind: ModelOverrideWarningKind::UnparseableEntry,
-                        reason: format!(
-                            "failed to parse after skipping invalid fields ({error}); using empty override"
-                        ),
                     });
                     (ConfigModelOverride::default(), warnings)
                 }
@@ -194,16 +544,14 @@ fn dedupe_aliases(
                     model_key: Some(model_key.to_owned()),
                     field: Some(legacy.to_owned()),
                     kind: ModelOverrideWarningKind::DuplicateAlias,
-                    reason: format!("legacy alias of {canonical}; skipped in favor of {canonical}"),
                 });
             }
-            Some(error) => {
+            Some(_) => {
                 table.remove(canonical);
                 warnings.push(ModelOverrideWarning {
                     model_key: Some(model_key.to_owned()),
                     field: Some(canonical.to_owned()),
                     kind: ModelOverrideWarningKind::InvalidValue,
-                    reason: format!("{error}; skipped in favor of {legacy}"),
                 });
             }
         }
@@ -229,7 +577,6 @@ fn unknown_field_warnings(model_key: &str, unknown: Vec<String>) -> Vec<ModelOve
             model_key: Some(model_key.to_owned()),
             field: Some(field),
             kind: ModelOverrideWarningKind::UnknownField,
-            reason: "unknown field".to_owned(),
         })
         .collect()
 }
@@ -243,12 +590,11 @@ fn prune_invalid_fields(
 ) {
     table.retain(|field, value| match field_parse_error(field, value) {
         None => true,
-        Some(error) => {
+        Some(_) => {
             warnings.push(ModelOverrideWarning {
                 model_key: Some(model_key.to_owned()),
                 field: Some(field.to_owned()),
                 kind: ModelOverrideWarningKind::InvalidValue,
-                reason: error.to_string(),
             });
             false
         }
@@ -265,7 +611,7 @@ fn field_parse_error(field: &str, value: &toml::Value) -> Option<toml::de::Error
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::agent) mod tests {
     use super::*;
     use crate::sampling::ApiBackend;
     use xai_grok_sampling_types::{
@@ -284,8 +630,431 @@ mod tests {
         Vec<ModelOverrideWarning>,
     ) {
         let raw: toml::Value = toml::from_str(toml_str).unwrap();
-        let ParsedModelOverrides { models, warnings } = parse_model_overrides(&raw);
+        let ParsedModelOverrides {
+            models, warnings, ..
+        } = parse_model_overrides(&raw);
         (models, warnings)
+    }
+
+    #[serial_test::serial]
+    pub(in crate::agent) fn assert_provider_model_acceptance_ac_09() {
+        let _env = xai_grok_test_support::EnvGuard::set(
+            "JSO_285_AC9_TOKEN",
+            "runtime-environment-secret-ac09",
+        );
+        let (_, warnings) = parse_raw(
+            r#"
+            [provider.literal]
+            base_url = "https://literal.example/v1"
+            api_key = "literal-provider-secret-ac09"
+            unknown_setting = "raw-provider-fragment-ac09"
+
+            [provider.environment]
+            base_url = "https://environment.example/v1"
+            api_key = { env = "JSO_285_AC9_TOKEN" }
+            unknown_setting = "environment-reference-fragment-ac09"
+
+            [provider.invalid]
+            base_url = "https://invalid.example/v1"
+            api_key = { env = "JSO_285_AC9_TOKEN", extra = "union-extra-secret-ac09" }
+
+            [model.ordinary]
+            api_key = "literal-model-secret-ac09"
+            env_key = { raw = "model-env-secret-ac09" }
+            reasoning_effort = "model-enum-secret-ac09"
+            future_field = "raw-model-fragment-ac09"
+
+            [model]
+            scalar = "raw-scalar-secret-ac09"
+            "#,
+        );
+        assert!(!warnings.is_empty(), "fixture must exercise warning paths");
+
+        let actual_warning_set: std::collections::HashSet<_> = warnings
+            .iter()
+            .map(|warning| {
+                (
+                    warning.model_key.clone(),
+                    warning.field.clone(),
+                    warning.kind,
+                )
+            })
+            .collect();
+        let expected_warning_set = std::collections::HashSet::from([
+            (
+                None,
+                Some("provider.literal.unknown_setting".to_owned()),
+                ModelOverrideWarningKind::UnknownField,
+            ),
+            (
+                None,
+                Some("provider.environment.unknown_setting".to_owned()),
+                ModelOverrideWarningKind::UnknownField,
+            ),
+            (
+                None,
+                Some("provider.invalid".to_owned()),
+                ModelOverrideWarningKind::InvalidValue,
+            ),
+            (
+                Some("ordinary".to_owned()),
+                Some("env_key".to_owned()),
+                ModelOverrideWarningKind::InvalidValue,
+            ),
+            (
+                Some("ordinary".to_owned()),
+                Some("reasoning_effort".to_owned()),
+                ModelOverrideWarningKind::InvalidValue,
+            ),
+            (
+                Some("ordinary".to_owned()),
+                Some("future_field".to_owned()),
+                ModelOverrideWarningKind::UnknownField,
+            ),
+            (
+                Some("scalar".to_owned()),
+                None,
+                ModelOverrideWarningKind::NotATable,
+            ),
+        ]);
+        assert_eq!(
+            actual_warning_set, expected_warning_set,
+            "every fixture warning path and category must remain observable"
+        );
+
+        let serialized = serde_json::to_value(&warnings).expect("warnings serialize");
+        for warning in serialized.as_array().expect("warning list") {
+            let keys = warning.as_object().expect("warning object").keys();
+            assert!(
+                keys.into_iter()
+                    .all(|key| matches!(key.as_str(), "modelKey" | "field" | "kind")),
+                "warning surfaces may contain only field-path components and the error category: {warning}"
+            );
+        }
+
+        let serialized = serialized.to_string();
+        let debug = format!("{warnings:?}");
+        for secret in [
+            "literal-provider-secret-ac09",
+            "raw-provider-fragment-ac09",
+            "environment-reference-fragment-ac09",
+            "union-extra-secret-ac09",
+            "literal-model-secret-ac09",
+            "model-env-secret-ac09",
+            "model-enum-secret-ac09",
+            "raw-model-fragment-ac09",
+            "raw-scalar-secret-ac09",
+            "JSO_285_AC9_TOKEN",
+            "runtime-environment-secret-ac09",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "serialized warning leaked {secret}"
+            );
+            assert!(!debug.contains(secret), "internal warning leaked {secret}");
+        }
+        assert!(!serialized.contains("api_key ="));
+        assert!(!serialized.contains("env_key ="));
+    }
+
+    #[test]
+    fn provider_model_invalid_references_are_fail_closed() {
+        let cases = [
+            (
+                "provider is not a string",
+                "acme/demo-v1",
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                [model."acme/demo-v1"]
+                provider = 7
+                "#,
+            ),
+            (
+                "provider does not exist",
+                "acme/demo-v1",
+                r#"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                "#,
+            ),
+            (
+                "key has no separator",
+                "demo-v1",
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                [model.demo-v1]
+                provider = "acme"
+                "#,
+            ),
+            (
+                "key provider does not match",
+                "other/demo-v1",
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                [model."other/demo-v1"]
+                provider = "acme"
+                "#,
+            ),
+            (
+                "wire model id is empty",
+                "acme/",
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                [model."acme/"]
+                provider = "acme"
+                "#,
+            ),
+        ];
+
+        for (case, model_key, input) in cases {
+            let (models, warnings) = parse_raw(input);
+            assert!(
+                models
+                    .get(model_key)
+                    .is_some_and(|model| model.reject_model),
+                "{case}: model must retain a fail-closed tombstone"
+            );
+            let matching: Vec<_> = warnings
+                .iter()
+                .filter(|warning| {
+                    warning.kind == ModelOverrideWarningKind::InvalidValue
+                        && warning.model_key.as_deref() == Some(model_key)
+                        && warning.field.as_deref() == Some("provider")
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "{case}: warning identity must be stable");
+        }
+    }
+
+    #[test]
+    fn provider_model_missing_effective_base_url_is_fail_closed() {
+        let (models, warnings) = parse_raw(
+            r#"
+            [provider.acme]
+            api_backend = "messages"
+            api_key = "missing-base-url-secret-marker"
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+        );
+
+        assert!(
+            models
+                .get("acme/demo-v1")
+                .is_some_and(|model| model.reject_model),
+            "a provider-backed model without an effective base_url must retain a fail-closed tombstone"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the clean missing-base-url fixture must emit exactly one warning"
+        );
+        let matching: Vec<_> = warnings
+            .iter()
+            .filter(|warning| {
+                warning.kind == ModelOverrideWarningKind::InvalidValue
+                    && warning.model_key.as_deref() == Some("acme/demo-v1")
+                    && warning.field.as_deref() == Some("provider")
+            })
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "missing effective base_url must produce one stable, value-free warning"
+        );
+        let rendered = serde_json::to_string(&warnings).expect("warnings serialize");
+        assert!(
+            !rendered.contains("missing-base-url-secret-marker"),
+            "the provider/InvalidValue warning must not expose configured values"
+        );
+    }
+
+    #[test]
+    fn provider_model_invalid_definitions_are_ignored_and_warnings_are_redacted() {
+        let cases = [
+            (
+                "provider is not a table",
+                "acme",
+                "acme/demo-v1",
+                ModelOverrideWarningKind::NotATable,
+                r#"
+                provider = { acme = "sensitive-provider-value" }
+                [model."acme/demo-v1"]
+                provider = "acme"
+                "#,
+                "sensitive-provider-value",
+            ),
+            (
+                "provider id contains slash",
+                "bad/id",
+                "bad/id/demo-v1",
+                ModelOverrideWarningKind::InvalidValue,
+                r#"
+                [provider."bad/id"]
+                base_url = "https://api.example/v1"
+                [model."bad/id/demo-v1"]
+                provider = "bad/id"
+                "#,
+                "not-present-secret",
+            ),
+            (
+                "provider id is whitespace",
+                " ",
+                " /demo-v1",
+                ModelOverrideWarningKind::InvalidValue,
+                r#"
+                [provider." "]
+                base_url = "sensitive-whitespace-value"
+                [model." /demo-v1"]
+                provider = " "
+                "#,
+                "sensitive-whitespace-value",
+            ),
+            (
+                "provider id is unicode",
+                "供应商",
+                "供应商/demo-v1",
+                ModelOverrideWarningKind::InvalidValue,
+                r#"
+                [provider."供应商"]
+                base_url = "sensitive-unicode-value"
+                [model."供应商/demo-v1"]
+                provider = "供应商"
+                "#,
+                "sensitive-unicode-value",
+            ),
+            (
+                "provider id contains another special character",
+                "acme@prod",
+                "acme@prod/demo-v1",
+                ModelOverrideWarningKind::InvalidValue,
+                r#"
+                [provider."acme@prod"]
+                base_url = "sensitive-special-value"
+                [model."acme@prod/demo-v1"]
+                provider = "acme@prod"
+                "#,
+                "sensitive-special-value",
+            ),
+            (
+                "provider base_url has wrong type",
+                "acme",
+                "acme/demo-v1",
+                ModelOverrideWarningKind::InvalidValue,
+                r#"
+                [provider.acme]
+                base_url = 42
+                [model."acme/demo-v1"]
+                provider = "acme"
+                "#,
+                "42",
+            ),
+            (
+                "provider has unknown field",
+                "acme",
+                "acme/demo-v1",
+                ModelOverrideWarningKind::UnknownField,
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                secret_token = "plaintext-provider-secret"
+                [model."acme/demo-v1"]
+                provider = "acme"
+                "#,
+                "plaintext-provider-secret",
+            ),
+        ];
+
+        for (case, provider_id, model_key, expected_kind, input, secret) in cases {
+            let raw: toml::Value = toml::from_str(input).expect("case TOML parses");
+            let ParsedModelOverrides {
+                models,
+                providers,
+                warnings,
+            } = parse_model_overrides(&raw);
+            assert!(
+                !providers.contains_key(provider_id),
+                "{case}: provider must be ignored"
+            );
+            assert!(
+                models
+                    .get(model_key)
+                    .is_some_and(|model| model.reject_model),
+                "{case}: referencing model must retain a fail-closed tombstone"
+            );
+            assert!(
+                warnings.iter().any(|warning| warning.kind == expected_kind),
+                "{case}: expected provider warning"
+            );
+            let rendered = serde_json::to_string(&warnings).expect("warnings serialize");
+            assert!(
+                !rendered.contains(secret),
+                "{case}: warnings must not expose provider values"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_model_invalid_provider_api_keys_are_redacted() {
+        let cases = [
+            ("blank literal", r#"api_key = "   ""#, None),
+            ("empty environment name", r#"api_key = { env = "" }"#, None),
+            (
+                "invalid environment name",
+                r#"api_key = { env = "9INVALID_PROVIDER_SECRET" }"#,
+                Some("9INVALID_PROVIDER_SECRET"),
+            ),
+            (
+                "inline table has extra member",
+                r#"api_key = { env = "VALID_ENV", extra = "provider-secret-extra-marker" }"#,
+                Some("provider-secret-extra-marker"),
+            ),
+            ("api_key has wrong type", "api_key = 28405", Some("28405")),
+        ];
+
+        for (case, provider_api_key, secret) in cases {
+            let raw: toml::Value = toml::from_str(&format!(
+                r#"
+                [provider.acme]
+                base_url = "https://api.acme.example/v1"
+                {provider_api_key}
+                [model."acme/demo-v1"]
+                provider = "acme"
+                "#
+            ))
+            .expect("case TOML parses");
+            let ParsedModelOverrides {
+                models,
+                providers,
+                warnings,
+            } = parse_model_overrides(&raw);
+            assert!(!providers.contains_key("acme"), "{case}");
+            assert!(
+                models
+                    .get("acme/demo-v1")
+                    .is_some_and(|model| model.reject_model),
+                "{case}: referencing model must retain a fail-closed tombstone"
+            );
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.kind == ModelOverrideWarningKind::InvalidValue),
+                "{case}: invalid api_key must warn"
+            );
+            let rendered = serde_json::to_string(&warnings).unwrap();
+            if let Some(secret) = secret {
+                assert!(!rendered.contains(secret), "{case}: warning leaked a value");
+            }
+            assert!(
+                !rendered.contains("api_key ="),
+                "{case}: warning leaked TOML"
+            );
+        }
     }
 
     #[test]
@@ -294,7 +1063,7 @@ mod tests {
             r#"
             [model."grok-4.5"]
             model = "grok-4.5"
-            env_key = "ANTHROPIC_AUTH_TOKEN"
+            api_key = { env = "ANTHROPIC_AUTH_TOKEN" }
             compactions_remaining = 1
             send_compactions_remaining = true
             "#,
@@ -338,7 +1107,7 @@ mod tests {
             r#"
             [model."grok-4.5"]
             model = "grok-4.5"
-            env_key = "ANTHROPIC_AUTH_TOKEN"
+            api_key = { env = "ANTHROPIC_AUTH_TOKEN" }
             reasoning_effort = "not-a-level"
             "#,
         );
@@ -360,7 +1129,7 @@ mod tests {
             r#"
             [model."grok-4.5"]
             model = "grok-4.5"
-            env_key = "TOKEN"
+            api_key = { env = "TOKEN" }
             future_field = 1
             "#,
         );
@@ -376,7 +1145,6 @@ mod tests {
                 model_key: Some("grok-4.5".to_owned()),
                 field: Some("future_field".to_owned()),
                 kind: ModelOverrideWarningKind::UnknownField,
-                reason: "unknown field".to_owned(),
             }]
         );
     }
@@ -423,7 +1191,11 @@ mod tests {
         );
         let entry = models.get("m").unwrap();
         assert_eq!(
-            entry.extra_headers.get("x-team").map(String::as_str),
+            entry
+                .extra_headers
+                .as_ref()
+                .and_then(|headers| headers.get("x-team"))
+                .map(String::as_str),
             Some("codegen")
         );
         assert!(entry.temperature.is_none());
@@ -499,20 +1271,25 @@ mod tests {
     /// here until the drift-guard tests cover it.
     fn fully_populated_override() -> ConfigModelOverride {
         ConfigModelOverride {
+            provider: None,
+            alias: Some("fast".into()),
             model: Some("m".into()),
             base_url: Some("https://example.com".into()),
             name: Some("Model M".into()),
             description: Some("desc".into()),
             api_key: Some("key".into()),
-            env_key: Some(crate::agent::config::EnvKeys::single("ENV_KEY")),
+            env_key: None,
             api_base_url: Some("https://api.example.com".into()),
             max_completion_tokens: Some(1024),
             temperature: Some(0.5),
             top_p: Some(0.9),
             api_backend: Some(ApiBackend::Messages),
-            extra_headers: [("x-team".to_owned(), "codegen".to_owned())]
-                .into_iter()
-                .collect(),
+            auth_scheme: Some(xai_grok_sampler::AuthScheme::XApiKey),
+            extra_headers: Some(
+                [("x-team".to_owned(), "codegen".to_owned())]
+                    .into_iter()
+                    .collect(),
+            ),
             context_window: Some(200_000),
             auto_compact_threshold_percent: Some(80),
             system_prompt_label: Some("label".into()),
@@ -536,6 +1313,9 @@ mod tests {
             compaction_at_tokens: Some(CompactionAtTokens::Fixed(100_000)),
             show_model_fingerprint: Some(true),
             stream_tool_calls: Some(false),
+            clear_credentials: false,
+            reject_model: false,
+            provider_alias_eligible: false,
         }
     }
 
@@ -549,8 +1329,9 @@ mod tests {
         model_table.insert("m".to_owned(), toml::Value::Table(entry));
         let mut root = toml::map::Map::new();
         root.insert("model".to_owned(), toml::Value::Table(model_table));
-        let ParsedModelOverrides { models, warnings } =
-            parse_model_overrides(&toml::Value::Table(root));
+        let ParsedModelOverrides {
+            models, warnings, ..
+        } = parse_model_overrides(&toml::Value::Table(root));
         (models, warnings)
     }
 
@@ -586,7 +1367,7 @@ mod tests {
             rest = after;
         }
         assert_eq!(
-            block.matches("alias").count(),
+            block.matches("#[serde(alias").count(),
             found.len(),
             "an alias on ConfigModelOverride was not recognized; write it as \
              `#[serde(alias = \"...\")]` on its own line, or update this scan"

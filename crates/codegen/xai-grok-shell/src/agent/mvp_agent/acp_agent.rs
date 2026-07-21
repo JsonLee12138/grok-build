@@ -505,10 +505,7 @@ impl acp::Agent for MvpAgent {
                     {
                         emit_login_span(false, "api_key", None, Some("no_credentials"));
                         return Err(
-                            acp::Error::auth_required()
-                                .data(
-                                    "Set XAI_API_KEY or add api_key/env_key to config.toml.",
-                                ),
+                            auth_method::ProviderAuthRequiredError::xai().into_acp_error(),
                         );
                     }
                 }

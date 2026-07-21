@@ -243,6 +243,79 @@ async fn sampler_401_with_api_key_auth_skips_refresh_and_surfaces_error() {
         .await;
 }
 
+/// Terminal sampler failures for first-party xAI requests retain structured
+/// provider remediation even when no token refresh is possible.
+#[tokio::test(flavor = "current_thread")]
+async fn tc8_terminal_xai_auth_failure_returns_structured_provider_auth_required() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = make_actor_with_auth_and_credentials(
+                None,
+                xai_chat_state::AuthType::ApiKey,
+                "unrecoverable-xai-key".to_string(),
+            )
+            .await;
+            let mut config = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor has sampling config");
+            config.base_url = "https://api.x.ai/v1".to_string();
+            actor.chat_state_handle.update_sampling_config(config);
+
+            let error = match actor.handle_sampling_failure(auth_error()).await {
+                Err(error) => error,
+                Ok(_) => panic!("unrecoverable xAI auth must be terminal"),
+            };
+            let data = error.data.expect("provider error has structured data");
+            assert_eq!(data["code"], "provider_auth_required");
+            assert_eq!(data["provider"], "xai");
+            assert!(
+                data["guidance"]
+                    .as_str()
+                    .is_some_and(|guidance| guidance.contains("/provider xai"))
+            );
+        })
+        .await;
+}
+
+/// A third-party BYOK failure must not be mislabeled as an xAI auth problem.
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_non_xai_auth_failure_does_not_claim_xai_provider() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = make_actor_with_auth_and_credentials(
+                None,
+                xai_chat_state::AuthType::ApiKey,
+                "third-party-key".to_string(),
+            )
+            .await;
+            let mut config = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("test actor has sampling config");
+            config.base_url = "https://provider.example/v1".to_string();
+            actor.chat_state_handle.update_sampling_config(config);
+
+            let error = match actor.handle_sampling_failure(auth_error()).await {
+                Err(error) => error,
+                Ok(_) => panic!("third-party auth failure must be terminal"),
+            };
+            assert_ne!(
+                error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("code"))
+                    .and_then(serde_json::Value::as_str),
+                Some("provider_auth_required")
+            );
+        })
+        .await;
+}
+
 /// Per-turn pre-flight refresh dispatches on `AuthManager`'s
 /// `TokenType`, not `creds.auth_type`. Pins that a stale
 /// When `creds.auth_type` is `ApiKey` (BYOK model), the pre-flight

@@ -90,6 +90,33 @@ pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> Strin
         }
         return rate_limited_user_message(is_api_key_auth).into();
     }
+    if let Some(data) = &err.data
+        && data
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            == Some(xai_grok_shell::agent::auth_method::PROVIDER_AUTH_REQUIRED_CODE)
+        && data
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            == Some("xai")
+    {
+        return data
+            .get("guidance")
+            .and_then(serde_json::Value::as_str)
+            .filter(|guidance| !guidance.is_empty())
+            .unwrap_or("Run `/provider xai` to configure xAI authentication, then retry.")
+            .to_string();
+    }
+    // Compatibility for older shells that encoded the provider error as a
+    // string before structured ACP error data was available.
+    if let Some(detail) = err
+        .data
+        .as_ref()
+        .and_then(xai_grok_shell::sampling::error::error_detail_from_data)
+        && detail.contains(xai_grok_shell::agent::auth_method::PROVIDER_AUTH_REQUIRED_CODE)
+    {
+        return "Run `/provider xai` to configure xAI authentication, then retry.".to_string();
+    }
     if err.code == acp::ErrorCode::InvalidParams && let Some(data) = &err.data
         && let Some(msg) = xai_grok_shell::sampling::error::error_detail_from_data(data)
         && !msg.is_empty()

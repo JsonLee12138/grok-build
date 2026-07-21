@@ -1,4 +1,5 @@
 use agent_client_protocol as acp;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::config::ModelEntry;
 use crate::auth::PreferredAuthMethod;
@@ -28,6 +29,39 @@ pub const XAI_API_KEY_ENV_VAR: &str = "XAI_API_KEY";
 /// Legacy env var name. Checked as a fallback when `XAI_API_KEY` is not set,
 /// so existing deployments that use the old name keep working.
 pub const LEGACY_XAI_API_KEY_ENV_VAR: &str = "GROK_CODE_XAI_API_KEY";
+
+/// Stable error code returned when an xAI-backed request cannot obtain usable
+/// credentials.  Clients must use this instead of inferring provider state
+/// from the generic ACP `auth_required` code or an upstream gateway message.
+pub const PROVIDER_AUTH_REQUIRED_CODE: &str = "provider_auth_required";
+
+/// Provider-scoped remediation returned with a request-time authentication
+/// failure.  Keep this data structured: gateways may collapse error messages
+/// into `authentication_failed` / `Not logged in`, but ACP clients can still
+/// render the provider-specific recovery action from `data`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderAuthRequiredError {
+    pub code: String,
+    pub provider: String,
+    pub guidance: String,
+}
+
+impl ProviderAuthRequiredError {
+    pub fn xai() -> Self {
+        Self {
+            code: PROVIDER_AUTH_REQUIRED_CODE.to_string(),
+            provider: "xai".to_string(),
+            guidance: "Run `/provider xai` to configure xAI authentication, then retry."
+                .to_string(),
+        }
+    }
+
+    /// Build the ACP error sent for a request-time xAI credential failure.
+    pub fn into_acp_error(self) -> acp::Error {
+        acp::Error::auth_required()
+            .data(serde_json::to_value(self).expect("provider auth error serializes"))
+    }
+}
 
 /// Read the API key from the environment.
 ///
@@ -391,6 +425,25 @@ pub const AUTH_ERROR_SESSION_EXPIRED: &str =
     "Session expired. Run `grok login` to re-authenticate.";
 
 pub const AUTH_ERROR_API_KEY: &str = "Authentication failed. Run `grok login`, set XAI_API_KEY, or add api_key to ~/.grok/config.toml.";
+
+#[cfg(test)]
+mod provider_auth_required_tests {
+    use super::*;
+
+    #[test]
+    fn tc7_request_time_xai_auth_failure_has_structured_provider_guidance() {
+        let error = ProviderAuthRequiredError::xai().into_acp_error();
+        assert_eq!(error.code, acp::ErrorCode::AuthRequired.into());
+        let data = error.data.expect("provider auth error must include data");
+        assert_eq!(data["code"], PROVIDER_AUTH_REQUIRED_CODE);
+        assert_eq!(data["provider"], "xai");
+        assert!(
+            data["guidance"]
+                .as_str()
+                .is_some_and(|guidance| guidance.contains("/provider xai"))
+        );
+    }
+}
 
 /// Next ACP method id when `cached_token` cannot proceed (missing / expired /
 /// legacy WebLogin), or `None` when fallthrough is forbidden.

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Builder"
+  short_description: "Create reliable Agent Skills and SKILL.md workflows"
+  default_prompt: "Use $skill-builder to create or refine a skill with a precise trigger description, concise SKILL.md contract, progressive disclosure, reusable resources, and validation checks."

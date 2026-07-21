@@ -1,0 +1,29 @@
+version: 1
+project:
+  name: "grok-build"
+  root: "."
+  repo_url: "https://github.com/JsonLee12138/grok-build.git"
+docs:
+  root: ".vibeRig/requirements"
+output:
+  language: "zh-CN"
+pull_request:
+  required: "true"
+  provider: "auto"
+  base_branch: ""
+  draft: "false"
+linear:
+  team_id: "d468277e-24d2-447d-a981-a20e0f1a7693"
+  project_id: "40632135-e9e9-4ce2-b45d-d92ee3319437"
+  project_document_id: "3e397f8e-e1e4-44ee-b865-ccdccc60fe4a"
+  project_document_title: "VibeRig Project Registration"
+gate_policy:
+  ci_required: "project_decides"
+  required_commands: []
+  manual_checks: []
+subagents:
+  default_research: "researcher"
+  default_qa: "qa"
+  default_security_audit: "security_auditor"
+  default_review: "code_review"
+  provider_model_configuration: "provider_model_configuration"

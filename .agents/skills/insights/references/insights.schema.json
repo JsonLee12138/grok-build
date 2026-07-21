@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://viberig.local/schemas/insights.schema.json",
+  "title": "VibeRig Insights Evidence",
+  "type": "object",
+  "required": ["requirement_id", "status"],
+  "properties": {
+    "requirement_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["accepted", "planned", "done"]
+    },
+    "gate": {
+      "type": "object",
+      "properties": {
+        "validation_passed": { "type": "boolean" },
+        "acceptance_passed": { "type": "boolean" },
+        "code_review_passed": { "type": "boolean" },
+        "pr_created": { "type": "boolean" },
+        "pr_merged": { "type": "boolean" },
+        "human_accepted": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "sources": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "git": {
+      "type": "object",
+      "properties": {
+        "branch": { "type": "string" },
+        "base_sha": { "type": "string" },
+        "head_sha": { "type": "string" },
+        "changed_files": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "validation": {
+      "type": "object",
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "result": { "type": "string" },
+        "output_path": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "review": {
+      "type": "object",
+      "properties": {
+        "acceptance_notes": { "type": "string" },
+        "code_review_notes": { "type": "string" },
+        "handoff_notes": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "learning_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "type", "confidence", "text"],
+        "properties": {
+          "id": { "type": "string" },
+          "type": {
+            "type": "string",
+            "enum": ["project_note", "workflow_rule", "skill_update", "user_preference"]
+          },
+          "confidence": {
+            "type": "string",
+            "enum": ["low", "medium", "high"]
+          },
+          "auto_apply": { "type": "boolean" },
+          "target": { "type": "string" },
+          "text": { "type": "string" },
+          "evidence": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "curation_proposals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "operation",
+          "target_skill",
+          "change_summary",
+          "evidence",
+          "confidence",
+          "risk",
+          "validation_plan",
+          "requires_confirmation"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "operation": {
+            "type": "string",
+            "enum": ["insert", "update", "deprecate", "noop"]
+          },
+          "target_skill": { "type": "string" },
+          "change_summary": { "type": "string" },
+          "evidence": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "confidence": {
+            "type": "string",
+            "enum": ["low", "medium", "high"]
+          },
+          "risk": {
+            "type": "string",
+            "enum": ["low", "medium", "high"]
+          },
+          "validation_plan": { "type": "string" },
+          "requires_confirmation": { "type": "boolean" },
+          "notes": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

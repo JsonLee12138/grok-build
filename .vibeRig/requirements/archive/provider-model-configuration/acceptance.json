@@ -1,0 +1,156 @@
+{
+  "version": 1,
+  "requirement": "provider-model-configuration",
+  "criteria": [
+    {
+      "id": "AC-1",
+      "source": "intake.md「期望结果」第 1、4、5 项",
+      "precondition": "配置包含合法的 [provider.acme] 与 [model.\"acme/demo-v1\"]，Model 显式引用 acme。",
+      "action": "加载模型配置。",
+      "expected": "catalog 中存在唯一 key 为 acme/demo-v1 的 ModelEntry。",
+      "evidence": "指定测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_01: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_01 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-2",
+      "source": "intake.md「期望结果」第 1 项",
+      "precondition": "provider.acme.base_url 为 URL A，关联模型已存在。",
+      "action": "将 base_url 改为 URL B 后重新加载配置。",
+      "expected": "关联 ModelEntry.base_url 等于 URL B。",
+      "evidence": "指定测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_02: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_02 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-3",
+      "source": "intake.md「期望结果」第 1 项",
+      "precondition": "配置加载结果包含 acme/demo-v1。",
+      "action": "删除该 Model 配置后重新加载。",
+      "expected": "catalog 不包含 acme/demo-v1。",
+      "evidence": "指定测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_03: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_03 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-4",
+      "source": "intake.md「期望结果」第 3 项",
+      "precondition": "三个 Provider 分别配置现有 OpenAI-compatible、Anthropic、内置 backend 值。",
+      "action": "分别加载三份配置。",
+      "expected": "每个 Provider Model 的 api_backend 精确等于对应既有 backend 枚举；协议枚举数量不增加。",
+      "evidence": "指定表驱动测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_04: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_04 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-5",
+      "source": "intake.md「期望结果」第 2 项",
+      "precondition": "Provider 配置 api_key = \"literal-secret\"。",
+      "action": "加载配置并展开 Model。",
+      "expected": "ModelEntry.api_key 等于 literal-secret；ModelEntry.env_key 为 None。",
+      "evidence": "指定测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_05: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_05 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-6",
+      "source": "intake.md「期望结果」第 2 项",
+      "precondition": "Provider 配置 api_key = { env = \"ACME_API_KEY\" }；测试进程不设置该变量。",
+      "action": "加载配置并展开 Model。",
+      "expected": "ModelEntry.env_key 等于 ACME_API_KEY；ModelEntry.api_key 为 None；解析阶段没有读取环境变量。",
+      "evidence": "指定测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_06: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_06 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-7",
+      "source": "intake.md「约束」第 4 项",
+      "precondition": "Provider 与关联 Model 对同一连接字段配置不同值。",
+      "action": "加载配置并展开 Model。",
+      "expected": "展开后的对应字段精确等于 Model 显式值。",
+      "evidence": "指定表驱动测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_07: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_07 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-8",
+      "source": "intake.md「期望结果」第 2 项及「约束」第 4 项",
+      "precondition": "显式引用 Provider 的 Model 同时声明 api_key 与独立 env_key。",
+      "action": "加载配置。",
+      "expected": "该新 Model 不进入 catalog。",
+      "evidence": "指定负向测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_08: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_08 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-9",
+      "source": "intake.md「约束」第 3 项",
+      "precondition": "配置含唯一标记明文密钥 secret-ac-09-marker，并触发该 Provider 的解析 warning。",
+      "action": "捕获解析与 warning 日志。",
+      "expected": "捕获内容不包含 secret-ac-09-marker。",
+      "evidence": "指定负向测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_09: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_09 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-10",
+      "source": "intake.md「期望结果」第 5、7 项及「成功信号」第 2、3 项",
+      "precondition": "catalog 含 canonical key acme/demo-v1。",
+      "action": "使用 acme/demo-v1 执行统一 model lookup。",
+      "expected": "返回 canonical key acme/demo-v1 对应的 ModelEntry。",
+      "evidence": "指定测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_10: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_10 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-11",
+      "source": "intake.md「期望结果」第 6、7 项及「成功信号」第 2、3 项",
+      "precondition": "acme/demo-v1 配置 alias fast。",
+      "action": "使用 fast 执行统一 model lookup。",
+      "expected": "返回 canonical key acme/demo-v1 对应的 ModelEntry。",
+      "evidence": "指定测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_11: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_11 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-12",
+      "source": "intake.md「期望结果」第 6 项",
+      "precondition": "alias fast 指向 acme/demo-v1；另一个 catalog key 或 wire slug 也叫 fast。",
+      "action": "使用 fast 执行统一 model lookup。",
+      "expected": "返回 alias 目标 acme/demo-v1。",
+      "evidence": "指定冲突测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_12: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_12 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-13",
+      "source": "intake.md「期望结果」第 6 项",
+      "precondition": "两个 Provider Model 均声明 alias duplicate；catalog 中另有 key 或 wire slug duplicate。",
+      "action": "使用 duplicate 执行统一 model lookup。",
+      "expected": "返回 unknown model；不得降级匹配同名 key 或 wire slug。",
+      "evidence": "指定负向测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_13: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_13 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-14",
+      "source": "intake.md「期望结果」第 5、7 项",
+      "precondition": "Model 表 key 为 acme/demo-v1，wire model ID 为 upstream-demo，alias 为 fast。",
+      "action": "分别通过 canonical key 与 alias 执行 lookup。",
+      "expected": "两次返回的 ModelEntry.info.model 均等于 upstream-demo。",
+      "evidence": "指定测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_14: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_14 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    },
+    {
+      "id": "AC-15",
+      "source": "intake.md「期望结果」第 2、5、7 项及「成功信号」第 4 项",
+      "precondition": "三份不含 provider 的直接 Model fixture 分别配置 api_key 明文、api_key = { env = \"DIRECT_API_KEY\" }、独立 env_key = \"DIRECT_API_KEY\"。",
+      "action": "分别加载配置并通过表 key 或 wire model slug 执行 model lookup。",
+      "expected": "前两份 fixture 以原 [model.<id>] 表 key 进入 catalog，分别互斥映射到 ModelEntry.api_key 或内部 ModelEntry.env_key，解析阶段不读取环境变量；含独立 env_key 的 Model 被跳过并输出不含字段值的 warning。",
+      "evidence": "指定表驱动正向与负向测试输出 ok。",
+      "verification": "执行：cargo test -p xai-grok-shell -- --list | rg '^agent::config::tests::provider_model_acceptance_ac_15: test$' && cargo test -p xai-grok-shell agent::config::tests::provider_model_acceptance_ac_15 -- --exact。测试名称必须被列出，随后该测试退出码必须为 0。",
+      "milestone": "provider-model-configuration"
+    }
+  ]
+}

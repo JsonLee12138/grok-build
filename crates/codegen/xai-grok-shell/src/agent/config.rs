@@ -7768,6 +7768,7 @@ reasoning_effort = "low"
                 ConnectionField::ApiBaseUrl,
                 r#"
                 [provider.acme]
+                base_url = "https://provider.example/v1"
                 api_base_url = "https://provider-api.example/v1"
                 [model."acme/demo-v1"]
                 provider = "acme"
@@ -7778,6 +7779,7 @@ reasoning_effort = "low"
                 ConnectionField::ApiBackend,
                 r#"
                 [provider.acme]
+                base_url = "https://provider.example/v1"
                 api_backend = "messages"
                 [model."acme/demo-v1"]
                 provider = "acme"
@@ -7788,6 +7790,7 @@ reasoning_effort = "low"
                 ConnectionField::AuthScheme,
                 r#"
                 [provider.acme]
+                base_url = "https://provider.example/v1"
                 auth_scheme = "x_api_key"
                 [model."acme/demo-v1"]
                 provider = "acme"
@@ -7798,6 +7801,7 @@ reasoning_effort = "low"
                 ConnectionField::ExtraHeaders,
                 r#"
                 [provider.acme]
+                base_url = "https://provider.example/v1"
                 extra_headers = { x-route = "provider" }
                 [model."acme/demo-v1"]
                 provider = "acme"
@@ -8394,6 +8398,83 @@ reasoning_effort = "low"
     }
 
     #[test]
+    fn provider_model_missing_effective_base_url_is_removed_from_catalog() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            api_backend = "messages"
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            None,
+        );
+
+        assert!(
+            !catalog.contains_key("acme/demo-v1"),
+            "a provider model without an effective base_url must not enter the catalog"
+        );
+        assert!(
+            resolve_model_reference(&catalog, &cfg.model_aliases, "acme/demo-v1").is_none(),
+            "the rejected catalog key must not resolve"
+        );
+    }
+
+    #[test]
+    fn provider_model_missing_effective_base_url_tombstones_prefetched_entry_and_wire_slug() {
+        let mut prefetched = IndexMap::new();
+        prefetched.insert(
+            "acme/demo-v1".to_owned(),
+            test_model_entry(
+                "old-wire-slug",
+                "https://prefetched.example/v1",
+                Some("prefetched-secret"),
+                Some("PREFETCHED_ENV"),
+                None,
+            ),
+        );
+
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            api_backend = "messages"
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            Some(prefetched),
+        );
+
+        for requested in ["acme/demo-v1", "old-wire-slug"] {
+            assert!(
+                resolve_model_reference(&catalog, &cfg.model_aliases, requested).is_none(),
+                "the fail-closed tombstone must remove prefetched reference {requested}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_model_explicit_model_base_url_is_accepted_without_provider_base_url() {
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            api_backend = "messages"
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            base_url = "https://model.example/v1"
+            "#,
+            None,
+        );
+
+        let entry = catalog
+            .get("acme/demo-v1")
+            .expect("an explicit Model.base_url is a valid effective endpoint");
+        assert_eq!(entry.info.base_url, "https://model.example/v1");
+        assert_eq!(entry.info.api_backend, ApiBackend::Messages);
+    }
+
+    #[test]
     fn provider_model_origin_bound_headers_do_not_cross_origins() {
         let cases = [
             (
@@ -8441,44 +8522,57 @@ reasoning_effort = "low"
     }
 
     #[test]
-    fn provider_model_origin_bound_data_requires_provider_session_endpoint() {
-        let cases = [
-            ("provider has no endpoint", ""),
-            (
-                "provider has only api endpoint",
-                r#"api_base_url = "https://provider.example/api/v1""#,
-            ),
-        ];
+    fn provider_model_provider_api_base_url_cannot_replace_base_url() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            api_base_url = "https://provider.example/api/v1"
+            auth_scheme = "x_api_key"
+            api_key = "provider-api-secret"
+            extra_headers = { authorization = "provider-secret" }
 
-        for (case, provider_endpoint) in cases {
-            let (_, catalog) = resolve_models_from_toml(
-                &format!(
-                    r#"
-                    [provider.acme]
-                    {provider_endpoint}
-                    auth_scheme = "x_api_key"
-                    api_key = "provider-api-secret"
-                    extra_headers = {{ authorization = "provider-secret" }}
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+            None,
+        );
+        assert!(
+            !catalog.contains_key("acme/demo-v1"),
+            "Provider.api_base_url cannot stand in for the required effective base_url"
+        );
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some("acme/demo-v1")
+                && warning.field.as_deref() == Some("provider")
+                && warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+        }));
+    }
 
-                    [model."acme/demo-v1"]
-                    provider = "acme"
-                    "#
-                ),
-                None,
-            );
-            let entry = &catalog["acme/demo-v1"];
-            assert!(
-                entry.info.extra_headers.is_empty(),
-                "{case}: headers cannot bind to a fallback session origin"
-            );
-            assert_eq!(
-                entry.info.auth_scheme,
-                AuthScheme::Bearer,
-                "{case}: auth cannot bind to a fallback session origin"
-            );
-            assert!(entry.api_key.is_none(), "{case}");
-            assert!(entry.env_key.is_none(), "{case}");
-        }
+    #[test]
+    fn provider_model_model_api_base_url_cannot_replace_base_url() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.acme]
+            auth_scheme = "x_api_key"
+            api_key = "provider-api-secret"
+            extra_headers = { authorization = "provider-secret" }
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            api_base_url = "https://model.example/api/v1"
+            "#,
+            None,
+        );
+        assert!(
+            !catalog.contains_key("acme/demo-v1"),
+            "Model.api_base_url cannot stand in for the required effective base_url"
+        );
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some("acme/demo-v1")
+                && warning.field.as_deref() == Some("provider")
+                && warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+        }));
     }
 
     #[test]

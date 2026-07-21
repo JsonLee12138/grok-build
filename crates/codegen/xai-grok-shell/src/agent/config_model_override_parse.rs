@@ -353,6 +353,19 @@ fn normalize_provider_model(
         return false;
     }
 
+    // Provider-backed models must have an effective session endpoint.  Do not
+    // let the downstream catalog builder fill in the default cli-chat-proxy
+    // URL when neither side supplies a session `base_url`; the override must
+    // fail closed and its caller will tombstone any stale catalog entries.
+    if entry.base_url.is_none() && provider.base_url.is_none() {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("provider".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+        });
+        return false;
+    }
+
     let changes_origin = model_changes_provider_origin(entry, provider);
 
     if entry.api_key.is_none() && entry.env_key.is_none() {
@@ -815,6 +828,50 @@ pub(in crate::agent) mod tests {
                 .collect();
             assert_eq!(matching.len(), 1, "{case}: warning identity must be stable");
         }
+    }
+
+    #[test]
+    fn provider_model_missing_effective_base_url_is_fail_closed() {
+        let (models, warnings) = parse_raw(
+            r#"
+            [provider.acme]
+            api_backend = "messages"
+            api_key = "missing-base-url-secret-marker"
+
+            [model."acme/demo-v1"]
+            provider = "acme"
+            "#,
+        );
+
+        assert!(
+            models
+                .get("acme/demo-v1")
+                .is_some_and(|model| model.reject_model),
+            "a provider-backed model without an effective base_url must retain a fail-closed tombstone"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the clean missing-base-url fixture must emit exactly one warning"
+        );
+        let matching: Vec<_> = warnings
+            .iter()
+            .filter(|warning| {
+                warning.kind == ModelOverrideWarningKind::InvalidValue
+                    && warning.model_key.as_deref() == Some("acme/demo-v1")
+                    && warning.field.as_deref() == Some("provider")
+            })
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "missing effective base_url must produce one stable, value-free warning"
+        );
+        let rendered = serde_json::to_string(&warnings).expect("warnings serialize");
+        assert!(
+            !rendered.contains("missing-base-url-secret-marker"),
+            "the provider/InvalidValue warning must not expose configured values"
+        );
     }
 
     #[test]

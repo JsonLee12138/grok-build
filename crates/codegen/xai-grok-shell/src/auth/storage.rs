@@ -4,6 +4,86 @@ use std::path::{Path, PathBuf};
 
 use super::model::{API_KEY_SCOPE, AuthMode, AuthStore, GrokAuth, lookup_auth};
 
+const PROVIDER_STORE_VERSION: u8 = 2;
+
+/// On-disk provider credential store.  The legacy scope map is retained as
+/// an implementation detail during the v2 transition so custom OAuth scopes
+/// cannot be lost, while the canonical xAI credential always lives at
+/// `providers.xai.credentials.xai`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProviderAuthStore {
+    version: u8,
+    providers: ProviderEntries,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProviderEntries {
+    xai: XaiProvider,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct XaiProvider {
+    credentials: XaiCredentials,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct XaiCredentials {
+    xai: GrokAuth,
+    /// Keeps current callers' scope-based contract lossless until they move
+    /// to provider credentials directly.  `xai` remains authoritative for
+    /// a newly written single-credential store.
+    #[serde(default, skip_serializing_if = "AuthStore::is_empty")]
+    scopes: AuthStore,
+}
+
+impl ProviderAuthStore {
+    fn from_legacy(scopes: AuthStore) -> std::io::Result<Self> {
+        let credential = scopes
+            .get(super::model::LEGACY_SCOPE)
+            .or_else(|| scopes.get(API_KEY_SCOPE))
+            .or_else(|| scopes.values().next())
+            .cloned()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty auth store")
+            })?;
+        Ok(Self {
+            version: PROVIDER_STORE_VERSION,
+            providers: ProviderEntries {
+                xai: XaiProvider {
+                    credentials: XaiCredentials {
+                        xai: credential,
+                        scopes,
+                    },
+                },
+            },
+        })
+    }
+
+    fn into_legacy(self) -> std::io::Result<AuthStore> {
+        if self.version != PROVIDER_STORE_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsupported auth store version",
+            ));
+        }
+        let credentials = self.providers.xai.credentials;
+        let scope = if credentials.xai.auth_mode == AuthMode::ApiKey {
+            API_KEY_SCOPE
+        } else {
+            super::model::LEGACY_SCOPE
+        };
+        // The canonical v2 value wins over a stale compatibility copy.
+        let mut scopes = credentials.scopes;
+        scopes.insert(scope.to_owned(), credentials.xai);
+        Ok(scopes)
+    }
+}
+
+enum DecodedAuthStore {
+    V2(AuthStore),
+    Legacy(AuthStore),
+}
+
 /// RAII guard for an exclusive advisory lock on `auth.json.lock`.
 /// The lock is released when the inner `File` is dropped (closing the FD).
 pub(crate) struct AuthFileLock {
@@ -58,9 +138,72 @@ pub fn read_auth_json(auth_file: &Path) -> std::io::Result<AuthStore> {
         return Ok(AuthStore::new());
     }
 
-    let map = serde_json::from_str(trimmed)
+    let value: serde_json::Value = serde_json::from_str(trimmed)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(map)
+    let decoded = if is_provider_store_envelope(&value) {
+        let v2 = serde_json::from_str::<ProviderAuthStore>(trimmed)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        DecodedAuthStore::V2(v2.into_legacy()?)
+    } else {
+        let legacy = serde_json::from_str(trimmed)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        DecodedAuthStore::Legacy(legacy)
+    };
+
+    match decoded {
+        DecodedAuthStore::V2(store) => Ok(store),
+        DecodedAuthStore::Legacy(store) => {
+            // A migration is best-effort when another auth writer already
+            // owns the lock.  Returning the legacy value is safe; that writer
+            // or the next read will retry, and we never overwrite its v2 file.
+            migrate_legacy_store(auth_file, &store)?;
+            Ok(store)
+        }
+    }
+}
+
+/// v2 is recognized only by its complete canonical envelope. A legacy scope
+/// literally named `version` must remain a legacy map, not a malformed v2.
+fn is_provider_store_v2(value: &serde_json::Value) -> bool {
+    value.get("version").and_then(serde_json::Value::as_u64) == Some(PROVIDER_STORE_VERSION.into())
+        && is_provider_store_envelope(value)
+}
+
+fn is_provider_store_envelope(value: &serde_json::Value) -> bool {
+    value.pointer("/providers/xai/credentials/xai").is_some()
+}
+
+/// Migrate only while holding the existing auth.json advisory lock.  Re-read
+/// after acquisition so an earlier v2 writer always wins over stale legacy
+/// bytes observed before waiting for the lock.
+fn migrate_legacy_store(auth_file: &Path, legacy: &AuthStore) -> std::io::Result<()> {
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    let Some(_lock) = super::manager::lock::try_lock_auth_file_nonblocking(auth_file) else {
+        return Ok(());
+    };
+    let current = std::fs::read_to_string(auth_file)?;
+    let trimmed = current.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let current_value: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if is_provider_store_v2(&current_value) {
+        return Ok(());
+    }
+    // Preserve the exact legacy data read under the lock. A parse failure is
+    // returned and leaves the original bytes untouched.
+    let locked_legacy: AuthStore = serde_json::from_str(trimmed)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let _ = legacy; // documents the pre-lock snapshot used by the caller.
+    if !_lock.still_live(auth_file) {
+        // A stale lock inode may coexist with a live writer. Re-readers will
+        // retry migration; this holder must never perform the irreversible write.
+        return Ok(());
+    }
+    write_auth_json(auth_file, &locked_legacy)
 }
 
 /// Read auth.json, returning an empty map if the file does not exist.
@@ -93,6 +236,15 @@ pub(crate) fn read_auth_json_or_empty(auth_file: &Path) -> std::io::Result<AuthS
 /// writes so the original bytes are never silently lost.
 pub(crate) fn backup_corrupt_auth_file(path: &Path) -> Option<PathBuf> {
     if !path.exists() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(path).ok()?;
+    if serde_json::from_str::<serde_json::Value>(&contents)
+        .ok()
+        .is_some_and(|value| is_provider_store_envelope(&value))
+    {
+        // An unsupported provider-store version is not corruption. Retain it
+        // verbatim so a newer client can still read it.
         return None;
     }
     if read_auth_json(path).is_ok() {
@@ -158,12 +310,30 @@ pub(crate) fn backup_corrupt_auth_file(path: &Path) -> Option<PathBuf> {
 pub(crate) fn read_auth_json_or_empty_recovering_corrupt(
     auth_file: &Path,
 ) -> std::io::Result<AuthStore> {
+    read_auth_json_or_empty_recovering_corrupt_with_lock(auth_file, None)
+}
+
+fn read_auth_json_or_empty_recovering_corrupt_with_lock(
+    auth_file: &Path,
+    lock: Option<&AuthFileLock>,
+) -> std::io::Result<AuthStore> {
     match read_auth_json(auth_file) {
         Ok(map) => Ok(map),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AuthStore::new()),
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-            let _ = backup_corrupt_auth_file(auth_file);
-            Ok(AuthStore::new())
+            if lock.is_some_and(|lock| !lock.still_live(auth_file)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "auth lock replaced",
+                ));
+            }
+            if backup_corrupt_auth_file(auth_file).is_some() {
+                Ok(AuthStore::new())
+            } else {
+                // A failed backup must not turn corruption into silent data
+                // loss by overwriting the only copy with an empty store.
+                Err(e)
+            }
         }
         Err(e) => Err(e),
     }
@@ -235,11 +405,16 @@ fn write_store_to(path: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
     use crate::util::secure_file::open_secure_file;
 
     if let Some(parent) = path.parent() {
+        let created = !parent.exists();
         std::fs::create_dir_all(parent)?;
+        if created {
+            set_secure_directory_permissions(parent)?;
+        }
     }
     let file = open_secure_file(path)?;
     let mut writer = std::io::BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, auth_store)
+    let provider_store = ProviderAuthStore::from_legacy(auth_store.clone())?;
+    serde_json::to_writer_pretty(&mut writer, &provider_store)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     writer.flush()?;
     writer
@@ -250,6 +425,17 @@ fn write_store_to(path: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
     {
         crate::util::secure_file::set_windows_secure_permissions(path)?;
     }
+    Ok(())
+}
+
+fn set_secure_directory_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -348,8 +534,25 @@ pub fn read_api_key(grok_home: &Path) -> Option<String> {
 /// Uses the corrupt-recovery reader so a malformed auth.json (e.g. from a
 /// previous crash) can be healed when the user sets an API key.
 pub fn store_api_key(grok_home: &Path, api_key: &str) -> std::io::Result<()> {
+    store_api_key_with(grok_home, api_key, |_| {})
+}
+
+fn store_api_key_with(
+    grok_home: &Path,
+    api_key: &str,
+    before_write: fn(&Path),
+) -> std::io::Result<()> {
     let path = grok_home.join("auth.json");
-    let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
+    // Recovery (read → corrupt backup → replacement write) must be one
+    // critical section, otherwise a concurrent fresh credential can be
+    // mistaken for the corrupt bytes we observed before locking.
+    if !grok_home.exists() {
+        std::fs::create_dir_all(grok_home)?;
+        set_secure_directory_permissions(grok_home)?;
+    }
+    let _lock = super::manager::lock::try_lock_auth_file_nonblocking(&path)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::WouldBlock, "auth store is busy"))?;
+    let mut map = read_auth_json_or_empty_recovering_corrupt_with_lock(&path, Some(&_lock))?;
     map.insert(
         API_KEY_SCOPE.to_owned(),
         GrokAuth {
@@ -358,6 +561,13 @@ pub fn store_api_key(grok_home: &Path, api_key: &str) -> std::io::Result<()> {
             ..Default::default()
         },
     );
+    before_write(&path);
+    if !_lock.still_live(&path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "auth lock replaced",
+        ));
+    }
     write_auth_json(&path, &map)
 }
 
@@ -373,6 +583,213 @@ pub fn clear_api_key(grok_home: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod provider_store_red_tests {
+    use super::*;
+
+    fn legacy_store(key: &str) -> AuthStore {
+        let mut store = AuthStore::new();
+        store.insert(
+            super::super::model::LEGACY_SCOPE.to_owned(),
+            GrokAuth {
+                key: key.to_owned(),
+                ..GrokAuth::test_default()
+            },
+        );
+        store
+    }
+
+    #[test]
+    fn migrates_legacy_xai_store_to_versioned_provider_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let legacy = legacy_store("legacy-secret");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        assert_eq!(
+            read_auth_json(&path)
+                .unwrap()
+                .get(super::super::model::LEGACY_SCOPE)
+                .unwrap()
+                .key,
+            "legacy-secret"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["version"], 2);
+        assert_eq!(
+            json["providers"]["xai"]["credentials"]["xai"]["key"],
+            "legacy-secret"
+        );
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_never_overwrites_existing_v2_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let existing = legacy_store("existing-secret");
+        write_auth_json(&path, &existing).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        assert_eq!(
+            read_auth_json(&path)
+                .unwrap()
+                .get(super::super::model::LEGACY_SCOPE)
+                .unwrap()
+                .key,
+            "existing-secret"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_scope_named_version_is_not_misdetected_as_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut legacy = legacy_store("legacy-secret");
+        legacy.insert("version".to_owned(), GrokAuth::test_default());
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let read = read_auth_json(&path).unwrap();
+        assert!(read.contains_key("version"));
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(is_provider_store_v2(&json));
+    }
+
+    #[test]
+    fn v2_canonical_credential_overrides_stale_compatibility_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut scopes = legacy_store("stale-secret");
+        let canonical = GrokAuth {
+            key: "canonical-secret".to_owned(),
+            ..GrokAuth::test_default()
+        };
+        let store = ProviderAuthStore {
+            version: PROVIDER_STORE_VERSION,
+            providers: ProviderEntries {
+                xai: XaiProvider {
+                    credentials: XaiCredentials {
+                        xai: canonical,
+                        scopes,
+                    },
+                },
+            },
+        };
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        assert_eq!(
+            read_auth_json(&path).unwrap()[super::super::model::LEGACY_SCOPE].key,
+            "canonical-secret"
+        );
+    }
+
+    #[test]
+    fn unsupported_provider_store_version_is_not_migrated_or_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut value =
+            serde_json::to_value(ProviderAuthStore::from_legacy(legacy_store("future")).unwrap())
+                .unwrap();
+        value["version"] = serde_json::json!(3);
+        let original = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        assert_eq!(
+            read_auth_json(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(store_api_key(dir.path(), "replacement").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_api_key_refuses_write_after_its_lock_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&legacy_store("old-secret")).unwrap(),
+        )
+        .unwrap();
+
+        let err = store_api_key_with(dir.path(), "new-secret", |auth_path| {
+            let lock_path = auth_path.with_file_name("auth.json.lock");
+            let old_lock = auth_path.with_file_name("replaced.lock");
+            std::fs::rename(&lock_path, old_lock).unwrap();
+            std::fs::write(lock_path, b"replacement").unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            read_auth_json(&path).unwrap()[super::super::model::LEGACY_SCOPE].key,
+            "old-secret"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_lock_guard_detects_replaced_lock_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(&auth_path, b"{}").unwrap();
+        let lock = super::super::manager::lock::try_lock_auth_file_nonblocking(&auth_path).unwrap();
+        let lock_path = dir.path().join("auth.json.lock");
+        let old_lock_path = dir.path().join("old.lock");
+        std::fs::rename(&lock_path, old_lock_path).unwrap();
+        std::fs::write(&lock_path, b"replacement").unwrap();
+        assert!(!lock.still_live(&auth_path));
+    }
+
+    #[test]
+    fn corrupt_store_is_backed_up_before_a_recovery_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, b"{not-json").unwrap();
+
+        store_api_key(dir.path(), "replacement-secret").unwrap();
+
+        let recovered = read_auth_json(&path).unwrap();
+        assert_eq!(recovered[API_KEY_SCOPE].key, "replacement-secret");
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("auth.json.corrupt.")
+            })
+            .count();
+        assert_eq!(backups, 1, "corrupt bytes must be retained in a backup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_store_keeps_directory_and_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("private");
+        store_api_key(&nested, "secret").unwrap();
+        assert_eq!(
+            std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(nested.join("auth.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 }
 
 #[cfg(test)]

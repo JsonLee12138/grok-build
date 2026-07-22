@@ -8,8 +8,8 @@ use super::*;
 /// Gateway layers can replace the source message with generic authentication
 /// copy.  This mapper intentionally classifies from `SamplingError`, not its
 /// text, so an xAI request always retains a stable provider remediation.
-fn map_request_sampling_error_to_acp(err: SamplingError) -> acp::Error {
-    if err.is_auth_error() {
+fn map_request_sampling_error_to_acp(err: SamplingError, base_url: &str) -> acp::Error {
+    if err.is_auth_error() && crate::util::is_first_party_xai_url(base_url) {
         return crate::agent::auth_method::ProviderAuthRequiredError::xai().into_acp_error();
     }
     map_sampling_err_to_acp(err)
@@ -23,7 +23,7 @@ impl SessionActor {
             .as_deref()
             .is_some_and(crate::agent::auth_method::is_session_based_method)
     }
-    pub(super) fn to_acp_error(&self, err: SamplingError) -> acp::Error {
+    pub(super) fn to_acp_error(&self, err: SamplingError, base_url: &str) -> acp::Error {
         if err.is_auth_error() {
             let method_guard = self.auth_method_id.load();
             let method = method_guard.as_deref();
@@ -39,9 +39,9 @@ impl SessionActor {
             // `Not logged in` message erase the actionable provider context.
             // A request never starts an interactive flow; the client receives
             // this structured instruction and the user chooses `/provider xai`.
-            return map_request_sampling_error_to_acp(err);
+            return map_request_sampling_error_to_acp(err, base_url);
         }
-        map_request_sampling_error_to_acp(err)
+        map_request_sampling_error_to_acp(err, base_url)
     }
     /// Set up `[system, skill_reminder?]` — prefix is deferred to background.
     pub(super) async fn initialize(&self, system_prompt: String) {
@@ -650,9 +650,10 @@ mod request_auth_error_tests {
 
     #[test]
     fn tc8_request_time_auth_error_preserves_xai_provider_guidance() {
-        let error = map_request_sampling_error_to_acp(SamplingError::Auth(
-            "gateway returned authentication_failed".to_string(),
-        ));
+        let error = map_request_sampling_error_to_acp(
+            SamplingError::Auth("gateway returned authentication_failed".to_string()),
+            "https://api.x.ai/v1",
+        );
 
         assert_eq!(error.code, acp::ErrorCode::AuthRequired.into());
         let data = error.data.expect("request auth error must include data");
@@ -662,6 +663,26 @@ mod request_auth_error_tests {
             data["guidance"]
                 .as_str()
                 .is_some_and(|guidance| guidance.contains("/provider xai"))
+        );
+    }
+
+    #[test]
+    fn third_party_request_auth_error_is_not_mislabeled_as_xai() {
+        let error = map_request_sampling_error_to_acp(
+            SamplingError::Auth("Invalid api_key".to_string()),
+            "https://provider.example/v1",
+        );
+
+        assert_ne!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data["provider"].as_str()),
+            Some("xai")
+        );
+        assert_ne!(
+            error.data.as_ref().and_then(|data| data["code"].as_str()),
+            Some("provider_auth_required")
         );
     }
 }

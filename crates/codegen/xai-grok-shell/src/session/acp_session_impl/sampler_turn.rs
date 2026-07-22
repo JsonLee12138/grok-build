@@ -535,8 +535,9 @@ impl SessionActor {
         self.refresh_token_if_expired().await;
         let mut full_config = self.reconstruct_full_config().await;
         full_config.force_http1 = force_http1;
-        let sampling_client =
-            xai_grok_sampler::SamplingClient::new(full_config).map_err(|e| self.to_acp_error(e))?;
+        let base_url = full_config.base_url.clone();
+        let sampling_client = xai_grok_sampler::SamplingClient::new(full_config)
+            .map_err(|e| self.to_acp_error(e, &base_url))?;
         Ok(sampling_client)
     }
     /// Push a fresh `SamplerConfig` into the per-session sampler actor

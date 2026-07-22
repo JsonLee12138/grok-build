@@ -584,7 +584,7 @@ fn session_created_without_flag_emits_no_extension_fetches() {
     assert_eq!(count_extension_fetches(&effects), 0);
 }
 #[test]
-fn session_failed_clears_flag_no_fetches() {
+fn session_failed_removes_zombie_and_surfaces_error() {
     use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab};
     let mut app = test_app_with_agent();
     let id = AgentId(0);
@@ -602,7 +602,153 @@ fn session_failed_clears_flag_no_fetches() {
         &mut app,
     );
     assert_eq!(count_extension_fetches(&effects), 0);
-    assert!(!app.agents[&id].pending_extensions_fetch);
+    assert!(
+        !app.agents.contains_key(&id),
+        "failed placeholder must not remain as a zombie session"
+    );
+    assert!(
+        app.startup_warnings
+            .iter()
+            .any(|warning| warning.message.contains("boom")),
+        "session creation error must be visible after the zombie is removed"
+    );
+}
+#[test]
+fn session_failed_restores_previous_session_with_visible_error_and_registration() {
+    let mut app = test_app_with_agent();
+    let previous_id = AgentId(0);
+    let failed_id = AgentId(1);
+    let mut failed_session = make_test_agent_session(&app, failed_id, "unused");
+    failed_session.session_id = None;
+    app.agents.insert(
+        failed_id,
+        AgentView::new(failed_session, ScrollbackState::new()),
+    );
+    app.active_view = ActiveView::Agent(failed_id);
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionFailed {
+            agent_id: failed_id,
+            error: "ACP request failed: boom".to_string(),
+        }),
+        &mut app,
+    );
+
+    assert!(!app.agents.contains_key(&failed_id));
+    assert_eq!(app.active_view, ActiveView::Agent(previous_id));
+    assert!(
+        all_system_texts(&app, previous_id)
+            .iter()
+            .any(|text| text.contains("Cannot create session: request failed: boom")),
+        "the sanitized failure must be visible in the restored session"
+    );
+    assert!(effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::RegisterActiveSession { session_id, cwd }
+                if session_id.0.as_ref() == "test-session" && cwd == "/tmp"
+        )
+    }));
+}
+#[test]
+fn session_failed_after_user_switch_preserves_current_session() {
+    let mut app = test_app_with_agent();
+    let current_id = AgentId(0);
+    let failed_id = AgentId(1);
+    let mut failed_session = make_test_agent_session(&app, failed_id, "unused");
+    failed_session.session_id = None;
+    app.agents.insert(
+        failed_id,
+        AgentView::new(failed_session, ScrollbackState::new()),
+    );
+    // The user has already switched back while the create request is pending.
+    app.active_view = ActiveView::Agent(current_id);
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionFailed {
+            agent_id: failed_id,
+            error: "late failure".to_string(),
+        }),
+        &mut app,
+    );
+
+    assert!(!app.agents.contains_key(&failed_id));
+    assert_eq!(app.active_view, ActiveView::Agent(current_id));
+    assert!(
+        all_system_texts(&app, current_id)
+            .iter()
+            .any(|text| text.contains("Cannot create session: late failure"))
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterActiveSession { session_id, .. }
+                if session_id.0.as_ref() == "test-session"
+        )),
+        "the current session must be re-registered after /new unregistered it"
+    );
+}
+#[test]
+fn session_failed_from_welcome_does_not_register_a_fallback_session() {
+    let mut app = test_app_with_agent();
+    let fallback_id = AgentId(0);
+    let failed_id = AgentId(1);
+    let mut failed_session = make_test_agent_session(&app, failed_id, "unused");
+    failed_session.session_id = None;
+    app.agents.insert(
+        failed_id,
+        AgentView::new(failed_session, ScrollbackState::new()),
+    );
+    app.active_view = ActiveView::Welcome;
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionFailed {
+            agent_id: failed_id,
+            error: "late failure from welcome".to_string(),
+        }),
+        &mut app,
+    );
+
+    assert!(!app.agents.contains_key(&failed_id));
+    assert_eq!(app.active_view, ActiveView::Welcome);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RegisterActiveSession { .. })),
+        "a non-Agent view must not gain an arbitrary active session"
+    );
+    assert!(
+        all_system_texts(&app, fallback_id)
+            .iter()
+            .any(|text| text.contains("Cannot create session: late failure from welcome")),
+        "the error should remain visible when the fallback session is opened later"
+    );
+}
+#[test]
+fn session_failed_for_bound_agent_surfaces_sanitized_turn_failure() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionFailed {
+            agent_id: id,
+            error: "Authentication required: cli-chat-proxy rejected credentials".to_string(),
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(app.agents.contains_key(&id));
+    let entry = app.agents[&id].scrollback.entry(0).unwrap();
+    match &entry.block {
+        RenderBlock::SessionEvent(block) => match &block.event {
+            SessionEvent::TurnFailed { error, .. } => {
+                assert_eq!(error, "server rejected credentials");
+            }
+            other => panic!("expected TurnFailed, got {other:?}"),
+        },
+        other => panic!("expected SessionEvent block, got {other:?}"),
+    }
 }
 #[test]
 fn switch_model_without_session_does_nothing() {

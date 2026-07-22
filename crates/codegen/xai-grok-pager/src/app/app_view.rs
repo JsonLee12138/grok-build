@@ -349,6 +349,15 @@ pub enum AuthState {
         mode: AuthMode,
     },
 }
+
+/// Why the current authentication flow was started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFlowOrigin {
+    /// Normal login or re-auth; completion/cancellation may resolve stale re-auth UI.
+    Login,
+    /// Explicit `/provider xai` cached-token attempt; it must leave session re-auth state alone.
+    ProviderSelection,
+}
 /// How the auth flow presents itself to the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
@@ -541,6 +550,9 @@ pub struct AppView {
     /// (e.g. `Agent`) afterwards. `None` at startup so the normal
     /// login-then-load flow is preserved.
     pub auth_return_view: Option<ActiveView>,
+    /// Origin of the current authentication flow, used to preserve session
+    /// re-auth state when an explicit provider-selection attempt is cancelled.
+    pub auth_flow_origin: AuthFlowOrigin,
     /// Per-agent views (keyed by AgentId).
     pub agents: IndexMap<AgentId, AgentView>,
     /// Monotonically increasing counter for agent ID allocation.
@@ -1172,6 +1184,7 @@ impl AppView {
         Self {
             active_view: ActiveView::Welcome,
             auth_return_view: None,
+            auth_flow_origin: AuthFlowOrigin::Login,
             agents: IndexMap::new(),
             next_agent_id: 0,
             models,
@@ -5060,6 +5073,7 @@ pub(crate) mod tests {
         AppView {
             active_view: ActiveView::Welcome,
             auth_return_view: None,
+            auth_flow_origin: AuthFlowOrigin::Login,
             agents: indexmap::IndexMap::new(),
             next_agent_id: 0,
             models: ModelState::default(),

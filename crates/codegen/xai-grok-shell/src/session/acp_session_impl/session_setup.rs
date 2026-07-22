@@ -2,6 +2,19 @@
 //! readiness, skills reload and reminders, session info, and model-metadata
 //! refresh.
 use super::*;
+
+/// Preserve provider-specific recovery data at the request boundary.
+///
+/// Gateway layers can replace the source message with generic authentication
+/// copy.  This mapper intentionally classifies from `SamplingError`, not its
+/// text, so an xAI request always retains a stable provider remediation.
+fn map_request_sampling_error_to_acp(err: SamplingError, base_url: &str) -> acp::Error {
+    if err.is_auth_error() && crate::util::is_first_party_xai_url(base_url) {
+        return crate::agent::auth_method::ProviderAuthRequiredError::xai().into_acp_error();
+    }
+    map_sampling_err_to_acp(err)
+}
+
 impl SessionActor {
     /// `true` for session-based ACP auth methods.
     fn is_session_based_auth(&self) -> bool {
@@ -10,15 +23,10 @@ impl SessionActor {
             .as_deref()
             .is_some_and(crate::agent::auth_method::is_session_based_method)
     }
-    pub(super) fn to_acp_error(&self, err: SamplingError) -> acp::Error {
+    pub(super) fn to_acp_error(&self, err: SamplingError, base_url: &str) -> acp::Error {
         if err.is_auth_error() {
             let method_guard = self.auth_method_id.load();
             let method = method_guard.as_deref();
-            let msg = if method.is_some_and(crate::agent::auth_method::is_session_based_method) {
-                crate::agent::auth_method::AUTH_ERROR_SESSION_EXPIRED
-            } else {
-                crate::agent::auth_method::AUTH_ERROR_API_KEY
-            };
             xai_grok_telemetry::unified_log::error(
                 "sampling auth error",
                 Some(self.session_info.id.0.as_ref()),
@@ -27,9 +35,13 @@ impl SessionActor {
                     format!("{err}"), }
                 )),
             );
-            return acp::Error::auth_required().data(msg);
+            // Do not let a proxy/gateway's generic `authentication_failed` or
+            // `Not logged in` message erase the actionable provider context.
+            // A request never starts an interactive flow; the client receives
+            // this structured instruction and the user chooses `/provider xai`.
+            return map_request_sampling_error_to_acp(err, base_url);
         }
-        map_sampling_err_to_acp(err)
+        map_request_sampling_error_to_acp(err, base_url)
     }
     /// Set up `[system, skill_reminder?]` — prefix is deferred to background.
     pub(super) async fn initialize(&self, system_prompt: String) {
@@ -629,5 +641,48 @@ impl SessionActor {
             ));
         }
         rows
+    }
+}
+
+#[cfg(test)]
+mod request_auth_error_tests {
+    use super::*;
+
+    #[test]
+    fn tc8_request_time_auth_error_preserves_xai_provider_guidance() {
+        let error = map_request_sampling_error_to_acp(
+            SamplingError::Auth("gateway returned authentication_failed".to_string()),
+            "https://api.x.ai/v1",
+        );
+
+        assert_eq!(error.code, acp::ErrorCode::AuthRequired.into());
+        let data = error.data.expect("request auth error must include data");
+        assert_eq!(data["code"], "provider_auth_required");
+        assert_eq!(data["provider"], "xai");
+        assert!(
+            data["guidance"]
+                .as_str()
+                .is_some_and(|guidance| guidance.contains("/provider xai"))
+        );
+    }
+
+    #[test]
+    fn third_party_request_auth_error_is_not_mislabeled_as_xai() {
+        let error = map_request_sampling_error_to_acp(
+            SamplingError::Auth("Invalid api_key".to_string()),
+            "https://provider.example/v1",
+        );
+
+        assert_ne!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data["provider"].as_str()),
+            Some("xai")
+        );
+        assert_ne!(
+            error.data.as_ref().and_then(|data| data["code"].as_str()),
+            Some("provider_auth_required")
+        );
     }
 }

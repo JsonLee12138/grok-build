@@ -296,6 +296,19 @@ mod tests {
     }
 
     #[test]
+    fn tc7_model_selection_only_emits_model_action_without_authentication() {
+        let mut state = ModelState::default();
+        let (id, info) = plain_model("xai/model", "xai/model");
+        state.available.insert(id.clone(), info);
+        let mut ctx = dummy_exec_ctx(&state);
+
+        assert!(matches!(
+            ModelCommand.run(&mut ctx, "xai/model"),
+            CommandResult::Action(Action::SetDefaultModel(selected)) if selected == id
+        ));
+    }
+
+    #[test]
     fn trailing_space_after_reasoning_model_enters_effort_phase() {
         let mut state = ModelState::default();
         let (id, info) = model_with_reasoning("reasoning-x", "Reasoning X");

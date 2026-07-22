@@ -2344,6 +2344,27 @@ async fn auth_type_no_method_id_no_current_returns_api_key() {
     assert!(agent.auth_manager.current().is_none());
     assert_eq!(agent.auth_type(), xai_chat_state::AuthType::ApiKey,);
 }
+/// Session creation must receive the live auth-method handle even before an
+/// auth method is selected. A later provider selection is visible through the
+/// already-cloned handle, so the session does not need to be recreated.
+#[tokio::test(flavor = "current_thread")]
+async fn session_auth_handle_stays_live_when_initially_unset() {
+    let agent = build_minimal_agent_for_tests();
+    let session_auth_method_id = agent.auth_method_id_for_session();
+
+    assert!(session_auth_method_id.load().is_none());
+
+    agent.set_auth_method(acp::AuthMethodId::new(
+        crate::agent::auth_method::OIDC_METHOD_ID,
+    ));
+
+    assert_eq!(
+        session_auth_method_id.load().as_deref(),
+        Some(&acp::AuthMethodId::new(
+            crate::agent::auth_method::OIDC_METHOD_ID,
+        )),
+    );
+}
 /// Live credential present but `auth_method_id` is still `None`. The
 /// in-memory bearer takes precedence: this is the order observed during
 /// `initialize()` silent refresh -- a token is hot-swapped in before

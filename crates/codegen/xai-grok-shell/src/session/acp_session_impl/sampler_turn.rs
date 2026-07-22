@@ -535,8 +535,9 @@ impl SessionActor {
         self.refresh_token_if_expired().await;
         let mut full_config = self.reconstruct_full_config().await;
         full_config.force_http1 = force_http1;
-        let sampling_client =
-            xai_grok_sampler::SamplingClient::new(full_config).map_err(|e| self.to_acp_error(e))?;
+        let base_url = full_config.base_url.clone();
+        let sampling_client = xai_grok_sampler::SamplingClient::new(full_config)
+            .map_err(|e| self.to_acp_error(e, &base_url))?;
         Ok(sampling_client)
     }
     /// Push a fresh `SamplerConfig` into the per-session sampler actor
@@ -761,6 +762,34 @@ impl SessionActor {
             }
             self.signals_handle().record_error_typed("empty_response");
         }
+        let is_auth_401 =
+            error.status_code == Some(401) || matches!(error.kind, SamplingErrorKind::Auth);
+        let request_base_url = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .map(|config| config.base_url)
+            .unwrap_or_default();
+        if is_auth_401 && crate::util::is_first_party_xai_url(&request_base_url) {
+            // This is the terminal edge of the real sampler request path.
+            // Do not expose a gateway's generic authentication message here:
+            // preserve the xAI provider remediation and never start an
+            // interactive/browser flow from a failed request.
+            let provider_error = crate::agent::auth_method::ProviderAuthRequiredError::xai();
+            self.log_terminal_failure(
+                crate::agent::auth_method::PROVIDER_AUTH_REQUIRED_CODE,
+                error.status_code,
+                &provider_error.guidance,
+            );
+            self.send_xai_notification(XaiSessionUpdate::RetryState(
+                crate::extensions::notification::RetryState::Failed {
+                    error_type: provider_error.code.clone(),
+                    message: provider_error.guidance.clone(),
+                },
+            ))
+            .await;
+            return Err(provider_error.into_acp_error());
+        }
         let auth_mode = self
             .auth_manager
             .as_ref()
@@ -789,8 +818,6 @@ impl SessionActor {
         }
         let is_model_404 =
             error.status_code == Some(404) && detailed_message.contains("does not exist");
-        let is_auth_401 =
-            error.status_code == Some(401) || matches!(error.kind, SamplingErrorKind::Auth);
         let detailed_message = if is_model_404 || is_auth_401 {
             let current_model = self
                 .chat_state_handle

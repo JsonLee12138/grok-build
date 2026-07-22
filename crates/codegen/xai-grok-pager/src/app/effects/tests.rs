@@ -26,6 +26,25 @@ fn format_acp_error_rate_limit_is_auth_aware() {
     assert_eq!(format_acp_error(& err, false), RATE_LIMITED_USER_MESSAGE_OAUTH);
     assert_eq!(format_acp_error(& err, true), RATE_LIMITED_USER_MESSAGE_API_KEY);
 }
+
+#[test]
+fn format_acp_error_reads_structured_provider_auth_guidance_for_auth_required() {
+    let err = acp::Error::auth_required().data(serde_json::json!({
+        "code": "provider_auth_required",
+        "provider": "xai",
+        "guidance": "Run `/provider xai` to authenticate."
+    }));
+    assert_eq!(
+        format_acp_error(&err, false),
+        "Run `/provider xai` to authenticate."
+    );
+}
+
+#[test]
+fn format_acp_error_keeps_provider_guidance_string_fallback() {
+    let err = acp::Error::auth_required().data("provider_auth_required");
+    assert!(format_acp_error(&err, false).contains("/provider xai"));
+}
 /// Non-empty token ranges ride the wire block meta as `skillTokenRanges`
 /// byte pairs; the text itself is untouched.
 #[test]

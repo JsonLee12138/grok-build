@@ -18,6 +18,7 @@ use crate::app::dispatch::router::dispatch;
 use crate::app::dispatch::status::notify_session_ready;
 use crate::app::dispatch::task_result::unregister_session_effect;
 use crate::app::dispatch::transcript::extensions_modal_tab_fetches;
+use crate::app::effects::sanitize_user_error;
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::SessionEvent;
 use crate::scrollback::state::ScrollbackState;
@@ -982,23 +983,51 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
     }
     vec![]
 }
-pub(in crate::app::dispatch) fn handle_worktree_session_failed(
+fn handle_session_creation_failed(
     app: &mut AppView,
     agent_id: AgentId,
     error: String,
+    orphan_message: impl FnOnce(&str) -> String,
 ) -> Vec<Effect> {
-    tracing::error!(
-        agent = ? agent_id, error = % error, "Worktree session creation failed"
-    );
+    let error = sanitize_user_error(&error);
+    let failed_was_active = matches!(app.active_view, ActiveView::Agent(id) if id == agent_id);
     let is_orphan_zombie = app
         .agents
         .get(&agent_id)
         .is_some_and(|a| a.session.session_id.is_none() && a.session.forked_from.is_none());
     if is_orphan_zombie {
-        let fallback = app.agents.keys().copied().find(|id| *id != agent_id);
+        // An async failure must not steal focus when the user has already
+        // switched away. Otherwise prefer the most recently inserted session,
+        // which is the closest available predecessor to a `/new` placeholder.
+        let current_active = match app.active_view {
+            ActiveView::Agent(id) if id != agent_id && app.agents.contains_key(&id) => Some(id),
+            _ => None,
+        };
+        let should_register_fallback = failed_was_active || current_active.is_some();
+        let fallback =
+            current_active.or_else(|| app.agents.keys().rev().copied().find(|id| *id != agent_id));
         remove_agent_and_cleanup(app, agent_id);
+        let msg = orphan_message(&error);
+        let mut effects = Vec::new();
         if let Some(target) = fallback {
-            switch_to_agent(app, target, SwitchCause::Picker);
+            if failed_was_active {
+                switch_to_agent(app, target, SwitchCause::Picker);
+            }
+            // `/new` unregisters the previous session before creating its
+            // placeholder. Re-register whichever live session remains current,
+            // including when the user switched back before this late failure.
+            if should_register_fallback
+                && let Some(agent) = app.agents.get(&target)
+                && let Some(session_id) = agent.session.session_id.clone()
+            {
+                effects.push(Effect::RegisterActiveSession {
+                    session_id,
+                    cwd: agent.session.cwd.display().to_string(),
+                });
+            }
+            if let Some(agent) = app.agents.get_mut(&target) {
+                agent.scrollback.push_block(RenderBlock::system(msg));
+            }
         } else {
             show_welcome(app);
             app.welcome_prompt_focused = true;
@@ -1007,15 +1036,15 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
             app.session_picker_state.selected = 0;
             app.session_picker_content_results = None;
             app.session_picker_content_loading = false;
+            if !app.startup_warnings.iter().any(|w| w.message == msg) {
+                app.startup_warnings.push(crate::startup::StartupWarning {
+                    severity: crate::startup::WarningSeverity::Warning,
+                    message: msg,
+                    action: None,
+                });
+            }
         }
-        let msg = format!("Cannot create worktree: {error}");
-        if !app.startup_warnings.iter().any(|w| w.message == msg) {
-            app.startup_warnings.push(crate::startup::StartupWarning {
-                severity: crate::startup::WarningSeverity::Warning,
-                message: msg,
-                action: None,
-            });
-        }
+        return effects;
     } else if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.pending_extensions_fetch = false;
         agent.session.prompt_history_loading = false;
@@ -1032,6 +1061,30 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
             }));
     }
     vec![]
+}
+pub(in crate::app::dispatch) fn handle_session_failed(
+    app: &mut AppView,
+    agent_id: AgentId,
+    error: String,
+) -> Vec<Effect> {
+    tracing::error!(
+        agent = ? agent_id, error = % error, "Session creation failed"
+    );
+    handle_session_creation_failed(app, agent_id, error, |error| {
+        format!("Cannot create session: {error}")
+    })
+}
+pub(in crate::app::dispatch) fn handle_worktree_session_failed(
+    app: &mut AppView,
+    agent_id: AgentId,
+    error: String,
+) -> Vec<Effect> {
+    tracing::error!(
+        agent = ? agent_id, error = % error, "Worktree session creation failed"
+    );
+    handle_session_creation_failed(app, agent_id, error, |error| {
+        format!("Cannot create worktree: {error}")
+    })
 }
 pub(in crate::app::dispatch) fn handle_switch_model_complete(
     app: &mut AppView,

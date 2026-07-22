@@ -78,6 +78,17 @@ impl MvpAgent {
     pub(super) fn set_auth_method(&self, id: acp::AuthMethodId) {
         self.auth_method_id.store(Some(std::sync::Arc::new(id)));
     }
+    /// Clone the live auth-method handle for a newly spawned session.
+    ///
+    /// The handle may be empty before `/provider xai` selects an auth method;
+    /// sessions must still be created so their first real request can report
+    /// the structured provider-auth requirement. Because the handle itself is
+    /// shared, that same session observes a later selection on its next turn.
+    pub(super) fn auth_method_id_for_session(
+        &self,
+    ) -> crate::agent::auth_method::SharedAuthMethodId {
+        std::sync::Arc::clone(&self.auth_method_id)
+    }
     /// Return auth for sync config construction.
     pub(super) fn current_or_buffered_auth(&self) -> Option<crate::auth::GrokAuth> {
         self.auth_manager
@@ -3124,10 +3135,7 @@ impl MvpAgent {
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
         let sampling_config = self
             .resolve_sampling_config_for_model(&session_model_id, origin_client.clone());
-        if self.auth_method_id.load().is_none() {
-            return Err(acp::Error::auth_required().data("no auth method id provided"));
-        }
-        let auth_method_id = std::sync::Arc::clone(&self.auth_method_id);
+        let auth_method_id = self.auth_method_id_for_session();
         tracing::info!(
             session_id = % session_info.id.0, ? startup_hints, "startup hints"
         );

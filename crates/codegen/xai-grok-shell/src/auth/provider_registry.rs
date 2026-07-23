@@ -7,6 +7,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -122,6 +124,55 @@ pub struct ProviderCredentialStore {
     path: PathBuf,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderOAuthCredential {
+    pub strategy: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<i64>,
+    pub token_endpoint: String,
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl std::fmt::Debug for ProviderOAuthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderOAuthCredential")
+            .field("strategy", &self.strategy)
+            .field("has_access_token", &!self.access_token.is_empty())
+            .field("has_refresh_token", &self.refresh_token.is_some())
+            .field("expires_at", &self.expires_at)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("client_id", &self.client_id)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+impl ProviderOAuthCredential {
+    fn refresh_fingerprint(&self) -> Option<String> {
+        self.refresh_token
+            .as_ref()
+            .map(|token| blake3::hash(token.as_bytes()).to_hex().to_string())
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.strategy.trim().is_empty()
+            || self.access_token.trim().is_empty()
+            || self.token_endpoint.trim().is_empty()
+            || self.client_id.trim().is_empty()
+        {
+            bail!("provider OAuth credential is incomplete");
+        }
+        let endpoint = Url::parse(&self.token_endpoint).context("invalid OAuth token endpoint")?;
+        if endpoint.scheme() != "https" && !cfg!(test) {
+            bail!("provider OAuth token endpoint must use HTTPS");
+        }
+        Ok(())
+    }
+}
+
 impl ProviderCredentialStore {
     pub fn new(grok_home: impl Into<PathBuf>) -> Self {
         Self {
@@ -204,6 +255,288 @@ impl ProviderCredentialStore {
             .and_then(Value::as_str)
             .map(|s| ApiKey::new(s.to_owned()))
             .transpose()
+    }
+
+    pub fn store_oauth(
+        &self,
+        provider: ProviderId,
+        credential: ProviderOAuthCredential,
+    ) -> Result<()> {
+        credential.validate()?;
+        let lock = self.lock_with_timeout(Duration::from_secs(5))?;
+        let mut root = self.read_provider_root_while_locked(&lock)?;
+        self.write_oauth_while_locked(provider, &credential, &mut root, &lock)
+    }
+
+    pub fn oauth(
+        &self,
+        provider: ProviderId,
+        strategy: &str,
+    ) -> Result<Option<ProviderOAuthCredential>> {
+        let root = self.read_raw()?;
+        let value = root.pointer(&format!(
+            "/providers/{}/credentials/oauth",
+            provider.as_str()
+        ));
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let credential: ProviderOAuthCredential =
+            serde_json::from_value(value.clone()).context("invalid provider OAuth credential")?;
+        if credential.strategy != strategy {
+            return Ok(None);
+        }
+        credential.validate()?;
+        Ok(Some(credential))
+    }
+
+    pub fn clear_oauth(&self, provider: ProviderId, strategy: &str) -> Result<bool> {
+        let lock = self.lock_with_timeout(Duration::from_secs(5))?;
+        let mut root = self.read_provider_root_while_locked(&lock)?;
+        self.remove_oauth_while_locked(provider, strategy, &mut root, &lock)
+    }
+
+    /// Provider+credential cross-process refresh singleflight.
+    ///
+    /// The caller supplies the refresh-token fingerprint observed before
+    /// waiting. After taking the shared `auth.json` lock this method re-reads
+    /// disk. A rotated token is reused immediately; otherwise `refresh` is
+    /// invoked exactly once while the lock is held and its result is installed
+    /// atomically before another process can consume the old refresh token.
+    pub fn refresh_oauth_with<F>(
+        &self,
+        provider: ProviderId,
+        strategy: &str,
+        observed_refresh_fingerprint: Option<&str>,
+        refresh: F,
+    ) -> Result<ProviderOAuthCredential>
+    where
+        F: FnOnce(&ProviderOAuthCredential) -> Result<ProviderOAuthCredential>,
+    {
+        let lock = self.lock_with_timeout(Duration::from_secs(10))?;
+        let mut root = self.read_provider_root_while_locked(&lock)?;
+        let current_value = root
+            .pointer(&format!(
+                "/providers/{}/credentials/oauth",
+                provider.as_str()
+            ))
+            .cloned()
+            .ok_or_else(|| anyhow!("provider OAuth credential unavailable"))?;
+        let current: ProviderOAuthCredential =
+            serde_json::from_value(current_value).context("invalid provider OAuth credential")?;
+        current.validate()?;
+        if current.strategy != strategy {
+            bail!("provider OAuth credential strategy mismatch");
+        }
+        let current_fingerprint = current.refresh_fingerprint();
+        if observed_refresh_fingerprint.is_some()
+            && current_fingerprint.as_deref() != observed_refresh_fingerprint
+        {
+            return Ok(current);
+        }
+        if current.refresh_token.is_none() {
+            bail!("provider OAuth credential has no refresh token");
+        }
+        let refreshed = refresh(&current)?;
+        refreshed.validate()?;
+        if refreshed.strategy != strategy {
+            bail!("refreshed OAuth credential strategy mismatch");
+        }
+        self.write_oauth_while_locked(provider, &refreshed, &mut root, &lock)?;
+        Ok(refreshed)
+    }
+
+    pub async fn refresh_oauth_http(
+        &self,
+        provider: ProviderId,
+        strategy: &str,
+        observed_refresh_fingerprint: Option<&str>,
+        client: &reqwest::Client,
+    ) -> Result<ProviderOAuthCredential> {
+        let lock = self.lock_with_timeout(Duration::from_secs(10))?;
+        let mut root = self.read_provider_root_while_locked(&lock)?;
+        let current_value = root
+            .pointer(&format!(
+                "/providers/{}/credentials/oauth",
+                provider.as_str()
+            ))
+            .cloned()
+            .ok_or_else(|| anyhow!("provider OAuth credential unavailable"))?;
+        let current: ProviderOAuthCredential =
+            serde_json::from_value(current_value).context("invalid provider OAuth credential")?;
+        current.validate()?;
+        if current.strategy != strategy {
+            bail!("provider OAuth credential strategy mismatch");
+        }
+        let current_fingerprint = current.refresh_fingerprint();
+        if observed_refresh_fingerprint.is_some()
+            && current_fingerprint.as_deref() != observed_refresh_fingerprint
+        {
+            return Ok(current);
+        }
+        let refresh_token = current
+            .refresh_token
+            .as_deref()
+            .ok_or_else(|| anyhow!("provider OAuth credential has no refresh token"))?;
+        let response = client
+            .post(&current.token_endpoint)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", current.client_id.as_str()),
+            ])
+            .send()
+            .await
+            .context("requesting provider OAuth token refresh")?;
+        let status = response.status();
+        let value = response
+            .json::<Value>()
+            .await
+            .context("decoding provider OAuth token refresh")?;
+        if !status.is_success() {
+            let terminal = matches!(status.as_u16(), 400 | 401 | 403)
+                && value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .is_some_and(|error| {
+                        matches!(
+                            error,
+                            "invalid_grant" | "invalid_client" | "unauthorized_client"
+                        )
+                    });
+            if terminal {
+                self.remove_oauth_while_locked(provider, strategy, &mut root, &lock)?;
+                bail!("provider OAuth credential was rejected and removed");
+            }
+            bail!("provider OAuth refresh returned status {}", status.as_u16());
+        }
+        let access_token = value
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| anyhow!("provider OAuth refresh returned no access token"))?;
+        let expires_at = value
+            .get("expires_in")
+            .and_then(Value::as_i64)
+            .map(|seconds| chrono::Utc::now().timestamp().saturating_add(seconds));
+        let refreshed = ProviderOAuthCredential {
+            strategy: current.strategy,
+            access_token: access_token.to_owned(),
+            refresh_token: value
+                .get("refresh_token")
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty())
+                .map(str::to_owned)
+                .or(current.refresh_token),
+            expires_at,
+            token_endpoint: current.token_endpoint,
+            client_id: current.client_id,
+            source: current.source,
+        };
+        refreshed.validate()?;
+        self.write_oauth_while_locked(provider, &refreshed, &mut root, &lock)?;
+        Ok(refreshed)
+    }
+
+    fn lock_with_timeout(&self, timeout: Duration) -> Result<super::storage::AuthFileLock> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow!("auth.json has no parent"))?;
+        if !parent.exists() {
+            fs::create_dir_all(parent).context("creating auth.json directory")?;
+            super::storage::set_secure_directory_permissions(parent)
+                .context("securing auth.json directory")?;
+        }
+        let started = Instant::now();
+        loop {
+            if let Some(lock) = super::manager::lock::try_lock_auth_file_nonblocking(&self.path) {
+                return Ok(lock);
+            }
+            if started.elapsed() >= timeout {
+                bail!("timed out waiting for provider credential refresh lock");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn write_oauth_while_locked(
+        &self,
+        provider: ProviderId,
+        credential: &ProviderOAuthCredential,
+        root: &mut Value,
+        lock: &super::storage::AuthFileLock,
+    ) -> Result<()> {
+        if !root.is_object() {
+            *root = json!({});
+        }
+        root["version"] = json!(AUTH_STORE_VERSION);
+        let providers = root
+            .as_object_mut()
+            .expect("object checked above")
+            .entry("providers")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("auth store providers is not an object"))?;
+        let credentials = providers
+            .entry(provider.as_str().to_owned())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("provider auth entry is not an object"))?
+            .entry("credentials")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("provider credentials entry is not an object"))?;
+        credentials.insert(
+            "oauth".to_owned(),
+            serde_json::to_value(credential).context("serializing provider OAuth credential")?,
+        );
+        if !lock.still_live(&self.path) {
+            bail!("auth store lock was replaced before OAuth credential write");
+        }
+        self.write_raw(root)
+    }
+
+    fn read_provider_root_while_locked(
+        &self,
+        lock: &super::storage::AuthFileLock,
+    ) -> Result<Value> {
+        let mut root = self.read_raw()?;
+        if !root.get("providers").is_some_and(Value::is_object) && self.path.exists() {
+            super::storage::migrate_legacy_store_while_locked(&self.path, lock)
+                .context("migrating locked legacy auth.json")?;
+            root = self.read_raw()?;
+        }
+        Ok(root)
+    }
+
+    fn remove_oauth_while_locked(
+        &self,
+        provider: ProviderId,
+        strategy: &str,
+        root: &mut Value,
+        lock: &super::storage::AuthFileLock,
+    ) -> Result<bool> {
+        let Some(credentials) = root
+            .pointer_mut(&format!("/providers/{}/credentials", provider.as_str()))
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(false);
+        };
+        let matches = credentials
+            .get("oauth")
+            .and_then(|value| value.get("strategy"))
+            .and_then(Value::as_str)
+            == Some(strategy);
+        if !matches {
+            return Ok(false);
+        }
+        credentials.remove("oauth");
+        if !lock.still_live(&self.path) {
+            bail!("auth store lock was replaced before OAuth credential clear");
+        }
+        self.write_raw(root)?;
+        Ok(true)
     }
 
     fn read_raw(&self) -> Result<Value> {
@@ -1463,5 +1796,257 @@ mod tests {
         let queries = queries.lock().unwrap();
         assert!(queries[0].contains("pageSize=1000"));
         assert!(queries[1].contains("pageToken=page-one"));
+    }
+
+    fn oauth_credential(
+        strategy: &str,
+        access_token: &str,
+        refresh_token: &str,
+    ) -> ProviderOAuthCredential {
+        ProviderOAuthCredential {
+            strategy: strategy.to_owned(),
+            access_token: access_token.to_owned(),
+            refresh_token: Some(refresh_token.to_owned()),
+            expires_at: Some(1),
+            token_endpoint: "http://127.0.0.1/token".to_owned(),
+            client_id: "test-client".to_owned(),
+            source: Some("test".to_owned()),
+        }
+    }
+
+    #[test]
+    fn provider_oauth_refresh_is_cross_process_singleflight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = ProviderCredentialStore::with_path(&path);
+        let initial = oauth_credential("codex_oauth", "access-old", "refresh-old");
+        let observed = initial.refresh_fingerprint().unwrap();
+        store.store_oauth(ProviderId::Openai, initial).unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let barrier = barrier.clone();
+            let refresh_count = refresh_count.clone();
+            let path = path.clone();
+            let observed = observed.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                ProviderCredentialStore::with_path(path)
+                    .refresh_oauth_with(ProviderId::Openai, "codex_oauth", Some(&observed), |_| {
+                        refresh_count.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(100));
+                        Ok(oauth_credential("codex_oauth", "access-new", "refresh-new"))
+                    })
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
+        assert!(
+            results
+                .iter()
+                .all(|result| result.access_token == "access-new")
+        );
+        let final_value = store
+            .oauth(ProviderId::Openai, "codex_oauth")
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_value.refresh_token.as_deref(), Some("refresh-new"));
+    }
+
+    #[test]
+    fn clearing_failed_oauth_preserves_api_key_and_other_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProviderCredentialStore::new(directory.path());
+        store
+            .store_api_key(ProviderId::Openai, key("openai-key"))
+            .unwrap();
+        store
+            .store_oauth(
+                ProviderId::Openai,
+                oauth_credential("codex_oauth", "access", "refresh"),
+            )
+            .unwrap();
+        store
+            .store_oauth(
+                ProviderId::Anthropic,
+                oauth_credential("claude_oauth", "access-a", "refresh-a"),
+            )
+            .unwrap();
+        assert!(
+            store
+                .clear_oauth(ProviderId::Openai, "codex_oauth")
+                .unwrap()
+        );
+        assert_eq!(
+            store.api_key(ProviderId::Openai).unwrap().unwrap().masked(),
+            "****-key"
+        );
+        assert!(
+            store
+                .oauth(ProviderId::Anthropic, "claude_oauth")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_oauth_http_refresh_rotates_atomically() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=refresh-old"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new",
+                "refresh_token": "refresh-new",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProviderCredentialStore::new(directory.path());
+        let mut initial = oauth_credential("gemini_oauth", "access-old", "refresh-old");
+        initial.token_endpoint = format!("{}/token", server.uri());
+        let observed = initial.refresh_fingerprint().unwrap();
+        store.store_oauth(ProviderId::Gemini, initial).unwrap();
+        let refreshed = store
+            .refresh_oauth_http(
+                ProviderId::Gemini,
+                "gemini_oauth",
+                Some(&observed),
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refreshed.access_token, "access-new");
+        assert_eq!(refreshed.refresh_token.as_deref(), Some("refresh-new"));
+        assert!(
+            store
+                .oauth(ProviderId::Gemini, "gemini_oauth")
+                .unwrap()
+                .unwrap()
+                .expires_at
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_oauth_refresh_removes_only_target_strategy() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProviderCredentialStore::new(directory.path());
+        let mut target = oauth_credential("codex_oauth", "access", "refresh");
+        target.token_endpoint = format!("{}/token", server.uri());
+        let observed = target.refresh_fingerprint().unwrap();
+        store.store_oauth(ProviderId::Openai, target).unwrap();
+        store
+            .store_api_key(ProviderId::Openai, key("stable-openai-key"))
+            .unwrap();
+        store
+            .store_oauth(
+                ProviderId::Anthropic,
+                oauth_credential("claude_oauth", "access-a", "refresh-a"),
+            )
+            .unwrap();
+        assert!(
+            store
+                .refresh_oauth_http(
+                    ProviderId::Openai,
+                    "codex_oauth",
+                    Some(&observed),
+                    &reqwest::Client::new(),
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .oauth(ProviderId::Openai, "codex_oauth")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.api_key(ProviderId::Openai).unwrap().is_some());
+        assert!(
+            store
+                .oauth(ProviderId::Anthropic, "claude_oauth")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_oauth_refresh_preserves_target_credential() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({"error": "temporarily_unavailable"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProviderCredentialStore::new(directory.path());
+        let mut initial = oauth_credential("gemini_oauth", "access-old", "refresh-old");
+        initial.token_endpoint = format!("{}/token", server.uri());
+        let observed = initial.refresh_fingerprint().unwrap();
+        store.store_oauth(ProviderId::Gemini, initial).unwrap();
+        assert!(
+            store
+                .refresh_oauth_http(
+                    ProviderId::Gemini,
+                    "gemini_oauth",
+                    Some(&observed),
+                    &reqwest::Client::new(),
+                )
+                .await
+                .is_err()
+        );
+        let preserved = store
+            .oauth(ProviderId::Gemini, "gemini_oauth")
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.access_token, "access-old");
+        assert_eq!(preserved.refresh_token.as_deref(), Some("refresh-old"));
+    }
+
+    #[test]
+    fn provider_oauth_debug_is_secret_free() {
+        let credential =
+            oauth_credential("codex_oauth", "access-super-secret", "refresh-super-secret");
+        let debug = format!("{credential:?}");
+        assert!(!debug.contains("access-super-secret"));
+        assert!(!debug.contains("refresh-super-secret"));
+        assert!(debug.contains("has_access_token"));
+        assert!(debug.contains("has_refresh_token"));
     }
 }

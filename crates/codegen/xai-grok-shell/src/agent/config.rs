@@ -3859,6 +3859,11 @@ impl ConfigModelOverride {
         endpoints: &EndpointsConfig,
     ) -> ModelEntry {
         let mut entry = base.unwrap_or_else(|| ModelEntry::fallback(key, endpoints));
+        if self.provider.is_some() {
+            // Preserve the canonical provider/model identity after the raw
+            // provider config has been flattened into ModelEntry.
+            entry.info.id = Some(key.to_owned());
+        }
         if let Some(ref v) = self.model {
             entry.info.model = v.clone();
         }
@@ -4554,6 +4559,11 @@ pub(crate) fn first_own_credential(
 /// When `env_key` lists multiple names, the first set non-empty value is used.
 pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> ResolvedCredentials {
     let info = model.info();
+    if let Some(credentials) =
+        resolve_fixed_provider_credentials_at(model, &crate::util::grok_home::grok_home())
+    {
+        return credentials;
+    }
     let (api_key, base_url, auth_type) = if let Some(key) = model.own_credential() {
         (
             Some(key),
@@ -4598,6 +4608,28 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
         auth_type,
         auth_scheme,
     }
+}
+
+pub(crate) fn resolve_fixed_provider_credentials_at(
+    model: &ModelEntry,
+    grok_home: &std::path::Path,
+) -> Option<ResolvedCredentials> {
+    let provider = model
+        .info
+        .id
+        .as_deref()
+        .and_then(crate::auth::provider_registry::ProviderId::from_canonical_model)?;
+    let api_key = crate::auth::provider_registry::ProviderCredentialStore::new(grok_home)
+        .api_key(provider)
+        .ok()
+        .flatten()
+        .map(crate::auth::provider_registry::ApiKey::into_secret);
+    Some(ResolvedCredentials {
+        api_key,
+        base_url: crate::auth::provider_registry::endpoint_base(provider).to_owned(),
+        auth_type: xai_chat_state::AuthType::ApiKey,
+        auth_scheme: AuthScheme::Bearer,
+    })
 }
 /// `disable_api_key_auth` at the credential seam: swap a first-party xAI API
 /// key for the IdP session (absent => request fails => forces login). BYOK

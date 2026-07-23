@@ -603,6 +603,13 @@ pub enum Action {
     /// Explicitly select xAI as the authentication provider. This first tries
     /// a cached xAI session without opening an interactive browser flow.
     SelectXaiProvider,
+    /// Open a masked API-key prompt for a fixed Provider adapter.
+    OpenProviderApiKey(xai_grok_shell::auth::provider_registry::ProviderId),
+    /// Persist a Provider API key through the agent extension boundary.
+    SetProviderApiKey {
+        provider: xai_grok_shell::auth::provider_registry::ProviderId,
+        key: xai_grok_shell::auth::provider_registry::ApiKey,
+    },
     /// Cancel an in-progress login that was started from inside a session
     /// (`/login` or a 401 re-auth prompt) and return to the previous view.
     /// Distinct from `Quit`: abandoning a mid-session re-auth must not exit
@@ -1663,6 +1670,11 @@ pub enum Effect {
     PollAuthUrl { request_seq: u64 },
     /// Submit a manually-pasted auth code (ext request).
     SubmitAuthCode { request_seq: u64, code: String },
+    /// Persist a Provider API key and refresh its model catalog.
+    SetProviderApiKey {
+        provider: xai_grok_shell::auth::provider_registry::ProviderId,
+        key: xai_grok_shell::auth::provider_registry::ApiKey,
+    },
     /// Fetch MCP server list from the shell (x.ai/mcp/list).
     FetchMcpsList {
         agent_id: AgentId,
@@ -2051,6 +2063,15 @@ pub enum SubagentKillOutcome {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    /// Provider API key was stored and its catalog refresh completed.
+    ProviderApiKeyStored {
+        provider: xai_grok_shell::auth::provider_registry::ProviderId,
+    },
+    /// Provider API key could not be stored or validated.
+    ProviderApiKeyStoreFailed {
+        provider: xai_grok_shell::auth::provider_registry::ProviderId,
+        error: String,
+    },
     /// Session was created successfully.
     SessionCreated {
         agent_id: AgentId,

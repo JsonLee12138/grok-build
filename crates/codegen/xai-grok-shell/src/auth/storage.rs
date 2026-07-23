@@ -18,7 +18,14 @@ struct ProviderAuthStore {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ProviderEntries {
-    xai: XaiProvider,
+    /// xAI is optional so a v2 store containing only a third-party provider
+    /// remains readable by legacy xAI callers (as an empty xAI scope map).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    xai: Option<XaiProvider>,
+    /// Provider namespaces unknown to the legacy xAI reader.  Flattening is
+    /// lossless: AuthManager writes must never erase OpenAI/OpenRouter keys.
+    #[serde(flatten)]
+    other: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -49,12 +56,13 @@ impl ProviderAuthStore {
         Ok(Self {
             version: PROVIDER_STORE_VERSION,
             providers: ProviderEntries {
-                xai: XaiProvider {
+                xai: Some(XaiProvider {
                     credentials: XaiCredentials {
                         xai: credential,
                         scopes,
                     },
-                },
+                }),
+                other: serde_json::Map::new(),
             },
         })
     }
@@ -66,7 +74,10 @@ impl ProviderAuthStore {
                 "unsupported auth store version",
             ));
         }
-        let credentials = self.providers.xai.credentials;
+        let Some(xai) = self.providers.xai else {
+            return Ok(AuthStore::new());
+        };
+        let credentials = xai.credentials;
         let scope = if credentials.xai.auth_mode == AuthMode::ApiKey {
             API_KEY_SCOPE
         } else {
@@ -77,6 +88,44 @@ impl ProviderAuthStore {
         scopes.insert(scope.to_owned(), credentials.xai);
         Ok(scopes)
     }
+}
+
+/// Preserve provider namespaces that the xAI scope-map API does not own.
+pub(crate) fn other_provider_entries(
+    auth_file: &Path,
+) -> serde_json::Map<String, serde_json::Value> {
+    let Ok(bytes) = std::fs::read(auth_file) else {
+        return serde_json::Map::new();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return serde_json::Map::new();
+    };
+    if !is_provider_store_envelope(&value) {
+        return serde_json::Map::new();
+    }
+    serde_json::from_value::<ProviderAuthStore>(value)
+        .map(|store| store.providers.other)
+        .unwrap_or_default()
+}
+
+fn provider_store_for_write(
+    auth_file: &Path,
+    auth_store: &AuthStore,
+) -> std::io::Result<ProviderAuthStore> {
+    let other = other_provider_entries(auth_file);
+    let mut store = if auth_store.is_empty() {
+        ProviderAuthStore {
+            version: PROVIDER_STORE_VERSION,
+            providers: ProviderEntries {
+                xai: None,
+                other: Default::default(),
+            },
+        }
+    } else {
+        ProviderAuthStore::from_legacy(auth_store.clone())?
+    };
+    store.providers.other = other;
+    Ok(store)
 }
 
 enum DecodedAuthStore {
@@ -170,7 +219,12 @@ fn is_provider_store_v2(value: &serde_json::Value) -> bool {
 }
 
 fn is_provider_store_envelope(value: &serde_json::Value) -> bool {
-    value.pointer("/providers/xai/credentials/xai").is_some()
+    value
+        .get("version")
+        .is_some_and(serde_json::Value::is_number)
+        && value
+            .get("providers")
+            .is_some_and(serde_json::Value::is_object)
 }
 
 /// Migrate only while holding the existing auth.json advisory lock.  Re-read
@@ -180,9 +234,19 @@ fn migrate_legacy_store(auth_file: &Path, legacy: &AuthStore) -> std::io::Result
     if legacy.is_empty() {
         return Ok(());
     }
-    let Some(_lock) = super::manager::lock::try_lock_auth_file_nonblocking(auth_file) else {
+    let Some(lock) = super::manager::lock::try_lock_auth_file_nonblocking(auth_file) else {
         return Ok(());
     };
+    migrate_legacy_store_while_locked(auth_file, &lock)
+}
+
+/// Migrate legacy scope-map bytes while the caller holds the live
+/// `auth.json.lock`. This deliberately does not call [`read_auth_json`]: that
+/// reader may attempt to acquire the same non-reentrant advisory lock.
+pub(super) fn migrate_legacy_store_while_locked(
+    auth_file: &Path,
+    lock: &AuthFileLock,
+) -> std::io::Result<()> {
     let current = std::fs::read_to_string(auth_file)?;
     let trimmed = current.trim();
     if trimmed.is_empty() {
@@ -197,8 +261,7 @@ fn migrate_legacy_store(auth_file: &Path, legacy: &AuthStore) -> std::io::Result
     // returned and leaves the original bytes untouched.
     let locked_legacy: AuthStore = serde_json::from_str(trimmed)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let _ = legacy; // documents the pre-lock snapshot used by the caller.
-    if !_lock.still_live(auth_file) {
+    if !lock.still_live(auth_file) {
         // A stale lock inode may coexist with a live writer. Re-readers will
         // retry migration; this holder must never perform the irreversible write.
         return Ok(());
@@ -361,18 +424,19 @@ fn read_auth_json_or_empty_recovering_corrupt_with_lock(
 ///   replace and is preferable to persisting nothing at all, which would
 ///   leave every concurrent process with a stale, already-revoked token.
 pub(super) fn write_auth_json(auth_file: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
-    write_auth_json_with(auth_file, auth_store, write_auth_json_atomic)
+    let provider_store = provider_store_for_write(auth_file, auth_store)?;
+    write_provider_store_with(auth_file, &provider_store, write_provider_store_atomic)
 }
 
 /// Dispatch helper: run `atomic`, and on `StorageFull` fall back to an
 /// in-place write. Split out (with `atomic` injectable) so the disk-full
 /// fallback is unit-testable without an actually-full filesystem.
-fn write_auth_json_with(
+fn write_provider_store_with(
     auth_file: &Path,
-    auth_store: &AuthStore,
-    atomic: fn(&Path, &AuthStore) -> std::io::Result<()>,
+    provider_store: &ProviderAuthStore,
+    atomic: fn(&Path, &ProviderAuthStore) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    match atomic(auth_file, auth_store) {
+    match atomic(auth_file, provider_store) {
         Err(e) if e.kind() == std::io::ErrorKind::StorageFull => {
             tracing::warn!(
                 path = %auth_file.display(),
@@ -388,7 +452,7 @@ fn write_auth_json_with(
                     "path": auth_file.display().to_string(),
                 })),
             );
-            write_auth_json_in_place(auth_file, auth_store)
+            write_provider_store_in_place(auth_file, provider_store)
         }
         other => other,
     }
@@ -401,7 +465,7 @@ fn write_auth_json_with(
 /// Uses streaming `to_writer_pretty` through a `BufWriter` to avoid
 /// allocating the entire JSON string in memory — eliminates OOM risk under
 /// severe memory pressure.
-fn write_store_to(path: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
+fn write_store_to(path: &Path, provider_store: &ProviderAuthStore) -> std::io::Result<()> {
     use crate::util::secure_file::open_secure_file;
 
     if let Some(parent) = path.parent() {
@@ -413,7 +477,6 @@ fn write_store_to(path: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
     }
     let file = open_secure_file(path)?;
     let mut writer = std::io::BufWriter::new(file);
-    let provider_store = ProviderAuthStore::from_legacy(auth_store.clone())?;
     serde_json::to_writer_pretty(&mut writer, &provider_store)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     writer.flush()?;
@@ -428,7 +491,7 @@ fn write_store_to(path: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
     Ok(())
 }
 
-fn set_secure_directory_permissions(path: &Path) -> std::io::Result<()> {
+pub(super) fn set_secure_directory_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -441,15 +504,55 @@ fn set_secure_directory_permissions(path: &Path) -> std::io::Result<()> {
 
 /// Atomic write: tmp + rename. Unix `rename(2)` replaces atomically;
 /// Windows `rename` requires removing the target first.
-fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
+fn write_provider_store_atomic(
+    auth_file: &Path,
+    provider_store: &ProviderAuthStore,
+) -> std::io::Result<()> {
     let tmp = auth_file.with_extension(format!("json.{}.tmp", std::process::id()));
-    write_store_to(&tmp, auth_store)?;
+    write_store_to(&tmp, provider_store)?;
     #[cfg(windows)]
     {
         let _ = std::fs::remove_file(auth_file);
     }
     std::fs::rename(&tmp, auth_file)?;
+    sync_parent_directory(auth_file);
     Ok(())
+}
+
+/// Atomic owner-only writer for provider namespaces that are not represented
+/// by the legacy xAI `AuthStore`.  Callers must hold `auth.json.lock`.
+pub(super) fn write_provider_json_atomic(
+    auth_file: &Path,
+    value: &serde_json::Value,
+) -> std::io::Result<()> {
+    use crate::util::secure_file::open_secure_file;
+    let tmp = auth_file.with_extension(format!("json.{}.tmp", std::process::id()));
+    let file = open_secure_file(&tmp)?;
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|e| e.into_error())?
+        .sync_all()?;
+    #[cfg(windows)]
+    crate::util::secure_file::set_windows_secure_permissions(&tmp)?;
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(auth_file);
+    std::fs::rename(tmp, auth_file)?;
+    sync_parent_directory(auth_file);
+    Ok(())
+}
+
+/// Best-effort parent-directory sync makes a successful rename durable on
+/// filesystems that do not implicitly flush the directory entry.
+fn sync_parent_directory(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(directory) = File::open(parent)
+    {
+        let _ = directory.sync_all();
+    }
 }
 
 /// Non-atomic fallback: truncate and rewrite `auth.json` in place.
@@ -464,21 +567,24 @@ fn write_auth_json_atomic(auth_file: &Path, auth_store: &AuthStore) -> std::io::
 /// must not leave an empty/torn file where a parseable (if stale) credential
 /// used to be. A partial file that survives (because even the restore failed)
 /// is healed on the next read via [`read_auth_json_or_empty_recovering_corrupt`].
-fn write_auth_json_in_place(auth_file: &Path, auth_store: &AuthStore) -> std::io::Result<()> {
-    write_auth_json_in_place_with(auth_file, auth_store, write_store_to)
+fn write_provider_store_in_place(
+    auth_file: &Path,
+    provider_store: &ProviderAuthStore,
+) -> std::io::Result<()> {
+    write_provider_store_in_place_with(auth_file, provider_store, write_store_to)
 }
 
 /// Inner of [`write_auth_json_in_place`] with `write` injectable so the
 /// rollback-on-failure path is unit-testable without an actually-full disk.
-fn write_auth_json_in_place_with(
+fn write_provider_store_in_place_with(
     auth_file: &Path,
-    auth_store: &AuthStore,
-    write: fn(&Path, &AuthStore) -> std::io::Result<()>,
+    provider_store: &ProviderAuthStore,
+    write: fn(&Path, &ProviderAuthStore) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     // Snapshot the prior bytes so a torn/empty write can be rolled back to
     // the previous on-disk credential. `None` when the file is absent.
     let prior = std::fs::read(auth_file).ok();
-    match write(auth_file, auth_store) {
+    match write(auth_file, provider_store) {
         Ok(()) => Ok(()),
         Err(e) => {
             if let Some(prior) = prior
@@ -576,7 +682,7 @@ pub fn clear_api_key(grok_home: &Path) -> std::io::Result<()> {
     let path = grok_home.join("auth.json");
     if let Ok(mut map) = read_auth_json(&path) {
         map.remove(API_KEY_SCOPE);
-        if map.is_empty() {
+        if map.is_empty() && other_provider_entries(&path).is_empty() {
             let _ = std::fs::remove_file(&path);
         } else {
             write_auth_json(&path, &map)?;
@@ -672,12 +778,13 @@ mod provider_store_red_tests {
         let store = ProviderAuthStore {
             version: PROVIDER_STORE_VERSION,
             providers: ProviderEntries {
-                xai: XaiProvider {
+                xai: Some(XaiProvider {
                     credentials: XaiCredentials {
                         xai: canonical,
                         scopes,
                     },
-                },
+                }),
+                other: serde_json::Map::new(),
             },
         };
         std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
@@ -815,18 +922,18 @@ mod write_fallback_tests {
             .and_then(|m| m.get(API_KEY_SCOPE).map(|a| a.key.clone()))
     }
 
-    fn fake_storage_full(_: &Path, _: &AuthStore) -> std::io::Result<()> {
+    fn fake_storage_full(_: &Path, _: &ProviderAuthStore) -> std::io::Result<()> {
         Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
     }
 
-    fn fake_permission_denied(_: &Path, _: &AuthStore) -> std::io::Result<()> {
+    fn fake_permission_denied(_: &Path, _: &ProviderAuthStore) -> std::io::Result<()> {
         Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
     }
 
     /// Simulates an in-place write that truncates the file (destroying the
     /// old content, as `open_secure_file` does) and then fails partway — the
     /// torn-write case the rollback must recover from.
-    fn fake_truncate_then_fail(path: &Path, _: &AuthStore) -> std::io::Result<()> {
+    fn fake_truncate_then_fail(path: &Path, _: &ProviderAuthStore) -> std::io::Result<()> {
         crate::util::secure_file::open_secure_file(path)?; // truncates to 0 bytes
         Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
     }
@@ -835,7 +942,11 @@ mod write_fallback_tests {
     fn in_place_write_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        write_auth_json_in_place(&path, &sample_store()).unwrap();
+        write_provider_store_in_place(
+            &path,
+            &ProviderAuthStore::from_legacy(sample_store()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(read_key(&path).as_deref(), Some("secret-key"));
     }
 
@@ -845,7 +956,11 @@ mod write_fallback_tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        write_auth_json_in_place(&path, &sample_store()).unwrap();
+        write_provider_store_in_place(
+            &path,
+            &ProviderAuthStore::from_legacy(sample_store()).unwrap(),
+        )
+        .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "in-place write must stay 0o600");
     }
@@ -856,7 +971,12 @@ mod write_fallback_tests {
     fn falls_back_to_in_place_on_storage_full() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        write_auth_json_with(&path, &sample_store(), fake_storage_full).unwrap();
+        write_provider_store_with(
+            &path,
+            &ProviderAuthStore::from_legacy(sample_store()).unwrap(),
+            fake_storage_full,
+        )
+        .unwrap();
         assert_eq!(
             read_key(&path).as_deref(),
             Some("secret-key"),
@@ -870,7 +990,12 @@ mod write_fallback_tests {
     fn propagates_non_storage_full_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        let err = write_auth_json_with(&path, &sample_store(), fake_permission_denied).unwrap_err();
+        let err = write_provider_store_with(
+            &path,
+            &ProviderAuthStore::from_legacy(sample_store()).unwrap(),
+            fake_permission_denied,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(!path.exists(), "non-ENOSPC failure must not write the file");
     }
@@ -892,7 +1017,11 @@ mod write_fallback_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         // Seed a valid prior credential.
-        write_auth_json_in_place(&path, &sample_store()).unwrap();
+        write_provider_store_in_place(
+            &path,
+            &ProviderAuthStore::from_legacy(sample_store()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(read_key(&path).as_deref(), Some("secret-key"));
 
         let mut replacement = AuthStore::new();
@@ -904,8 +1033,12 @@ mod write_fallback_tests {
                 ..Default::default()
             },
         );
-        let err = write_auth_json_in_place_with(&path, &replacement, fake_truncate_then_fail)
-            .unwrap_err();
+        let err = write_provider_store_in_place_with(
+            &path,
+            &ProviderAuthStore::from_legacy(replacement).unwrap(),
+            fake_truncate_then_fail,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
         assert_eq!(
             read_key(&path).as_deref(),
@@ -921,8 +1054,16 @@ mod write_fallback_tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        write_auth_json_in_place(&path, &sample_store()).unwrap();
-        let _ = write_auth_json_in_place_with(&path, &sample_store(), fake_truncate_then_fail);
+        write_provider_store_in_place(
+            &path,
+            &ProviderAuthStore::from_legacy(sample_store()).unwrap(),
+        )
+        .unwrap();
+        let _ = write_provider_store_in_place_with(
+            &path,
+            &ProviderAuthStore::from_legacy(sample_store()).unwrap(),
+            fake_truncate_then_fail,
+        );
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "restored file must stay 0o600");
     }

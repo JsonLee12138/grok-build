@@ -585,6 +585,15 @@ impl AgentView {
                     self.handle_modal_key(key)
                 }
                 Event::Mouse(mouse) => self.handle_modal_mouse(mouse),
+                Event::Paste(text) => {
+                    if let Some(crate::views::modal::ActiveModal::ProviderApiKey {
+                        secret, ..
+                    }) = self.active_modal.as_mut()
+                    {
+                        secret.push_str(text.trim());
+                    }
+                    InputOutcome::Changed
+                }
                 _ => InputOutcome::Changed,
             };
         }

@@ -1977,6 +1977,28 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::SetProviderApiKey { provider, key } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let params = serde_json::json!({
+                    "provider": provider.as_str(),
+                    "key": key.into_secret(),
+                });
+                let request = acp::ExtRequest::new(
+                    "x.ai/provider/setApiKey",
+                    serde_json::value::to_raw_value(&params)
+                        .expect("serialize provider API key params")
+                        .into(),
+                );
+                match acp_send(request, &tx).await {
+                    Ok(_) => TaskResult::ProviderApiKeyStored { provider },
+                    Err(error) => TaskResult::ProviderApiKeyStoreFailed {
+                        provider,
+                        error: error.to_string(),
+                    },
+                }
+            });
+        }
         Effect::FetchMcpsList { agent_id, session_id, cache } => {
             let tx = acp_tx.clone();
             tasks

@@ -17,6 +17,7 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         "x.ai/auth/getBearerToken" => handle_get_bearer_token(agent).await,
         "x.ai/getApiKey" => handle_get_api_key(),
         "x.ai/setApiKey" => handle_set_api_key(args),
+        "x.ai/provider/setApiKey" => handle_set_provider_api_key(agent, args).await,
         "x.ai/auth/submit_code" => handle_submit_code(agent, args),
         "x.ai/auth/get_url" => handle_get_url(agent).await,
         "x.ai/auth/logout" => handle_logout(agent, args).await,
@@ -24,6 +25,30 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         "x.ai/auth/check_subscription" => handle_check_subscription(agent).await,
         _ => Err(acp::Error::method_not_found()),
     }
+}
+
+async fn handle_set_provider_api_key(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+    #[derive(Deserialize)]
+    struct Params {
+        provider: crate::auth::provider_registry::ProviderId,
+        key: String,
+    }
+
+    let params: Params = parse_params(args)?;
+    let key = crate::auth::provider_registry::ApiKey::new(params.key)
+        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+    crate::auth::provider_registry::ProviderCredentialStore::new(
+        crate::util::grok_home::grok_home(),
+    )
+    .store_api_key(params.provider, key)
+    .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+    agent.models_manager.on_auth_changed().await;
+    ExtMethodResult::success(serde_json::json!({
+        "ok": true,
+        "provider": params.provider.as_str()
+    }))
+    .to_ext_response()
+    .map_err(|error| acp::Error::internal_error().data(error.to_string()))
 }
 
 async fn handle_get_bearer_token(agent: &MvpAgent) -> ExtResult {

@@ -171,6 +171,19 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
 /// Handle a completed async task result.
 pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec<Effect> {
     match result {
+        TaskResult::ProviderApiKeyStored { provider } => {
+            app.show_toast(&format!("{} API key saved", provider.as_str()));
+            vec![]
+        }
+        TaskResult::ProviderApiKeyStoreFailed { provider, error } => {
+            tracing::warn!(
+                provider = provider.as_str(),
+                error = %error,
+                "provider API key update failed"
+            );
+            app.show_toast(&format!("Couldn't save {} API key", provider.as_str()));
+            vec![]
+        }
         TaskResult::SessionCreated {
             agent_id,
             session_id,

@@ -1,5 +1,6 @@
 //! Model fetching, resolution, and management.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -150,6 +151,8 @@ struct Inner {
     fetch_auth: RwLock<ModelFetchAuth>,
     gateway: RwLock<Option<xai_acp_lib::AcpAgentGatewaySender>>,
     cache: ModelsCacheManager,
+    provider_registry: tokio::sync::Mutex<crate::auth::provider_registry::ProviderAdapterRegistry>,
+    validated_provider_models: RwLock<HashSet<String>>,
     /// Guard to prevent overlapping retry loops.
     retry_in_flight: AtomicBool,
     /// `allowed_models` matched nothing in the fetched catalog; the prompt path
@@ -176,6 +179,21 @@ struct Inner {
     /// registry — no manual fan-out, no listener-leak risk, no
     /// `unregister` API to maintain.
     model_switch_watch: tokio::sync::watch::Sender<u64>,
+}
+
+fn filter_fixed_provider_models(
+    mut catalog: IndexMap<String, ModelEntry>,
+    validated: &HashSet<String>,
+) -> (IndexMap<String, ModelEntry>, bool) {
+    let mut had_fixed_provider_models = false;
+    catalog.retain(|catalog_key, entry| {
+        let canonical = entry.info.id.as_deref().unwrap_or(catalog_key);
+        let is_fixed =
+            crate::auth::provider_registry::ProviderId::from_canonical_model(canonical).is_some();
+        had_fixed_provider_models |= is_fixed;
+        !is_fixed || validated.contains(canonical)
+    });
+    (catalog, had_fixed_provider_models)
 }
 
 impl Default for ModelsManager {
@@ -219,6 +237,10 @@ impl ModelsManager {
                 fetch_auth: RwLock::new(fetch_auth),
                 gateway: RwLock::new(None),
                 cache: ModelsCacheManager::new(),
+                provider_registry: tokio::sync::Mutex::new(
+                    crate::auth::provider_registry::ProviderAdapterRegistry::default(),
+                ),
+                validated_provider_models: RwLock::new(HashSet::new()),
                 retry_in_flight: AtomicBool::new(false),
                 allowlist_excludes_all: AtomicBool::new(false),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
@@ -268,11 +290,15 @@ impl ModelsManager {
                 .map(|c| c.models)
         });
         let has_prefetched = prefetched_models.is_some();
-        let catalog = resolve_model_catalog(cfg, prefetched_models.clone());
+        let raw_catalog = resolve_model_catalog(cfg, prefetched_models.clone());
+        let (catalog, had_fixed_provider_models) =
+            filter_fixed_provider_models(raw_catalog, &HashSet::new());
 
         // Validate only against a real catalog; a bundled-only first run defers
         // to the async fetch (`apply_refresh_result`).
-        if has_prefetched {
+        if has_prefetched && !catalog.is_empty() {
+            validate_selectable(cfg, &catalog)?;
+        } else if has_prefetched && !had_fixed_provider_models {
             validate_selectable(cfg, &catalog)?;
         }
 
@@ -317,8 +343,13 @@ impl ModelsManager {
         }
         let prefetched = self.inner.prefetched.read().clone();
         let new_catalog = resolve_model_catalog(&new_config, prefetched);
+        let (new_catalog, had_fixed_provider_models) =
+            filter_fixed_provider_models(new_catalog, &self.inner.validated_provider_models.read());
         let has_real_catalog = *self.inner.has_fetched_real_catalog.read();
-        if has_real_catalog && let Err(e) = validate_selectable(&new_config, &new_catalog) {
+        if has_real_catalog
+            && !(new_catalog.is_empty() && had_fixed_provider_models)
+            && let Err(e) = validate_selectable(&new_config, &new_catalog)
+        {
             tracing::error!(error = %e, "ignoring config reload: allowed_models excludes all models");
             return;
         }
@@ -627,11 +658,10 @@ impl ModelsManager {
     // ── Mutations ───────────────────────────────────────────────────
 
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
-        self.replace_catalog(
-            resolve_model_catalog(cfg, prefetched),
-            cfg.model_aliases.clone(),
-            None,
-        );
+        let catalog = resolve_model_catalog(cfg, prefetched);
+        let (catalog, _) =
+            filter_fixed_provider_models(catalog, &self.inner.validated_provider_models.read());
+        self.replace_catalog(catalog, cfg.model_aliases.clone(), None);
     }
 
     /// Publish catalog entries and their derived alias index as one snapshot.
@@ -1014,6 +1044,7 @@ impl ModelsManager {
     /// Wipe in-memory state so a previous identity's catalog doesn't leak.
     fn clear(&self) {
         *self.inner.prefetched.write() = None;
+        self.inner.validated_provider_models.write().clear();
         self.replace_catalog(IndexMap::new(), config::AliasIndex::default(), None);
         *self.inner.etag.write() = None;
         *self.inner.has_fetched_real_catalog.write() = false;
@@ -1150,6 +1181,78 @@ impl ModelsManager {
             .await
     }
 
+    async fn refresh_fixed_provider_models(&self, cfg: &config::Config) -> bool {
+        use crate::auth::provider_registry::{CatalogModel, ProviderCredentialStore, ProviderId};
+
+        let prefetched = self.inner.prefetched.read().clone();
+        let raw_catalog = resolve_model_catalog(cfg, prefetched);
+        let mut registered = std::collections::HashMap::<ProviderId, Vec<CatalogModel>>::new();
+        for (catalog_key, entry) in raw_catalog {
+            let canonical = entry.info.id.as_deref().unwrap_or(&catalog_key);
+            let Some(provider) = ProviderId::from_canonical_model(canonical) else {
+                continue;
+            };
+            registered.entry(provider).or_default().push(CatalogModel {
+                id: canonical.to_owned(),
+                wire_id: entry.info.model,
+                provider,
+            });
+        }
+
+        let store = ProviderCredentialStore::new(crate::util::grok_home::grok_home());
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(error = %error, "provider catalog client construction failed");
+                return false;
+            }
+        };
+        let mut next = self.inner.validated_provider_models.read().clone();
+        let mut registry = self.inner.provider_registry.lock().await;
+        for provider in [ProviderId::Openai, ProviderId::Openrouter] {
+            let provider_registered = registered.remove(&provider).unwrap_or_default();
+            let provider_prefix = format!("{}/", provider.as_str());
+            if provider_registered.is_empty() {
+                next.retain(|model| !model.starts_with(&provider_prefix));
+                continue;
+            }
+            let has_key = store.api_key(provider).ok().flatten().is_some();
+            if !has_key {
+                next.retain(|model| !model.starts_with(&provider_prefix));
+                continue;
+            }
+            match registry
+                .discover_registered_http(&store, provider, &provider_registered, &client)
+                .await
+            {
+                Ok(models) => {
+                    next.retain(|model| !model.starts_with(&provider_prefix));
+                    next.extend(models.into_iter().map(|model| model.id));
+                }
+                Err(error) => {
+                    // Preserve the last validated subset on a transient failure.
+                    // The error has no response body or credential material.
+                    tracing::warn!(
+                        provider = provider.as_str(),
+                        error = %error,
+                        "provider model discovery failed; preserving prior validated catalog"
+                    );
+                }
+            }
+        }
+        drop(registry);
+
+        let mut validated = self.inner.validated_provider_models.write();
+        if *validated == next {
+            return false;
+        }
+        *validated = next;
+        true
+    }
+
     /// `remote_fetch_enabled` is a parameter so tests can drive the gate
     /// without touching on-disk config layers.
     async fn fetch_and_apply_inner(&self, remote_fetch_enabled: bool) {
@@ -1162,6 +1265,7 @@ impl ModelsManager {
         let has_auth = auth.is_some();
         let fetch_auth = *self.inner.fetch_auth.read();
         let cfg = self.inner.cfg.read().clone();
+        let provider_catalog_changed = self.refresh_fixed_provider_models(&cfg).await;
         xai_grok_telemetry::unified_log::info(
             "model catalog: fetching",
             None,
@@ -1172,6 +1276,10 @@ impl ModelsManager {
         );
         let new_prefetched = fetch_models_async(cfg.endpoints.clone(), auth, fetch_auth).await;
         let success = self.apply_refresh_result(&cfg, new_prefetched, None);
+        if !success && provider_catalog_changed {
+            self.rebuild(&cfg, self.inner.prefetched.read().clone());
+            self.reselect_current_model_if_missing(&cfg);
+        }
         if success {
             xai_grok_telemetry::unified_log::info(
                 "model catalog: fetch succeeded",
@@ -2148,6 +2256,47 @@ mod tests {
 
     fn config_from_toml(toml: &str) -> config::Config {
         config::Config::new_from_toml_cfg(&toml::from_str(toml).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn fixed_provider_models_are_hidden_until_directory_validation() {
+        let cfg = config_from_toml(
+            r#"
+            [provider.openai]
+            base_url = "https://api.openai.com/v1"
+
+            [model."openai/gpt-approved"]
+            provider = "openai"
+            model = "gpt-approved"
+            "#,
+        );
+        let raw = resolve_model_catalog(&cfg, None);
+        assert!(raw.contains_key("openai/gpt-approved"));
+
+        let (hidden, had_fixed) = filter_fixed_provider_models(raw.clone(), &HashSet::new());
+        assert!(had_fixed);
+        assert!(!hidden.contains_key("openai/gpt-approved"));
+
+        let validated = HashSet::from(["openai/gpt-approved".to_owned()]);
+        let (visible, _) = filter_fixed_provider_models(raw, &validated);
+        assert!(visible.contains_key("openai/gpt-approved"));
+    }
+
+    #[test]
+    fn non_fixed_custom_provider_does_not_require_fixed_directory_validation() {
+        let cfg = config_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+
+            [model."acme/model"]
+            provider = "acme"
+            "#,
+        );
+        let raw = resolve_model_catalog(&cfg, None);
+        let (catalog, had_fixed) = filter_fixed_provider_models(raw, &HashSet::new());
+        assert!(!had_fixed);
+        assert!(catalog.contains_key("acme/model"));
     }
 
     #[test]

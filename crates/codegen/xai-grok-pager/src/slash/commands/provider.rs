@@ -1,4 +1,4 @@
-//! `/provider xai` -- explicitly select the xAI authentication provider.
+//! `/provider <xai|openai|openrouter>` -- configure authentication.
 
 use crate::app::actions::Action;
 use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand};
@@ -15,7 +15,7 @@ impl SlashCommand for ProviderCommand {
     }
 
     fn usage(&self) -> &str {
-        "/provider xai"
+        "/provider <xai|openai|openrouter>"
     }
 
     fn args_required(&self) -> bool {
@@ -25,9 +25,15 @@ impl SlashCommand for ProviderCommand {
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
         match args.trim() {
             "xai" => CommandResult::Action(Action::SelectXaiProvider),
-            "" => CommandResult::Error("Usage: /provider xai".to_string()),
+            "openai" => CommandResult::Action(Action::OpenProviderApiKey(
+                xai_grok_shell::auth::provider_registry::ProviderId::Openai,
+            )),
+            "openrouter" => CommandResult::Action(Action::OpenProviderApiKey(
+                xai_grok_shell::auth::provider_registry::ProviderId::Openrouter,
+            )),
+            "" => CommandResult::Error("Usage: /provider <xai|openai|openrouter>".to_string()),
             provider => CommandResult::Error(format!(
-                "Unknown provider `{provider}`. Available providers: xai"
+                "Unknown provider `{provider}`. Available providers: xai, openai, openrouter"
             )),
         }
     }
@@ -72,6 +78,33 @@ mod tests {
         assert!(matches!(
             command.run(&mut ctx, "other"),
             CommandResult::Error(_)
+        ));
+    }
+
+    #[test]
+    fn api_key_providers_open_masked_entry() {
+        let command = ProviderCommand;
+        let models = crate::acp::model_state::ModelState::default();
+        let bundle = crate::app::bundle::BundleState::default();
+        let mut ctx = CommandExecCtx {
+            models: &models,
+            session_id: None,
+            bundle_state: &bundle,
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+            pager_state: crate::settings::PagerLocalSnapshot::default(),
+        };
+
+        assert!(matches!(
+            command.run(&mut ctx, "openai"),
+            CommandResult::Action(Action::OpenProviderApiKey(
+                xai_grok_shell::auth::provider_registry::ProviderId::Openai
+            ))
+        ));
+        assert!(matches!(
+            command.run(&mut ctx, "openrouter"),
+            CommandResult::Action(Action::OpenProviderApiKey(
+                xai_grok_shell::auth::provider_registry::ProviderId::Openrouter
+            ))
         ));
     }
 }

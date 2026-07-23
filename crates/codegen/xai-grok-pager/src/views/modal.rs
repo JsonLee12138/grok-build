@@ -171,6 +171,13 @@ pub fn howto_list_modal(previous_palette: Option<PaletteSnapshot>) -> ActiveModa
 /// Each variant wraps a `ModalConfirmation<R>` with its concrete result
 /// type plus any context needed for resolution (e.g., pending focus target).
 pub enum ActiveModal {
+    /// Masked API-key entry. The secret is never rendered or placed in slash
+    /// command history.
+    ProviderApiKey {
+        provider: xai_grok_shell::auth::provider_registry::ProviderId,
+        secret: String,
+        window: ModalWindowState,
+    },
     /// Confirmation for leaving a dirty queued-prompt edit.
     EditConfirm {
         modal: ModalConfirmation<EditConfirmResult>,
@@ -605,6 +612,7 @@ impl ActiveModal {
                 .map(|o| (o.key, o.result.label()))
                 .collect(),
             ActiveModal::CommandPalette { .. }
+            | ActiveModal::ProviderApiKey { .. }
             | ActiveModal::ArgPicker { .. }
             | ActiveModal::SessionPicker { .. }
             | ActiveModal::DocPicker { .. }
@@ -617,6 +625,12 @@ impl ActiveModal {
     }
     pub fn message(&self, drain_blocked: bool) -> &str {
         match self {
+            ActiveModal::ProviderApiKey { provider, .. } => match provider {
+                xai_grok_shell::auth::provider_registry::ProviderId::Openai => "OpenAI API key",
+                xai_grok_shell::auth::provider_registry::ProviderId::Openrouter => {
+                    "OpenRouter API key"
+                }
+            },
             ActiveModal::EditConfirm { .. } => {
                 if drain_blocked {
                     "Save and send?"

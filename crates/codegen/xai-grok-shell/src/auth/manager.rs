@@ -487,7 +487,9 @@ impl AuthManager {
             return Ok(ScopeRemoval::SkippedUnreadable);
         };
         auth_store.remove(scope);
-        if auth_store.is_empty() {
+        if auth_store.is_empty()
+            && crate::auth::storage::other_provider_entries(&self.path).is_empty()
+        {
             let _ = std::fs::remove_file(&self.path);
             Ok(ScopeRemoval::FileDeleted)
         } else {

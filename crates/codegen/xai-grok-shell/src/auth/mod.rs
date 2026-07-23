@@ -11,6 +11,7 @@ mod jwt;
 pub(crate) mod manager;
 mod model;
 pub mod oidc;
+pub mod provider_registry;
 pub(crate) mod recovery;
 pub(crate) mod refresh;
 mod storage;

@@ -245,6 +245,31 @@ fn gemini_model_entry(
     entry
 }
 
+fn custom_model_entry(
+    cfg: &config::Config,
+    provider: &str,
+    provider_config: &config::ProviderConfig,
+    model: crate::auth::provider_registry::CustomCatalogModel,
+) -> ModelEntry {
+    let mut entry = ModelEntry::fallback(&model.wire_id, &cfg.endpoints);
+    entry.info.id = Some(model.id);
+    entry.info.model = model.wire_id;
+    entry.info.base_url = provider_config
+        .base_url
+        .clone()
+        .expect("validated custom Provider has base_url");
+    entry.api_base_url.clone_from(&provider_config.api_base_url);
+    entry.info.api_backend = provider_config.api_backend.clone().unwrap_or_default();
+    entry.info.auth_scheme = provider_config.auth_scheme.unwrap_or_default();
+    entry.info.extra_headers = provider_config.extra_headers.clone();
+    entry.info.supported_in_api = true;
+    debug_assert_eq!(
+        entry.info.id.as_deref().unwrap().split('/').next(),
+        Some(provider)
+    );
+    entry
+}
+
 impl Default for ModelsManager {
     fn default() -> Self {
         let grok_home = crate::util::grok_home::grok_home();
@@ -1318,6 +1343,61 @@ impl ModelsManager {
                         "provider model discovery failed; preserving prior validated catalog"
                     );
                 }
+            }
+        }
+
+        for (provider, provider_config) in &cfg.providers {
+            if provider_config.kind != Some(config::ProviderKind::Custom)
+                || provider_config
+                    .model_discovery
+                    .as_ref()
+                    .is_none_or(|discovery| {
+                        discovery.format != config::ProviderModelDiscoveryFormat::Openai
+                    })
+            {
+                continue;
+            }
+            let Some(base_url) = provider_config.base_url.as_deref() else {
+                continue;
+            };
+            let Some(key) = store.custom_api_key(provider).ok().flatten() else {
+                next_discovered.retain(|model, _| !model.starts_with(&format!("{provider}/")));
+                continue;
+            };
+            drop(key);
+            let discovery_config = provider_config.model_discovery.as_ref().unwrap();
+            let header = match provider_config.auth_scheme.unwrap_or_default() {
+                xai_grok_sampler::config::AuthScheme::Bearer => "authorization",
+                xai_grok_sampler::config::AuthScheme::XApiKey => "x-api-key",
+                xai_grok_sampler::config::AuthScheme::XGoogApiKey => "x-goog-api-key",
+            };
+            match registry
+                .discover_custom_http(
+                    provider,
+                    base_url,
+                    discovery_config.path.as_deref(),
+                    header,
+                    &store,
+                    &client,
+                )
+                .await
+            {
+                Ok(models) => {
+                    let prefix = format!("{provider}/");
+                    next_discovered.retain(|model, _| !model.starts_with(&prefix));
+                    for model in models {
+                        let id = model.id.clone();
+                        next_discovered.insert(
+                            id,
+                            custom_model_entry(cfg, provider, provider_config, model),
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    provider,
+                    error = %error,
+                    "custom Provider model discovery failed; preserving prior catalog"
+                ),
             }
         }
         drop(registry);

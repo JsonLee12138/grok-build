@@ -230,6 +230,7 @@ fn parse_providers(
                     .api_key
                     .as_ref()
                     .is_some_and(|source| !source.is_valid())
+                    || !valid_custom_provider(provider_id, &provider)
                 {
                     warnings.push(ModelOverrideWarning {
                         model_key: None,
@@ -257,6 +258,50 @@ fn parse_providers(
         }
     }
     providers
+}
+
+fn valid_custom_provider(provider_id: &str, provider: &ProviderConfig) -> bool {
+    use super::config::{ProviderKind, ProviderModelDiscoveryFormat};
+
+    if provider.kind != Some(ProviderKind::Custom) {
+        return true;
+    }
+    if matches!(
+        provider_id,
+        "xai" | "anthropic" | "gemini" | "openai" | "openrouter" | "github-copilot"
+    ) || provider.api_key.is_some()
+    {
+        return false;
+    }
+    let Some(base_url) = provider.base_url.as_deref() else {
+        return false;
+    };
+    let Ok(base_url) = url::Url::parse(base_url) else {
+        return false;
+    };
+    if !matches!(base_url.scheme(), "http" | "https") || base_url.host_str().is_none() {
+        return false;
+    }
+    if matches!(
+        provider.api_backend,
+        Some(xai_grok_sampler::ApiBackend::GeminiGenerateContent)
+    ) {
+        return false;
+    }
+    let Some(discovery) = provider.model_discovery.as_ref() else {
+        return true;
+    };
+    match discovery.format {
+        ProviderModelDiscoveryFormat::Configured => discovery.path.is_none(),
+        ProviderModelDiscoveryFormat::Openai => discovery.path.as_deref().is_none_or(|path| {
+            path.starts_with('/')
+                && !path.starts_with("//")
+                && url::Url::parse(path).is_err()
+                && base_url
+                    .join(path)
+                    .is_ok_and(|url| url.origin() == base_url.origin())
+        }),
+    }
 }
 
 fn is_valid_provider_id(provider_id: &str) -> bool {
@@ -336,6 +381,16 @@ fn normalize_provider_model(
         });
         return false;
     };
+    if provider.kind == Some(super::config::ProviderKind::Custom)
+        && (entry.api_key.is_some() || entry.env_key.is_some())
+    {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("api_key".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+        });
+        return false;
+    }
     let Some((key_provider, key_model_id)) = model_key.split_once('/') else {
         warnings.push(ModelOverrideWarning {
             model_key: Some(model_key.to_owned()),

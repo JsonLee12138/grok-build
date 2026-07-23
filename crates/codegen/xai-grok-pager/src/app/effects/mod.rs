@@ -1981,7 +1981,7 @@ pub(crate) fn execute(
             let tx = acp_tx.clone();
             tasks.spawn(async move {
                 let params = serde_json::json!({
-                    "provider": provider.as_str(),
+                    "provider": provider,
                     "key": key.into_secret(),
                 });
                 let request = acp::ExtRequest::new(

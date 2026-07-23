@@ -30,22 +30,41 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 async fn handle_set_provider_api_key(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     #[derive(Deserialize)]
     struct Params {
-        provider: crate::auth::provider_registry::ProviderId,
+        provider: String,
         key: String,
     }
 
     let params: Params = parse_params(args)?;
     let key = crate::auth::provider_registry::ApiKey::new(params.key)
         .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
-    crate::auth::provider_registry::ProviderCredentialStore::new(
+    let store = crate::auth::provider_registry::ProviderCredentialStore::new(
         crate::util::grok_home::grok_home(),
-    )
-    .store_api_key(params.provider, key)
+    );
+    if let Ok(provider) = serde_json::from_value::<crate::auth::provider_registry::ProviderId>(
+        serde_json::Value::String(params.provider.clone()),
+    ) {
+        store.store_api_key(provider, key)
+    } else {
+        let is_configured_custom = agent
+            .cfg
+            .borrow()
+            .providers
+            .get(&params.provider)
+            .is_some_and(|provider| {
+                provider.kind == Some(crate::agent::config::ProviderKind::Custom)
+            });
+        if !is_configured_custom {
+            return Err(
+                acp::Error::invalid_params().data("custom Provider is not configured".to_owned())
+            );
+        }
+        store.store_custom_api_key(&params.provider, key)
+    }
     .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
     agent.models_manager.on_auth_changed().await;
     ExtMethodResult::success(serde_json::json!({
         "ok": true,
-        "provider": params.provider.as_str()
+        "provider": params.provider
     }))
     .to_ext_response()
     .map_err(|error| acp::Error::internal_error().data(error.to_string()))

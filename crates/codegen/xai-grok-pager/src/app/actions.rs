@@ -604,10 +604,10 @@ pub enum Action {
     /// a cached xAI session without opening an interactive browser flow.
     SelectXaiProvider,
     /// Open a masked API-key prompt for a fixed Provider adapter.
-    OpenProviderApiKey(xai_grok_shell::auth::provider_registry::ProviderId),
+    OpenProviderApiKey(String),
     /// Persist a Provider API key through the agent extension boundary.
     SetProviderApiKey {
-        provider: xai_grok_shell::auth::provider_registry::ProviderId,
+        provider: String,
         key: xai_grok_shell::auth::provider_registry::ApiKey,
     },
     /// Cancel an in-progress login that was started from inside a session
@@ -1672,7 +1672,7 @@ pub enum Effect {
     SubmitAuthCode { request_seq: u64, code: String },
     /// Persist a Provider API key and refresh its model catalog.
     SetProviderApiKey {
-        provider: xai_grok_shell::auth::provider_registry::ProviderId,
+        provider: String,
         key: xai_grok_shell::auth::provider_registry::ApiKey,
     },
     /// Fetch MCP server list from the shell (x.ai/mcp/list).
@@ -2065,11 +2065,11 @@ pub enum SubagentKillOutcome {
 pub enum TaskResult {
     /// Provider API key was stored and its catalog refresh completed.
     ProviderApiKeyStored {
-        provider: xai_grok_shell::auth::provider_registry::ProviderId,
+        provider: String,
     },
     /// Provider API key could not be stored or validated.
     ProviderApiKeyStoreFailed {
-        provider: xai_grok_shell::auth::provider_registry::ProviderId,
+        provider: String,
         error: String,
     },
     /// Session was created successfully.

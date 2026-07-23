@@ -115,7 +115,7 @@ impl AgentView {
                     return InputOutcome::Changed;
                 }
                 KeyCode::Enter => {
-                    let provider = *provider;
+                    let provider = provider.clone();
                     let raw = std::mem::take(secret);
                     self.active_modal = None;
                     return match xai_grok_shell::auth::provider_registry::ApiKey::new(raw) {
@@ -1662,15 +1662,12 @@ impl AgentView {
                 window,
             } = active_modal
             {
-                let title = match provider {
-                    xai_grok_shell::auth::provider_registry::ProviderId::Anthropic => {
-                        "Anthropic API key"
-                    }
-                    xai_grok_shell::auth::provider_registry::ProviderId::Gemini => "Gemini API key",
-                    xai_grok_shell::auth::provider_registry::ProviderId::Openai => "OpenAI API key",
-                    xai_grok_shell::auth::provider_registry::ProviderId::Openrouter => {
-                        "OpenRouter API key"
-                    }
+                let title = match provider.as_str() {
+                    "anthropic" => "Anthropic API key",
+                    "gemini" => "Gemini API key",
+                    "openai" => "OpenAI API key",
+                    "openrouter" => "OpenRouter API key",
+                    _ => "Custom Provider API key",
                 };
                 let shortcuts = [
                     Shortcut {
@@ -2897,12 +2894,11 @@ mod command_palette_vim_input_tests {
     fn provider_api_key_modal_masks_render_and_action_debug() {
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
-        use xai_grok_shell::auth::provider_registry::ProviderId;
 
         let secret = "sk-sensitive-provider-key";
         let mut agent = make_agent();
         agent.active_modal = Some(ActiveModal::ProviderApiKey {
-            provider: ProviderId::Openai,
+            provider: "openai".to_owned(),
             secret: secret.to_owned(),
             window: crate::views::modal_window::ModalWindowState::new(),
         });

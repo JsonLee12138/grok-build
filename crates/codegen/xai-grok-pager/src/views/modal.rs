@@ -174,7 +174,7 @@ pub enum ActiveModal {
     /// Masked API-key entry. The secret is never rendered or placed in slash
     /// command history.
     ProviderApiKey {
-        provider: xai_grok_shell::auth::provider_registry::ProviderId,
+        provider: String,
         secret: String,
         window: ModalWindowState,
     },
@@ -625,15 +625,12 @@ impl ActiveModal {
     }
     pub fn message(&self, drain_blocked: bool) -> &str {
         match self {
-            ActiveModal::ProviderApiKey { provider, .. } => match provider {
-                xai_grok_shell::auth::provider_registry::ProviderId::Anthropic => {
-                    "Anthropic API key"
-                }
-                xai_grok_shell::auth::provider_registry::ProviderId::Gemini => "Gemini API key",
-                xai_grok_shell::auth::provider_registry::ProviderId::Openai => "OpenAI API key",
-                xai_grok_shell::auth::provider_registry::ProviderId::Openrouter => {
-                    "OpenRouter API key"
-                }
+            ActiveModal::ProviderApiKey { provider, .. } => match provider.as_str() {
+                "anthropic" => "Anthropic API key",
+                "gemini" => "Gemini API key",
+                "openai" => "OpenAI API key",
+                "openrouter" => "OpenRouter API key",
+                _ => "Custom Provider API key",
             },
             ActiveModal::EditConfirm { .. } => {
                 if drain_blocked {

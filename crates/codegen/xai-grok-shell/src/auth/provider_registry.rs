@@ -66,6 +66,21 @@ impl ProviderId {
     }
 }
 
+fn validate_custom_provider_id(provider: &str) -> Result<()> {
+    if provider.is_empty()
+        || !provider
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || matches!(
+            provider,
+            "xai" | "anthropic" | "gemini" | "openai" | "openrouter" | "github-copilot"
+        )
+    {
+        bail!("invalid custom Provider id");
+    }
+    Ok(())
+}
+
 /// A display-safe credential reference. Its `Debug` implementation never
 /// renders the secret, so assertion failures and tracing cannot disclose it.
 #[derive(Clone, PartialEq, Eq)]
@@ -185,6 +200,25 @@ impl ProviderCredentialStore {
     }
 
     pub fn store_api_key(&self, provider: ProviderId, key: ApiKey) -> Result<()> {
+        self.store_api_key_in_namespace(provider.as_str(), "api_key", key)
+    }
+
+    /// Store a named custom Provider credential in its own namespace.
+    ///
+    /// The credential id intentionally equals the Provider id, matching the
+    /// v2 store contract and preventing a singleton `custom` credential from
+    /// being shared by unrelated upstreams.
+    pub fn store_custom_api_key(&self, provider: &str, key: ApiKey) -> Result<()> {
+        validate_custom_provider_id(provider)?;
+        self.store_api_key_in_namespace(provider, provider, key)
+    }
+
+    fn store_api_key_in_namespace(
+        &self,
+        provider: &str,
+        credential_id: &str,
+        key: ApiKey,
+    ) -> Result<()> {
         let parent = self
             .path
             .parent()
@@ -218,7 +252,7 @@ impl ProviderCredentialStore {
             .as_object_mut()
             .ok_or_else(|| anyhow!("auth store providers is not an object"))?;
         let provider_entry = providers
-            .entry(provider.as_str().to_string())
+            .entry(provider.to_owned())
             .or_insert_with(|| json!({}));
         let provider_object = provider_entry
             .as_object_mut()
@@ -229,7 +263,7 @@ impl ProviderCredentialStore {
             .as_object_mut()
             .ok_or_else(|| anyhow!("provider credentials entry is not an object"))?;
         credentials.insert(
-            "api_key".to_owned(),
+            credential_id.to_owned(),
             json!({ "type": "api_key", "key": key.expose() }),
         );
         if !lock.still_live(&self.path) {
@@ -239,10 +273,18 @@ impl ProviderCredentialStore {
     }
 
     pub fn api_key(&self, provider: ProviderId) -> Result<Option<ApiKey>> {
+        self.api_key_in_namespace(provider.as_str(), "api_key")
+    }
+
+    pub fn custom_api_key(&self, provider: &str) -> Result<Option<ApiKey>> {
+        validate_custom_provider_id(provider)?;
+        self.api_key_in_namespace(provider, provider)
+    }
+
+    fn api_key_in_namespace(&self, provider: &str, credential_id: &str) -> Result<Option<ApiKey>> {
         let root = self.read_raw()?;
         let value = root.pointer(&format!(
-            "/providers/{}/credentials/api_key",
-            provider.as_str()
+            "/providers/{provider}/credentials/{credential_id}"
         ));
         let Some(value) = value else {
             return Ok(None);
@@ -600,15 +642,146 @@ struct CatalogCacheKey {
     origin: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CustomCatalogCacheKey {
+    provider: String,
+    key_fingerprint: String,
+    origin: String,
+    path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomCatalogModel {
+    pub id: String,
+    pub wire_id: String,
+    pub provider: String,
+}
+
+#[derive(Clone)]
+pub struct CustomCatalogRequest {
+    pub endpoint: Url,
+    credential_header_name: String,
+    credential_header_value: String,
+}
+
+impl CustomCatalogRequest {
+    pub(crate) fn credential_header(&self) -> (&str, &str) {
+        (&self.credential_header_name, &self.credential_header_value)
+    }
+}
+
 /// Fixed adapter registry. No user-configured endpoint is accepted for these
 /// adapters: this prevents a credential saved for one provider reaching a
 /// look-alike or cross-origin endpoint.
 #[derive(Default)]
 pub struct ProviderAdapterRegistry {
     cache: HashMap<CatalogCacheKey, Vec<CatalogModel>>,
+    custom_cache: HashMap<CustomCatalogCacheKey, Vec<CustomCatalogModel>>,
 }
 
 impl ProviderAdapterRegistry {
+    pub fn discover_custom_with<F>(
+        &mut self,
+        provider: &str,
+        base_url: &str,
+        models_path: Option<&str>,
+        credential_header_name: &str,
+        key: ApiKey,
+        fetch: F,
+    ) -> Result<Vec<CustomCatalogModel>>
+    where
+        F: FnOnce(&CustomCatalogRequest) -> Result<Value>,
+    {
+        validate_custom_provider_id(provider)?;
+        let base = Url::parse(base_url).context("invalid custom Provider base URL")?;
+        let path = models_path.unwrap_or("/v1/models");
+        if !path.starts_with('/') || path.starts_with("//") || Url::parse(path).is_ok() {
+            bail!("custom Provider models path must be an absolute URL path");
+        }
+        let endpoint = base
+            .join(path)
+            .context("invalid custom Provider models path")?;
+        if endpoint.origin() != base.origin() {
+            bail!("custom Provider models path changes origin");
+        }
+        let credential_header_value =
+            if credential_header_name.eq_ignore_ascii_case("authorization") {
+                format!("Bearer {}", key.expose())
+            } else {
+                key.expose().to_owned()
+            };
+        let request = CustomCatalogRequest {
+            endpoint: endpoint.clone(),
+            credential_header_name: credential_header_name.to_owned(),
+            credential_header_value,
+        };
+        let cache_key = CustomCatalogCacheKey {
+            provider: provider.to_owned(),
+            key_fingerprint: key.fingerprint(),
+            origin: endpoint.origin().ascii_serialization(),
+            path: endpoint.path().to_owned(),
+        };
+        match fetch(&request).and_then(|value| parse_custom_catalog(provider, value)) {
+            Ok(models) => {
+                self.custom_cache.insert(cache_key, models.clone());
+                Ok(models)
+            }
+            Err(error) => self.custom_cache.get(&cache_key).cloned().ok_or(error),
+        }
+    }
+
+    pub async fn discover_custom_http(
+        &mut self,
+        provider: &str,
+        base_url: &str,
+        models_path: Option<&str>,
+        credential_header_name: &str,
+        store: &ProviderCredentialStore,
+        client: &reqwest::Client,
+    ) -> Result<Vec<CustomCatalogModel>> {
+        let key = store
+            .custom_api_key(provider)?
+            .ok_or_else(|| anyhow!("custom Provider credential unavailable"))?;
+        let mut captured_request = None;
+        let cached_or_marker = self.discover_custom_with(
+            provider,
+            base_url,
+            models_path,
+            credential_header_name,
+            key.clone(),
+            |request| {
+                captured_request = Some(request.clone());
+                bail!("custom Provider HTTP request pending")
+            },
+        );
+        let request = captured_request.expect("request is captured before injected fetch");
+        let (header_name, header_value) = request.credential_header();
+        let response = match client
+            .get(request.endpoint.clone())
+            .header(header_name, header_value)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return cached_or_marker,
+        };
+        if !response.status().is_success() {
+            return cached_or_marker;
+        }
+        let value = match response.json::<Value>().await {
+            Ok(value) => value,
+            Err(_) => return cached_or_marker,
+        };
+        self.discover_custom_with(
+            provider,
+            base_url,
+            models_path,
+            credential_header_name,
+            key,
+            |_| Ok(value),
+        )
+    }
+
     pub fn request_projection(
         &self,
         provider: ProviderId,
@@ -1088,6 +1261,27 @@ fn parse_catalog(provider: ProviderId, value: Value) -> Result<Vec<CatalogModel>
     Ok(models)
 }
 
+fn parse_custom_catalog(provider: &str, value: Value) -> Result<Vec<CustomCatalogModel>> {
+    let raw_models = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("custom Provider catalog has no data array"))?;
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for model in raw_models {
+        let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+        if id.is_empty() || !seen.insert(id.to_owned()) {
+            continue;
+        }
+        models.push(CustomCatalogModel {
+            id: format!("{provider}/{id}"),
+            wire_id: id.to_owned(),
+            provider: provider.to_owned(),
+        });
+    }
+    Ok(models)
+}
+
 fn openrouter_model_is_usable(model: &Value) -> bool {
     let architecture = model.get("architecture").unwrap_or(&Value::Null);
     let modality = architecture
@@ -1114,6 +1308,138 @@ fn openrouter_model_is_usable(model: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_custom_credentials_are_isolated_and_builtin_names_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProviderCredentialStore::new(directory.path());
+        store
+            .store_custom_api_key("custom-a", key("custom-a-secret"))
+            .unwrap();
+        store
+            .store_custom_api_key("custom-b", key("custom-b-secret"))
+            .unwrap();
+
+        assert_eq!(
+            store.custom_api_key("custom-a").unwrap().unwrap().masked(),
+            "****cret"
+        );
+        assert_eq!(
+            store.custom_api_key("custom-b").unwrap().unwrap().masked(),
+            "****cret"
+        );
+        let root: Value =
+            serde_json::from_slice(&fs::read(directory.path().join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            root.pointer("/providers/custom-a/credentials/custom-a/type")
+                .and_then(Value::as_str),
+            Some("api_key")
+        );
+        assert!(
+            store
+                .store_custom_api_key("openai", key("must-not-write"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn custom_catalogs_use_same_origin_and_isolated_failure_cache() {
+        let mut registry = ProviderAdapterRegistry::default();
+        let a = registry
+            .discover_custom_with(
+                "custom-a",
+                "https://a.example/api/",
+                Some("/v1/models"),
+                "authorization",
+                key("a-secret"),
+                |request| {
+                    assert_eq!(request.endpoint.as_str(), "https://a.example/v1/models");
+                    assert_eq!(
+                        request.credential_header(),
+                        ("authorization", "Bearer a-secret")
+                    );
+                    Ok(json!({ "data": [{ "id": "alpha" }] }))
+                },
+            )
+            .unwrap();
+        let b = registry
+            .discover_custom_with(
+                "custom-b",
+                "https://b.example/v1",
+                None,
+                "x-api-key",
+                key("b-secret"),
+                |_| Ok(json!({ "data": [{ "id": "beta" }] })),
+            )
+            .unwrap();
+        assert_eq!(a[0].id, "custom-a/alpha");
+        assert_eq!(b[0].id, "custom-b/beta");
+
+        let cached_a = registry
+            .discover_custom_with(
+                "custom-a",
+                "https://a.example/api/",
+                Some("/v1/models"),
+                "authorization",
+                key("a-secret"),
+                |_| bail!("temporary failure"),
+            )
+            .unwrap();
+        assert_eq!(cached_a, a);
+        assert!(
+            registry
+                .discover_custom_with(
+                    "custom-a",
+                    "https://a.example/api/",
+                    Some("https://evil.example/models"),
+                    "authorization",
+                    key("a-secret"),
+                    |_| unreachable!(),
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_catalog_http_uses_named_credential_and_openai_shape() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer custom-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "id": "remote-a" }, { "id": "remote-b" }]
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProviderCredentialStore::new(directory.path());
+        store
+            .store_custom_api_key("custom-a", key("custom-secret"))
+            .unwrap();
+
+        let models = ProviderAdapterRegistry::default()
+            .discover_custom_http(
+                "custom-a",
+                &upstream.uri(),
+                None,
+                "authorization",
+                &store,
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["custom-a/remote-a", "custom-a/remote-b"]
+        );
+    }
 
     fn write_legacy_xai_api_key(directory: &std::path::Path, key: &str) {
         let mut legacy = std::collections::BTreeMap::new();

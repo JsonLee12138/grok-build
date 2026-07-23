@@ -3777,13 +3777,49 @@ fn is_default_laziness_detector(cfg: &LazinessDetectorPerModelConfig) -> bool {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ProviderConfig {
+    /// Explicitly marks a user-defined provider. Legacy provider tables may
+    /// omit this field, but model discovery is only available to `custom`.
+    pub kind: Option<ProviderKind>,
     pub base_url: Option<String>,
     pub api_base_url: Option<String>,
     pub api_backend: Option<ApiBackend>,
     pub auth_scheme: Option<AuthScheme>,
     pub api_key: Option<ApiKeySource>,
+    pub model_discovery: Option<ProviderModelDiscoveryConfig>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    Custom,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ProviderModelDiscoveryConfig {
+    pub format: ProviderModelDiscoveryFormat,
+    /// URL path only. Absolute URLs are rejected so credentials cannot cross
+    /// the provider base URL's origin.
+    pub path: Option<String>,
+}
+
+impl Default for ProviderModelDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            format: ProviderModelDiscoveryFormat::Configured,
+            path: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderModelDiscoveryFormat {
+    Openai,
+    #[default]
+    Configured,
 }
 /// A `[model.foo]` entry from config.toml, parsed directly from raw TOML
 /// (bypassing deep merge). Scalar fields are `Option` so absent means "inherit
@@ -4645,25 +4681,40 @@ pub(crate) fn resolve_fixed_provider_credentials_at(
     model: &ModelEntry,
     grok_home: &std::path::Path,
 ) -> Option<ResolvedCredentials> {
-    let provider = model
-        .info
-        .id
-        .as_deref()
-        .and_then(crate::auth::provider_registry::ProviderId::from_canonical_model)?;
-    let api_key = crate::auth::provider_registry::ProviderCredentialStore::new(grok_home)
-        .api_key(provider)
-        .ok()
-        .flatten()
-        .map(crate::auth::provider_registry::ApiKey::into_secret);
+    let canonical = model.info.id.as_deref()?;
+    let (provider_name, wire_model) = canonical.split_once('/')?;
+    if wire_model.is_empty() {
+        return None;
+    }
+    let store = crate::auth::provider_registry::ProviderCredentialStore::new(grok_home);
+    let builtin = crate::auth::provider_registry::ProviderId::from_canonical_model(canonical);
+    let api_key = match builtin {
+        Some(provider) => store.api_key(provider),
+        None => store.custom_api_key(provider_name),
+    }
+    .ok()
+    .flatten()
+    .map(crate::auth::provider_registry::ApiKey::into_secret);
+    if builtin.is_none() && api_key.is_none() {
+        // A direct/legacy model containing `/` is not necessarily a named
+        // custom Provider. Let the regular credential resolver handle it.
+        return None;
+    }
     Some(ResolvedCredentials {
         api_key,
-        base_url: crate::auth::provider_registry::endpoint_base(provider).to_owned(),
+        base_url: builtin
+            .map(crate::auth::provider_registry::endpoint_base)
+            .unwrap_or(model.info.base_url.as_str())
+            .to_owned(),
         auth_type: xai_chat_state::AuthType::ApiKey,
-        auth_scheme: match provider {
-            crate::auth::provider_registry::ProviderId::Anthropic => AuthScheme::XApiKey,
-            crate::auth::provider_registry::ProviderId::Gemini => AuthScheme::XGoogApiKey,
-            crate::auth::provider_registry::ProviderId::Openai
-            | crate::auth::provider_registry::ProviderId::Openrouter => AuthScheme::Bearer,
+        auth_scheme: match builtin {
+            Some(crate::auth::provider_registry::ProviderId::Anthropic) => AuthScheme::XApiKey,
+            Some(crate::auth::provider_registry::ProviderId::Gemini) => AuthScheme::XGoogApiKey,
+            Some(
+                crate::auth::provider_registry::ProviderId::Openai
+                | crate::auth::provider_registry::ProviderId::Openrouter,
+            ) => AuthScheme::Bearer,
+            None => model.info.auth_scheme,
         },
     })
 }
@@ -7608,6 +7659,129 @@ reasoning_effort = "low"
         let entry = catalog.get("acme/demo-v1").expect("provider model exists");
         assert_eq!(entry.info.model, "demo-v1");
         assert_eq!(entry.info.base_url, "https://api.acme.example/v1");
+    }
+
+    #[test]
+    fn custom_provider_contract_accepts_named_isolated_instances() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.custom-a]
+            kind = "custom"
+            base_url = "https://a.example/v1"
+            api_backend = "chat_completions"
+            model_discovery = { format = "openai", path = "/v1/models" }
+
+            [provider.custom-b]
+            kind = "custom"
+            base_url = "http://127.0.0.1:8080/v1"
+            api_backend = "messages"
+            model_discovery = { format = "configured" }
+
+            [model."custom-a/remote"]
+            provider = "custom-a"
+
+            [model."custom-b/local"]
+            provider = "custom-b"
+            "#,
+            None,
+        );
+
+        assert_eq!(cfg.providers.len(), 2);
+        assert_eq!(catalog["custom-a/remote"].info.model, "remote");
+        assert_eq!(
+            catalog["custom-b/local"].info.api_backend,
+            ApiBackend::Messages
+        );
+    }
+
+    #[test]
+    fn custom_provider_request_uses_only_its_named_store_credential() {
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.custom-a]
+            kind = "custom"
+            base_url = "https://a.example/v1"
+            api_backend = "messages"
+            auth_scheme = "x_api_key"
+            model_discovery = { format = "configured" }
+
+            [model."custom-a/demo"]
+            provider = "custom-a"
+            "#,
+            None,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        crate::auth::provider_registry::ProviderCredentialStore::new(directory.path())
+            .store_custom_api_key(
+                "custom-a",
+                crate::auth::provider_registry::ApiKey::new("named-secret").unwrap(),
+            )
+            .unwrap();
+
+        let resolved =
+            resolve_fixed_provider_credentials_at(&catalog["custom-a/demo"], directory.path())
+                .expect("named Provider credential resolves");
+        assert_eq!(resolved.api_key.as_deref(), Some("named-secret"));
+        assert_eq!(resolved.base_url, "https://a.example/v1");
+        assert_eq!(resolved.auth_scheme, AuthScheme::XApiKey);
+    }
+
+    #[test]
+    fn custom_provider_contract_rejects_builtin_names_and_unsafe_discovery() {
+        for input in [
+            r#"
+            [provider.openai]
+            kind = "custom"
+            base_url = "https://evil.example/v1"
+            "#,
+            r#"
+            [provider.unsafe]
+            kind = "custom"
+            base_url = "https://safe.example/v1"
+            model_discovery = { format = "openai", path = "https://evil.example/models" }
+            "#,
+            r#"
+            [provider.scripted]
+            kind = "custom"
+            base_url = "https://safe.example/v1"
+            model_discovery = { format = "jsonpath" }
+            "#,
+            r#"
+            [provider.secret-in-config]
+            kind = "custom"
+            base_url = "https://safe.example/v1"
+            api_key = "must-live-in-auth-json"
+            "#,
+        ] {
+            let raw: toml::Value = toml::from_str(input).expect("fixture TOML");
+            let cfg = Config::new_from_toml_cfg(&raw).expect("config remains recoverable");
+            assert!(cfg.providers.is_empty());
+            assert!(cfg.model_override_warnings.iter().any(|warning| {
+                warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+            }));
+        }
+    }
+
+    #[test]
+    fn custom_provider_model_rejects_model_local_credentials() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.custom-a]
+            kind = "custom"
+            base_url = "https://a.example/v1"
+
+            [model."custom-a/demo"]
+            provider = "custom-a"
+            api_key = "must-live-in-auth-json"
+            "#,
+            None,
+        );
+        assert!(!catalog.contains_key("custom-a/demo"));
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some("custom-a/demo")
+                && warning.field.as_deref() == Some("api_key")
+        }));
     }
 
     #[test]

@@ -172,16 +172,16 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
 pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec<Effect> {
     match result {
         TaskResult::ProviderApiKeyStored { provider } => {
-            app.show_toast(&format!("{} API key saved", provider.as_str()));
+            app.show_toast(&format!("{provider} API key saved"));
             vec![]
         }
         TaskResult::ProviderApiKeyStoreFailed { provider, error } => {
             tracing::warn!(
-                provider = provider.as_str(),
+                provider,
                 error = %error,
                 "provider API key update failed"
             );
-            app.show_toast(&format!("Couldn't save {} API key", provider.as_str()));
+            app.show_toast(&format!("Couldn't save {provider} API key"));
             vec![]
         }
         TaskResult::SessionCreated {

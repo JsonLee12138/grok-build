@@ -34,6 +34,130 @@ pub enum ProviderId {
     Openrouter,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterStability {
+    Stable,
+    Conditional,
+    Experimental,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterAvailability {
+    Available,
+    NotEnabled,
+    BlockedExternal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAuthMethod {
+    pub id: &'static str,
+    pub provider: &'static str,
+    pub stability: AdapterStability,
+    pub availability: AdapterAvailability,
+    pub requires_confirmation: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProviderReleaseGates {
+    pub gemini_oauth: bool,
+    pub github_copilot: bool,
+    pub codex_oauth: bool,
+    pub claude_oauth: bool,
+}
+
+impl ProviderReleaseGates {
+    pub fn from_features(features: &crate::agent::config::Features) -> Self {
+        Self {
+            gemini_oauth: features.provider_gemini_oauth.unwrap_or(false),
+            github_copilot: features.provider_github_copilot.unwrap_or(false),
+            codex_oauth: features.provider_codex_oauth.unwrap_or(false),
+            claude_oauth: features.provider_claude_oauth.unwrap_or(false),
+        }
+    }
+}
+
+pub fn provider_auth_methods(
+    gates: ProviderReleaseGates,
+    copilot_external_ready: bool,
+) -> Vec<ProviderAuthMethod> {
+    let mut methods = vec![
+        ProviderAuthMethod {
+            id: "openai_api_key",
+            provider: "openai",
+            stability: AdapterStability::Stable,
+            availability: AdapterAvailability::Available,
+            requires_confirmation: false,
+        },
+        ProviderAuthMethod {
+            id: "anthropic_api_key",
+            provider: "anthropic",
+            stability: AdapterStability::Stable,
+            availability: AdapterAvailability::Available,
+            requires_confirmation: false,
+        },
+        ProviderAuthMethod {
+            id: "gemini_api_key",
+            provider: "gemini",
+            stability: AdapterStability::Stable,
+            availability: AdapterAvailability::Available,
+            requires_confirmation: false,
+        },
+        ProviderAuthMethod {
+            id: "openrouter_api_key",
+            provider: "openrouter",
+            stability: AdapterStability::Stable,
+            availability: AdapterAvailability::Available,
+            requires_confirmation: false,
+        },
+    ];
+    if gates.gemini_oauth {
+        methods.push(ProviderAuthMethod {
+            id: "gemini_oauth",
+            provider: "gemini",
+            stability: AdapterStability::Conditional,
+            // The user-owned OAuth client flow is not enabled until its
+            // implementation and real-account UAT both pass.
+            availability: AdapterAvailability::NotEnabled,
+            requires_confirmation: false,
+        });
+    }
+    if gates.github_copilot {
+        methods.push(ProviderAuthMethod {
+            id: "github_copilot",
+            provider: "github-copilot",
+            stability: AdapterStability::Conditional,
+            availability: if copilot_external_ready {
+                AdapterAvailability::NotEnabled
+            } else {
+                AdapterAvailability::BlockedExternal
+            },
+            requires_confirmation: false,
+        });
+    }
+    if gates.codex_oauth {
+        methods.push(ProviderAuthMethod {
+            id: "codex_oauth_compat",
+            provider: "openai",
+            stability: AdapterStability::Experimental,
+            availability: AdapterAvailability::NotEnabled,
+            requires_confirmation: true,
+        });
+    }
+    if gates.claude_oauth {
+        methods.push(ProviderAuthMethod {
+            id: "claude_oauth_compat",
+            provider: "anthropic",
+            stability: AdapterStability::Experimental,
+            availability: AdapterAvailability::NotEnabled,
+            requires_confirmation: true,
+        });
+    }
+    methods
+}
+
 impl ProviderId {
     pub const ALL: [Self; 4] = [
         Self::Anthropic,
@@ -1308,6 +1432,77 @@ fn openrouter_model_is_usable(model: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experimental_oauth_visibility_is_default_hidden_and_independently_gated() {
+        let default_methods = provider_auth_methods(ProviderReleaseGates::default(), false);
+        assert!(
+            default_methods
+                .iter()
+                .all(|method| method.stability == AdapterStability::Stable)
+        );
+
+        let codex_only = provider_auth_methods(
+            ProviderReleaseGates {
+                codex_oauth: true,
+                ..Default::default()
+            },
+            false,
+        );
+        let experimental: Vec<_> = codex_only
+            .iter()
+            .filter(|method| method.stability == AdapterStability::Experimental)
+            .collect();
+        assert_eq!(experimental.len(), 1);
+        assert_eq!(experimental[0].id, "codex_oauth_compat");
+        assert!(experimental[0].requires_confirmation);
+        assert_eq!(
+            experimental[0].availability,
+            AdapterAvailability::NotEnabled
+        );
+        assert!(
+            codex_only
+                .iter()
+                .any(|method| method.id == "openai_api_key"),
+            "experimental compatibility must retain the stable API-key fallback"
+        );
+    }
+
+    #[test]
+    fn conditional_adapter_statuses_never_claim_unverified_availability() {
+        let methods = provider_auth_methods(
+            ProviderReleaseGates {
+                gemini_oauth: true,
+                github_copilot: true,
+                claude_oauth: true,
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .find(|method| method.id == "github_copilot")
+                .unwrap()
+                .availability,
+            AdapterAvailability::BlockedExternal
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .find(|method| method.id == "gemini_oauth")
+                .unwrap()
+                .availability,
+            AdapterAvailability::NotEnabled
+        );
+        assert!(
+            methods
+                .iter()
+                .find(|method| method.id == "claude_oauth_compat")
+                .unwrap()
+                .requires_confirmation
+        );
+    }
 
     #[test]
     fn named_custom_credentials_are_isolated_and_builtin_names_fail_closed() {

@@ -4430,6 +4430,18 @@ pub struct AutoModeConfig {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Features {
+    /// User-client Gemini OAuth adapter. Conditional and disabled by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_gemini_oauth: Option<bool>,
+    /// Official Copilot SDK/CLI adapter. Conditional and disabled by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_github_copilot: Option<bool>,
+    /// Experimental Codex CLI compatibility adapter. Disabled by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_codex_oauth: Option<bool>,
+    /// Experimental Claude Code compatibility adapter. Disabled by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_claude_oauth: Option<bool>,
     /// when set, the agent may ask permission for tool executions
     #[serde(default)]
     pub support_permission: bool,

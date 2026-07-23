@@ -18,6 +18,7 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         "x.ai/getApiKey" => handle_get_api_key(),
         "x.ai/setApiKey" => handle_set_api_key(args),
         "x.ai/provider/setApiKey" => handle_set_provider_api_key(agent, args).await,
+        "x.ai/provider/methods" => handle_provider_methods(agent),
         "x.ai/auth/submit_code" => handle_submit_code(agent, args),
         "x.ai/auth/get_url" => handle_get_url(agent).await,
         "x.ai/auth/logout" => handle_logout(agent, args).await,
@@ -25,6 +26,24 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         "x.ai/auth/check_subscription" => handle_check_subscription(agent).await,
         _ => Err(acp::Error::method_not_found()),
     }
+}
+
+fn handle_provider_methods(agent: &MvpAgent) -> ExtResult {
+    let gates = crate::auth::provider_registry::ProviderReleaseGates::from_features(
+        &agent.cfg.borrow().features,
+    );
+    let methods =
+        crate::auth::provider_registry::provider_auth_methods(gates, command_on_path("copilot"));
+    ExtMethodResult::success(serde_json::json!({ "methods": methods }))
+        .to_ext_response()
+        .map_err(|error| acp::Error::internal_error().data(error.to_string()))
+}
+
+fn command_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| directory.join(name).is_file())
 }
 
 async fn handle_set_provider_api_key(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {

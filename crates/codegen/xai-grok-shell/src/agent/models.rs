@@ -153,6 +153,7 @@ struct Inner {
     cache: ModelsCacheManager,
     provider_registry: tokio::sync::Mutex<crate::auth::provider_registry::ProviderAdapterRegistry>,
     validated_provider_models: RwLock<HashSet<String>>,
+    discovered_provider_models: RwLock<IndexMap<String, ModelEntry>>,
     /// Guard to prevent overlapping retry loops.
     retry_in_flight: AtomicBool,
     /// `allowed_models` matched nothing in the fetched catalog; the prompt path
@@ -194,6 +195,37 @@ fn filter_fixed_provider_models(
         !is_fixed || validated.contains(canonical)
     });
     (catalog, had_fixed_provider_models)
+}
+
+fn merge_discovered_provider_models(
+    mut catalog: IndexMap<String, ModelEntry>,
+    discovered: &IndexMap<String, ModelEntry>,
+) -> IndexMap<String, ModelEntry> {
+    for (key, entry) in discovered {
+        catalog.entry(key.clone()).or_insert_with(|| entry.clone());
+    }
+    catalog
+}
+
+fn anthropic_model_entry(
+    cfg: &config::Config,
+    model: crate::auth::provider_registry::CatalogModel,
+) -> ModelEntry {
+    let mut entry = ModelEntry::fallback(&model.wire_id, &cfg.endpoints);
+    entry.info.id = Some(model.id);
+    entry.info.model = model.wire_id;
+    entry.info.base_url = crate::auth::provider_registry::endpoint_base(
+        crate::auth::provider_registry::ProviderId::Anthropic,
+    )
+    .to_owned();
+    entry.info.api_backend = xai_grok_sampling_types::ApiBackend::Messages;
+    entry.info.auth_scheme = xai_grok_sampler::config::AuthScheme::XApiKey;
+    entry.info.extra_headers.insert(
+        "anthropic-version".to_owned(),
+        crate::auth::provider_registry::ANTHROPIC_API_VERSION.to_owned(),
+    );
+    entry.info.supported_in_api = true;
+    entry
 }
 
 impl Default for ModelsManager {
@@ -241,6 +273,7 @@ impl ModelsManager {
                     crate::auth::provider_registry::ProviderAdapterRegistry::default(),
                 ),
                 validated_provider_models: RwLock::new(HashSet::new()),
+                discovered_provider_models: RwLock::new(IndexMap::new()),
                 retry_in_flight: AtomicBool::new(false),
                 allowlist_excludes_all: AtomicBool::new(false),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
@@ -342,7 +375,10 @@ impl ModelsManager {
             return;
         }
         let prefetched = self.inner.prefetched.read().clone();
-        let new_catalog = resolve_model_catalog(&new_config, prefetched);
+        let new_catalog = merge_discovered_provider_models(
+            resolve_model_catalog(&new_config, prefetched),
+            &self.inner.discovered_provider_models.read(),
+        );
         let (new_catalog, had_fixed_provider_models) =
             filter_fixed_provider_models(new_catalog, &self.inner.validated_provider_models.read());
         let has_real_catalog = *self.inner.has_fetched_real_catalog.read();
@@ -658,7 +694,10 @@ impl ModelsManager {
     // ── Mutations ───────────────────────────────────────────────────
 
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
-        let catalog = resolve_model_catalog(cfg, prefetched);
+        let catalog = merge_discovered_provider_models(
+            resolve_model_catalog(cfg, prefetched),
+            &self.inner.discovered_provider_models.read(),
+        );
         let (catalog, _) =
             filter_fixed_provider_models(catalog, &self.inner.validated_provider_models.read());
         self.replace_catalog(catalog, cfg.model_aliases.clone(), None);
@@ -1045,6 +1084,7 @@ impl ModelsManager {
     fn clear(&self) {
         *self.inner.prefetched.write() = None;
         self.inner.validated_provider_models.write().clear();
+        self.inner.discovered_provider_models.write().clear();
         self.replace_catalog(IndexMap::new(), config::AliasIndex::default(), None);
         *self.inner.etag.write() = None;
         *self.inner.has_fetched_real_catalog.write() = false;
@@ -1211,26 +1251,39 @@ impl ModelsManager {
             }
         };
         let mut next = self.inner.validated_provider_models.read().clone();
+        let mut next_discovered = self.inner.discovered_provider_models.read().clone();
         let mut registry = self.inner.provider_registry.lock().await;
-        for provider in [ProviderId::Openai, ProviderId::Openrouter] {
+        for provider in ProviderId::ALL {
             let provider_registered = registered.remove(&provider).unwrap_or_default();
             let provider_prefix = format!("{}/", provider.as_str());
-            if provider_registered.is_empty() {
-                next.retain(|model| !model.starts_with(&provider_prefix));
-                continue;
-            }
             let has_key = store.api_key(provider).ok().flatten().is_some();
             if !has_key {
                 next.retain(|model| !model.starts_with(&provider_prefix));
+                next_discovered.retain(|model, _| !model.starts_with(&provider_prefix));
                 continue;
             }
-            match registry
-                .discover_registered_http(&store, provider, &provider_registered, &client)
-                .await
-            {
+            if provider != ProviderId::Anthropic && provider_registered.is_empty() {
+                next.retain(|model| !model.starts_with(&provider_prefix));
+                continue;
+            }
+            let discovery = if provider == ProviderId::Anthropic {
+                registry.discover_anthropic_http(&store, &client).await
+            } else {
+                registry
+                    .discover_registered_http(&store, provider, &provider_registered, &client)
+                    .await
+            };
+            match discovery {
                 Ok(models) => {
                     next.retain(|model| !model.starts_with(&provider_prefix));
-                    next.extend(models.into_iter().map(|model| model.id));
+                    next_discovered.retain(|model, _| !model.starts_with(&provider_prefix));
+                    for model in models {
+                        next.insert(model.id.clone());
+                        if provider == ProviderId::Anthropic {
+                            let id = model.id.clone();
+                            next_discovered.insert(id, anthropic_model_entry(cfg, model));
+                        }
+                    }
                 }
                 Err(error) => {
                     // Preserve the last validated subset on a transient failure.
@@ -1245,12 +1298,19 @@ impl ModelsManager {
         }
         drop(registry);
 
-        let mut validated = self.inner.validated_provider_models.write();
-        if *validated == next {
-            return false;
+        let discovered_changed = {
+            let current = self.inner.discovered_provider_models.read();
+            current.len() != next_discovered.len() || current.keys().ne(next_discovered.keys())
+        };
+        if discovered_changed {
+            *self.inner.discovered_provider_models.write() = next_discovered;
         }
-        *validated = next;
-        true
+        let mut validated = self.inner.validated_provider_models.write();
+        let validated_changed = *validated != next;
+        if validated_changed {
+            *validated = next;
+        }
+        discovered_changed || validated_changed
     }
 
     /// `remote_fetch_enabled` is a parameter so tests can drive the gate
@@ -2297,6 +2357,36 @@ mod tests {
         let (catalog, had_fixed) = filter_fixed_provider_models(raw, &HashSet::new());
         assert!(!had_fixed);
         assert!(catalog.contains_key("acme/model"));
+    }
+
+    #[test]
+    fn discovered_anthropic_model_uses_native_messages_contract() {
+        use crate::auth::provider_registry::{CatalogModel, ProviderId};
+
+        let cfg = config::Config::default();
+        let entry = anthropic_model_entry(
+            &cfg,
+            CatalogModel {
+                id: "anthropic/claude-test".to_owned(),
+                wire_id: "claude-test".to_owned(),
+                provider: ProviderId::Anthropic,
+            },
+        );
+        assert_eq!(entry.info.id.as_deref(), Some("anthropic/claude-test"));
+        assert_eq!(entry.info.model, "claude-test");
+        assert_eq!(entry.info.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(
+            entry.info.api_backend,
+            xai_grok_sampling_types::ApiBackend::Messages
+        );
+        assert_eq!(
+            entry.info.auth_scheme,
+            xai_grok_sampler::config::AuthScheme::XApiKey
+        );
+        assert_eq!(
+            entry.info.extra_headers.get("anthropic-version"),
+            Some(&crate::auth::provider_registry::ANTHROPIC_API_VERSION.to_owned())
+        );
     }
 
     #[test]

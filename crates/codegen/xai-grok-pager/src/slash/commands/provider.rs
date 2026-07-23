@@ -1,4 +1,4 @@
-//! `/provider <xai|openai|openrouter>` -- configure authentication.
+//! `/provider <xai|anthropic|openai|openrouter>` -- configure authentication.
 
 use crate::app::actions::Action;
 use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand};
@@ -15,7 +15,7 @@ impl SlashCommand for ProviderCommand {
     }
 
     fn usage(&self) -> &str {
-        "/provider <xai|openai|openrouter>"
+        "/provider <xai|anthropic|openai|openrouter>"
     }
 
     fn args_required(&self) -> bool {
@@ -25,15 +25,20 @@ impl SlashCommand for ProviderCommand {
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
         match args.trim() {
             "xai" => CommandResult::Action(Action::SelectXaiProvider),
+            "anthropic" => CommandResult::Action(Action::OpenProviderApiKey(
+                xai_grok_shell::auth::provider_registry::ProviderId::Anthropic,
+            )),
             "openai" => CommandResult::Action(Action::OpenProviderApiKey(
                 xai_grok_shell::auth::provider_registry::ProviderId::Openai,
             )),
             "openrouter" => CommandResult::Action(Action::OpenProviderApiKey(
                 xai_grok_shell::auth::provider_registry::ProviderId::Openrouter,
             )),
-            "" => CommandResult::Error("Usage: /provider <xai|openai|openrouter>".to_string()),
+            "" => CommandResult::Error(
+                "Usage: /provider <xai|anthropic|openai|openrouter>".to_string(),
+            ),
             provider => CommandResult::Error(format!(
-                "Unknown provider `{provider}`. Available providers: xai, openai, openrouter"
+                "Unknown provider `{provider}`. Available providers: xai, anthropic, openai, openrouter"
             )),
         }
     }
@@ -94,6 +99,12 @@ mod tests {
             pager_state: crate::settings::PagerLocalSnapshot::default(),
         };
 
+        assert!(matches!(
+            command.run(&mut ctx, "anthropic"),
+            CommandResult::Action(Action::OpenProviderApiKey(
+                xai_grok_shell::auth::provider_registry::ProviderId::Anthropic
+            ))
+        ));
         assert!(matches!(
             command.run(&mut ctx, "openai"),
             CommandResult::Action(Action::OpenProviderApiKey(

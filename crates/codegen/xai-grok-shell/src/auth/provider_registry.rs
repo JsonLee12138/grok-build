@@ -4,7 +4,7 @@
 //! endpoint.  In particular, callers must obtain a [`RequestProjection`] from
 //! the registry instead of combining fields from arbitrary model entries.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -18,18 +18,24 @@ use crate::agent::auth_method::ProviderAuthRequiredError;
 const AUTH_STORE_VERSION: u8 = 2;
 const OPENAI_MODELS_URL: &str = "https://api.openai.com/v1/models";
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models";
+pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
 /// Providers with a fixed, reviewed protocol in the initial registry.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
+    Anthropic,
     Openai,
     Openrouter,
 }
 
 impl ProviderId {
+    pub const ALL: [Self; 3] = [Self::Anthropic, Self::Openai, Self::Openrouter];
+
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Anthropic => "anthropic",
             Self::Openai => "openai",
             Self::Openrouter => "openrouter",
         }
@@ -41,6 +47,7 @@ impl ProviderId {
             return None;
         }
         match provider {
+            "anthropic" => Some(Self::Anthropic),
             "openai" => Some(Self::Openai),
             "openrouter" => Some(Self::Openrouter),
             _ => None,
@@ -223,12 +230,16 @@ pub struct RequestProjection {
     pub provider: ProviderId,
     pub model_id: String,
     pub endpoint: Url,
-    authorization: String,
+    credential_header_name: &'static str,
+    credential_header_value: String,
 }
 
 impl RequestProjection {
-    pub fn authorization(&self) -> &str {
-        &self.authorization
+    pub(crate) fn credential_header(&self) -> (&'static str, &str) {
+        (
+            self.credential_header_name,
+            self.credential_header_value.as_str(),
+        )
     }
 }
 
@@ -271,7 +282,16 @@ impl ProviderAdapterRegistry {
             // only accept their provider-owned wire model identifier.
             model_id: model_id.to_owned(),
             endpoint: Url::parse(endpoint_base(provider)).expect("fixed provider URL"),
-            authorization: format!("Bearer {}", key.expose()),
+            credential_header_name: match provider {
+                ProviderId::Anthropic => "x-api-key",
+                ProviderId::Openai | ProviderId::Openrouter => "authorization",
+            },
+            credential_header_value: match provider {
+                ProviderId::Anthropic => key.expose().to_owned(),
+                ProviderId::Openai | ProviderId::Openrouter => {
+                    format!("Bearer {}", key.expose())
+                }
+            },
         })
     }
 
@@ -362,6 +382,32 @@ impl ProviderAdapterRegistry {
     }
 
     /// Production HTTP transport for fixed Provider model discovery.
+    pub async fn discover_anthropic_http(
+        &mut self,
+        store: &ProviderCredentialStore,
+        client: &reqwest::Client,
+    ) -> Result<Vec<CatalogModel>> {
+        let provider = ProviderId::Anthropic;
+        let key = store
+            .api_key(provider)?
+            .ok_or_else(|| anyhow!("provider credential unavailable"))?;
+        let endpoint = Url::parse(catalog_endpoint(provider)).expect("fixed provider catalog URL");
+        let cache_key = CatalogCacheKey {
+            provider,
+            policy: "unfiltered-v1".to_owned(),
+            key_fingerprint: key.fingerprint(),
+            origin: endpoint.origin().ascii_serialization(),
+        };
+        match fetch_catalog_http(client, provider, &key).await {
+            Ok(models) => {
+                self.cache.insert(cache_key, models.clone());
+                Ok(models)
+            }
+            Err(error) => self.cache.get(&cache_key).cloned().ok_or(error),
+        }
+    }
+
+    /// Production HTTP transport for fixed Provider model discovery.
     pub async fn discover_registered_http(
         &mut self,
         store: &ProviderCredentialStore,
@@ -372,28 +418,9 @@ impl ProviderAdapterRegistry {
         let key = store
             .api_key(provider)?
             .ok_or_else(|| anyhow!("provider credential unavailable"))?;
-        let mut request = self
-            .request_projection(provider, "__catalog__", key.clone())
-            .map_err(|_| anyhow!("provider credential unavailable"))?;
-        request.endpoint =
-            Url::parse(catalog_endpoint(provider)).expect("fixed provider catalog URL");
-        let cache_key = registered_cache_key(provider, &key, &request.endpoint, registered);
-        let response = async {
-            let response = client
-                .get(request.endpoint.clone())
-                .bearer_auth(key.expose())
-                .send()
-                .await
-                .context("requesting provider model catalog")?
-                .error_for_status()
-                .context("provider model catalog returned an error status")?;
-            let value = response
-                .json::<Value>()
-                .await
-                .context("decoding provider model catalog")?;
-            parse_catalog(provider, value)
-        }
-        .await;
+        let endpoint = Url::parse(catalog_endpoint(provider)).expect("fixed provider catalog URL");
+        let cache_key = registered_cache_key(provider, &key, &endpoint, registered);
+        let response = fetch_catalog_http(client, provider, &key).await;
         match response {
             Ok(discovered) => {
                 let discovered_wire_ids: std::collections::HashSet<&str> = discovered
@@ -429,6 +456,98 @@ impl ProviderAdapterRegistry {
     }
 }
 
+async fn fetch_catalog_http(
+    client: &reqwest::Client,
+    provider: ProviderId,
+    key: &ApiKey,
+) -> Result<Vec<CatalogModel>> {
+    let endpoint = Url::parse(catalog_endpoint(provider)).expect("fixed provider catalog URL");
+    fetch_catalog_http_at(client, provider, key, &endpoint).await
+}
+
+async fn fetch_catalog_http_at(
+    client: &reqwest::Client,
+    provider: ProviderId,
+    key: &ApiKey,
+    endpoint: &Url,
+) -> Result<Vec<CatalogModel>> {
+    if provider != ProviderId::Anthropic {
+        let response = client
+            .get(endpoint.clone())
+            .bearer_auth(key.expose())
+            .send()
+            .await
+            .context("requesting provider model catalog")?
+            .error_for_status()
+            .context("provider model catalog returned an error status")?;
+        let value = response
+            .json::<Value>()
+            .await
+            .context("decoding provider model catalog")?;
+        return parse_catalog(provider, value);
+    }
+
+    let mut models = Vec::new();
+    let mut seen_models = HashSet::new();
+    let mut after_id: Option<String> = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let mut request = client
+            .get(endpoint.clone())
+            .header("x-api-key", key.expose())
+            .header("anthropic-version", ANTHROPIC_API_VERSION)
+            .query(&[("limit", "1000")]);
+        if let Some(cursor) = after_id.as_deref() {
+            request = request.query(&[("after_id", cursor)]);
+        }
+        let response = request
+            .send()
+            .await
+            .context("requesting Anthropic model catalog")?
+            .error_for_status()
+            .context("Anthropic model catalog returned an error status")?;
+        let value = response
+            .json::<Value>()
+            .await
+            .context("decoding Anthropic model catalog")?;
+        let (page_models, next_cursor) = parse_anthropic_page(value)?;
+        for model in page_models {
+            if seen_models.insert(model.wire_id.clone()) {
+                models.push(model);
+            }
+        }
+        let Some(cursor) = next_cursor else {
+            after_id = None;
+            break;
+        };
+        if !seen_cursors.insert(cursor.clone()) {
+            bail!("Anthropic catalog repeated pagination cursor");
+        }
+        after_id = Some(cursor);
+    }
+    if after_id.is_some() {
+        bail!("Anthropic catalog exceeded pagination safety limit");
+    }
+    Ok(models)
+}
+
+fn parse_anthropic_page(value: Value) -> Result<(Vec<CatalogModel>, Option<String>)> {
+    let models = parse_catalog(ProviderId::Anthropic, value.clone())?;
+    let has_more = value
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("Anthropic catalog page has no has_more boolean"))?;
+    if !has_more {
+        return Ok((models, None));
+    }
+    let cursor = value
+        .get("last_id")
+        .and_then(Value::as_str)
+        .filter(|cursor| !cursor.is_empty())
+        .ok_or_else(|| anyhow!("Anthropic catalog page has_more without last_id"))?;
+    Ok((models, Some(cursor.to_owned())))
+}
+
 fn registered_cache_key(
     provider: ProviderId,
     key: &ApiKey,
@@ -455,6 +574,7 @@ fn registered_cache_key(
 
 pub(crate) fn endpoint_base(provider: ProviderId) -> &'static str {
     match provider {
+        ProviderId::Anthropic => "https://api.anthropic.com/v1",
         ProviderId::Openai => "https://api.openai.com/v1",
         ProviderId::Openrouter => "https://openrouter.ai/api/v1",
     }
@@ -462,6 +582,7 @@ pub(crate) fn endpoint_base(provider: ProviderId) -> &'static str {
 
 fn catalog_endpoint(provider: ProviderId) -> &'static str {
     match provider {
+        ProviderId::Anthropic => ANTHROPIC_MODELS_URL,
         ProviderId::Openai => OPENAI_MODELS_URL,
         ProviderId::Openrouter => OPENROUTER_MODELS_URL,
     }
@@ -483,7 +604,8 @@ fn parse_catalog(provider: ProviderId, value: Value) -> Result<Vec<CatalogModel>
         .get("data")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("provider catalog has no data array"))?;
-    let mut models = BTreeMap::new();
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
     for model in raw_models {
         let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
         if id.is_empty() {
@@ -492,16 +614,15 @@ fn parse_catalog(provider: ProviderId, value: Value) -> Result<Vec<CatalogModel>
         if provider == ProviderId::Openrouter && !openrouter_model_is_usable(model) {
             continue;
         }
-        models.insert(
-            id.to_owned(),
-            CatalogModel {
+        if seen.insert(id.to_owned()) {
+            models.push(CatalogModel {
                 id: format!("{}/{}", provider.as_str(), id),
                 wire_id: id.to_owned(),
                 provider,
-            },
-        );
+            });
+        }
     }
-    Ok(models.into_values().collect())
+    Ok(models)
 }
 
 fn openrouter_model_is_usable(model: &Value) -> bool {
@@ -781,10 +902,124 @@ mod tests {
         assert_eq!(router.endpoint.as_str(), "https://openrouter.ai/api/v1");
         assert_eq!(openai.model_id, "gpt-4.1");
         assert_eq!(router.model_id, "vendor/model");
-        assert!(openai.authorization().contains("openai-secret"));
-        assert!(!openai.authorization().contains("router-secret"));
-        assert!(router.authorization().contains("router-secret"));
-        assert!(!router.authorization().contains("openai-secret"));
+        assert!(openai.credential_header().1.contains("openai-secret"));
+        assert!(!openai.credential_header().1.contains("router-secret"));
+        assert!(router.credential_header().1.contains("router-secret"));
+        assert!(!router.credential_header().1.contains("openai-secret"));
+    }
+
+    #[test]
+    fn anthropic_projection_uses_fixed_origin_and_x_api_key() {
+        let registry = ProviderAdapterRegistry::default();
+        let request = registry
+            .request_projection(
+                ProviderId::Anthropic,
+                "claude-sonnet",
+                key("anthropic-secret"),
+            )
+            .unwrap();
+        assert_eq!(request.endpoint.as_str(), "https://api.anthropic.com/v1");
+        assert_eq!(request.model_id, "claude-sonnet");
+        assert_eq!(
+            request.credential_header(),
+            ("x-api-key", "anthropic-secret")
+        );
+    }
+
+    #[test]
+    fn anthropic_pagination_uses_last_id_and_rejects_missing_cursor() {
+        let (first, cursor) = parse_anthropic_page(json!({
+            "data": [{"id": "claude-new"}],
+            "has_more": true,
+            "first_id": "claude-new",
+            "last_id": "opaque-cursor"
+        }))
+        .unwrap();
+        assert_eq!(first[0].id, "anthropic/claude-new");
+        assert_eq!(cursor.as_deref(), Some("opaque-cursor"));
+
+        let (last, cursor) = parse_anthropic_page(json!({
+            "data": [{"id": "claude-old"}],
+            "has_more": false,
+            "last_id": "claude-old"
+        }))
+        .unwrap();
+        assert_eq!(last[0].id, "anthropic/claude-old");
+        assert!(cursor.is_none());
+
+        assert!(
+            parse_anthropic_page(json!({"data": [], "has_more": true})).is_err(),
+            "has_more without the official last_id cursor must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_http_catalog_sends_headers_and_walks_official_cursor() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let seen_queries = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen_queries.clone();
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert_eq!(
+                    request
+                        .headers
+                        .get("x-api-key")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("anthropic-secret")
+                );
+                assert_eq!(
+                    request
+                        .headers
+                        .get("anthropic-version")
+                        .and_then(|value| value.to_str().ok()),
+                    Some(ANTHROPIC_API_VERSION)
+                );
+                let query = request.url.query().unwrap_or_default().to_owned();
+                captured.lock().unwrap().push(query.clone());
+                if query.contains("after_id=page-one-cursor") {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "data": [{"id": "claude-old"}],
+                        "has_more": false,
+                        "last_id": "claude-old"
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "data": [{"id": "claude-new"}],
+                        "has_more": true,
+                        "last_id": "page-one-cursor"
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let endpoint = Url::parse(&format!("{}/v1/models", server.uri())).unwrap();
+        let models = fetch_catalog_http_at(
+            &reqwest::Client::new(),
+            ProviderId::Anthropic,
+            &key("anthropic-secret"),
+            &endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["anthropic/claude-new", "anthropic/claude-old"]
+        );
+        let queries = seen_queries.lock().unwrap();
+        assert_eq!(queries.len(), 2);
+        assert!(queries[0].contains("limit=1000"));
+        assert!(!queries[0].contains("after_id"));
+        assert!(queries[1].contains("after_id=page-one-cursor"));
     }
 
     #[test]
@@ -809,6 +1044,36 @@ mod tests {
         assert_eq!(credentials.api_key.as_deref(), Some("stored-openai-secret"));
         assert_eq!(credentials.base_url, "https://api.openai.com/v1");
         assert_eq!(credentials.auth_type, xai_chat_state::AuthType::ApiKey);
+    }
+
+    #[test]
+    fn anthropic_sampling_credentials_use_x_api_key_and_fixed_origin() {
+        let directory = tempfile::tempdir().unwrap();
+        ProviderCredentialStore::new(directory.path())
+            .store_api_key(ProviderId::Anthropic, key("stored-anthropic-secret"))
+            .unwrap();
+        let mut info = crate::agent::config::ModelInfo::fallback("claude-test");
+        info.id = Some("anthropic/claude-test".to_owned());
+        info.base_url = "https://attacker.invalid/v1".to_owned();
+        let model = crate::agent::config::ModelEntry {
+            info,
+            api_key: Some("config-secret".to_owned()),
+            env_key: None,
+            api_base_url: Some("https://attacker.invalid/v1".to_owned()),
+        };
+
+        let credentials =
+            crate::agent::config::resolve_fixed_provider_credentials_at(&model, directory.path())
+                .unwrap();
+        assert_eq!(
+            credentials.api_key.as_deref(),
+            Some("stored-anthropic-secret")
+        );
+        assert_eq!(credentials.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(
+            credentials.auth_scheme,
+            xai_grok_sampler::config::AuthScheme::XApiKey
+        );
     }
 
     #[test]
@@ -961,6 +1226,37 @@ mod tests {
                 .unwrap()[0]
                 .id,
             "openrouter/vendor/model"
+        );
+    }
+
+    #[test]
+    fn anthropic_failure_preserves_only_anthropic_cache() {
+        let mut registry = ProviderAdapterRegistry::default();
+        let anthropic_key = key("anthropic-secret");
+        let openai_key = key("openai-secret");
+        registry
+            .discover_with(ProviderId::Anthropic, anthropic_key.clone(), |_| {
+                Ok(json!({"data":[{"id":"claude-test"}]}))
+            })
+            .unwrap();
+        registry
+            .discover_with(ProviderId::Openai, openai_key.clone(), |_| {
+                Ok(json!({"data":[{"id":"gpt-test"}]}))
+            })
+            .unwrap();
+
+        let preserved = registry
+            .discover_with(ProviderId::Anthropic, anthropic_key.clone(), |_| {
+                Err(anyhow!("anthropic offline"))
+            })
+            .unwrap();
+        assert_eq!(preserved[0].id, "anthropic/claude-test");
+        assert_eq!(
+            registry
+                .cached_models(ProviderId::Openai, &openai_key)
+                .unwrap()[0]
+                .id,
+            "openai/gpt-test"
         );
     }
 }

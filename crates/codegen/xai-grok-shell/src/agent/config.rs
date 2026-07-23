@@ -3962,6 +3962,30 @@ impl ConfigModelOverride {
         if self.supported_in_api.is_none() && (self.api_key.is_some() || self.env_key.is_some()) {
             entry.info.supported_in_api = true;
         }
+        if self.provider.is_some()
+            && let Some(provider) =
+                crate::auth::provider_registry::ProviderId::from_canonical_model(key)
+        {
+            entry.info.extra_headers.retain(|name, _| {
+                !name.eq_ignore_ascii_case("authorization")
+                    && !name.eq_ignore_ascii_case("x-api-key")
+            });
+            if provider == crate::auth::provider_registry::ProviderId::Anthropic {
+                entry.info.base_url =
+                    crate::auth::provider_registry::endpoint_base(provider).to_owned();
+                entry.api_base_url = None;
+                entry.info.api_backend = ApiBackend::Messages;
+                entry.info.auth_scheme = AuthScheme::XApiKey;
+                entry
+                    .info
+                    .extra_headers
+                    .retain(|name, _| !name.eq_ignore_ascii_case("anthropic-version"));
+                entry.info.extra_headers.insert(
+                    "anthropic-version".to_owned(),
+                    crate::auth::provider_registry::ANTHROPIC_API_VERSION.to_owned(),
+                );
+            }
+        }
         entry
     }
 }
@@ -4628,7 +4652,11 @@ pub(crate) fn resolve_fixed_provider_credentials_at(
         api_key,
         base_url: crate::auth::provider_registry::endpoint_base(provider).to_owned(),
         auth_type: xai_chat_state::AuthType::ApiKey,
-        auth_scheme: AuthScheme::Bearer,
+        auth_scheme: match provider {
+            crate::auth::provider_registry::ProviderId::Anthropic => AuthScheme::XApiKey,
+            crate::auth::provider_registry::ProviderId::Openai
+            | crate::auth::provider_registry::ProviderId::Openrouter => AuthScheme::Bearer,
+        },
     })
 }
 /// `disable_api_key_auth` at the credential seam: swap a first-party xAI API
@@ -8450,6 +8478,38 @@ reasoning_effort = "low"
             resolve_model_reference(&catalog, &cfg.model_aliases, "acme/demo-v1").is_none(),
             "the rejected catalog key must not resolve"
         );
+    }
+
+    #[test]
+    fn anthropic_adapter_forces_native_messages_protocol_and_fixed_origin() {
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.anthropic]
+            base_url = "https://attacker.invalid/v1"
+            api_backend = "responses"
+            auth_scheme = "bearer"
+            extra_headers = { Authorization = "Bearer wrong", "X-Api-Key" = "wrong", "Anthropic-Version" = "wrong" }
+
+            [model."anthropic/claude-test"]
+            provider = "anthropic"
+            model = "claude-test"
+            "#,
+            None,
+        );
+        let entry = catalog
+            .get("anthropic/claude-test")
+            .expect("Anthropic model should remain selectable after protocol normalization");
+        assert_eq!(entry.info.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(
+            entry.info.api_backend,
+            xai_grok_sampling_types::ApiBackend::Messages
+        );
+        assert_eq!(entry.info.auth_scheme, AuthScheme::XApiKey);
+        assert_eq!(
+            entry.info.extra_headers.get("anthropic-version"),
+            Some(&crate::auth::provider_registry::ANTHROPIC_API_VERSION.to_owned())
+        );
+        assert_eq!(entry.info.extra_headers.len(), 1);
     }
 
     #[test]

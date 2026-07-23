@@ -626,6 +626,9 @@ impl ActiveModal {
     pub fn message(&self, drain_blocked: bool) -> &str {
         match self {
             ActiveModal::ProviderApiKey { provider, .. } => match provider {
+                xai_grok_shell::auth::provider_registry::ProviderId::Anthropic => {
+                    "Anthropic API key"
+                }
                 xai_grok_shell::auth::provider_registry::ProviderId::Openai => "OpenAI API key",
                 xai_grok_shell::auth::provider_registry::ProviderId::Openrouter => {
                     "OpenRouter API key"

@@ -13708,6 +13708,7 @@ dependencies = [
  "walkdir",
  "webbrowser",
  "windows 0.61.3",
+ "wiremock",
  "xai-acp-lib",
  "xai-agent-lifecycle",
  "xai-chat-state",

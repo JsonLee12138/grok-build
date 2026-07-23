@@ -1663,6 +1663,9 @@ impl AgentView {
             } = active_modal
             {
                 let title = match provider {
+                    xai_grok_shell::auth::provider_registry::ProviderId::Anthropic => {
+                        "Anthropic API key"
+                    }
                     xai_grok_shell::auth::provider_registry::ProviderId::Openai => "OpenAI API key",
                     xai_grok_shell::auth::provider_registry::ProviderId::Openrouter => {
                         "OpenRouter API key"

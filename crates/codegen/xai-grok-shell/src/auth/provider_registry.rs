@@ -19,6 +19,7 @@ const AUTH_STORE_VERSION: u8 = 2;
 const OPENAI_MODELS_URL: &str = "https://api.openai.com/v1/models";
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models";
+const GEMINI_MODELS_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
 /// Providers with a fixed, reviewed protocol in the initial registry.
@@ -26,16 +27,23 @@ pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
     Anthropic,
+    Gemini,
     Openai,
     Openrouter,
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 3] = [Self::Anthropic, Self::Openai, Self::Openrouter];
+    pub const ALL: [Self; 4] = [
+        Self::Anthropic,
+        Self::Gemini,
+        Self::Openai,
+        Self::Openrouter,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
             Self::Openai => "openai",
             Self::Openrouter => "openrouter",
         }
@@ -48,6 +56,7 @@ impl ProviderId {
         }
         match provider {
             "anthropic" => Some(Self::Anthropic),
+            "gemini" => Some(Self::Gemini),
             "openai" => Some(Self::Openai),
             "openrouter" => Some(Self::Openrouter),
             _ => None,
@@ -284,10 +293,11 @@ impl ProviderAdapterRegistry {
             endpoint: Url::parse(endpoint_base(provider)).expect("fixed provider URL"),
             credential_header_name: match provider {
                 ProviderId::Anthropic => "x-api-key",
+                ProviderId::Gemini => "x-goog-api-key",
                 ProviderId::Openai | ProviderId::Openrouter => "authorization",
             },
             credential_header_value: match provider {
-                ProviderId::Anthropic => key.expose().to_owned(),
+                ProviderId::Anthropic | ProviderId::Gemini => key.expose().to_owned(),
                 ProviderId::Openai | ProviderId::Openrouter => {
                     format!("Bearer {}", key.expose())
                 }
@@ -407,6 +417,31 @@ impl ProviderAdapterRegistry {
         }
     }
 
+    pub async fn discover_gemini_http(
+        &mut self,
+        store: &ProviderCredentialStore,
+        client: &reqwest::Client,
+    ) -> Result<Vec<CatalogModel>> {
+        let provider = ProviderId::Gemini;
+        let key = store
+            .api_key(provider)?
+            .ok_or_else(|| anyhow!("provider credential unavailable"))?;
+        let endpoint = Url::parse(catalog_endpoint(provider)).expect("fixed provider catalog URL");
+        let cache_key = CatalogCacheKey {
+            provider,
+            policy: "generate-content-v1beta".to_owned(),
+            key_fingerprint: key.fingerprint(),
+            origin: endpoint.origin().ascii_serialization(),
+        };
+        match fetch_catalog_http(client, provider, &key).await {
+            Ok(models) => {
+                self.cache.insert(cache_key, models.clone());
+                Ok(models)
+            }
+            Err(error) => self.cache.get(&cache_key).cloned().ok_or(error),
+        }
+    }
+
     /// Production HTTP transport for fixed Provider model discovery.
     pub async fn discover_registered_http(
         &mut self,
@@ -471,6 +506,9 @@ async fn fetch_catalog_http_at(
     key: &ApiKey,
     endpoint: &Url,
 ) -> Result<Vec<CatalogModel>> {
+    if provider == ProviderId::Gemini {
+        return fetch_gemini_catalog_http_at(client, key, endpoint).await;
+    }
     if provider != ProviderId::Anthropic {
         let response = client
             .get(endpoint.clone())
@@ -531,6 +569,96 @@ async fn fetch_catalog_http_at(
     Ok(models)
 }
 
+async fn fetch_gemini_catalog_http_at(
+    client: &reqwest::Client,
+    key: &ApiKey,
+    endpoint: &Url,
+) -> Result<Vec<CatalogModel>> {
+    let mut models = Vec::new();
+    let mut seen_models = HashSet::new();
+    let mut page_token: Option<String> = None;
+    let mut seen_tokens = HashSet::new();
+    for _ in 0..100 {
+        let mut request = client
+            .get(endpoint.clone())
+            .header("x-goog-api-key", key.expose())
+            .query(&[("pageSize", "1000")]);
+        if let Some(token) = page_token.as_deref() {
+            request = request.query(&[("pageToken", token)]);
+        }
+        let value = request
+            .send()
+            .await
+            .context("requesting Gemini model catalog")?
+            .error_for_status()
+            .context("Gemini model catalog returned an error status")?
+            .json::<Value>()
+            .await
+            .context("decoding Gemini model catalog")?;
+        let (page_models, next_token) = parse_gemini_page(value)?;
+        for model in page_models {
+            if seen_models.insert(model.wire_id.clone()) {
+                models.push(model);
+            }
+        }
+        let Some(token) = next_token else {
+            page_token = None;
+            break;
+        };
+        if !seen_tokens.insert(token.clone()) {
+            bail!("Gemini catalog repeated pagination token");
+        }
+        page_token = Some(token);
+    }
+    if page_token.is_some() {
+        bail!("Gemini catalog exceeded pagination safety limit");
+    }
+    Ok(models)
+}
+
+fn parse_gemini_page(value: Value) -> Result<(Vec<CatalogModel>, Option<String>)> {
+    let raw_models = value
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Gemini catalog has no models array"))?;
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for model in raw_models {
+        let supports_generate = model
+            .get("supportedGenerationMethods")
+            .and_then(Value::as_array)
+            .is_some_and(|methods| {
+                methods
+                    .iter()
+                    .any(|method| method.as_str() == Some("generateContent"))
+            });
+        if !supports_generate {
+            continue;
+        }
+        let Some(wire_id) = model
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| name.strip_prefix("models/"))
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        if seen.insert(wire_id.to_owned()) {
+            models.push(CatalogModel {
+                id: format!("gemini/{wire_id}"),
+                wire_id: wire_id.to_owned(),
+                provider: ProviderId::Gemini,
+            });
+        }
+    }
+    let next = value
+        .get("nextPageToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned);
+    Ok((models, next))
+}
+
 fn parse_anthropic_page(value: Value) -> Result<(Vec<CatalogModel>, Option<String>)> {
     let models = parse_catalog(ProviderId::Anthropic, value.clone())?;
     let has_more = value
@@ -575,6 +703,7 @@ fn registered_cache_key(
 pub(crate) fn endpoint_base(provider: ProviderId) -> &'static str {
     match provider {
         ProviderId::Anthropic => "https://api.anthropic.com/v1",
+        ProviderId::Gemini => "https://generativelanguage.googleapis.com/v1beta",
         ProviderId::Openai => "https://api.openai.com/v1",
         ProviderId::Openrouter => "https://openrouter.ai/api/v1",
     }
@@ -583,6 +712,7 @@ pub(crate) fn endpoint_base(provider: ProviderId) -> &'static str {
 fn catalog_endpoint(provider: ProviderId) -> &'static str {
     match provider {
         ProviderId::Anthropic => ANTHROPIC_MODELS_URL,
+        ProviderId::Gemini => GEMINI_MODELS_URL,
         ProviderId::Openai => OPENAI_MODELS_URL,
         ProviderId::Openrouter => OPENROUTER_MODELS_URL,
     }
@@ -1258,5 +1388,80 @@ mod tests {
                 .id,
             "openai/gpt-test"
         );
+    }
+
+    #[test]
+    fn gemini_catalog_strips_resource_prefix_and_filters_generation_method() {
+        let (models, next) = parse_gemini_page(json!({
+            "models": [
+                {"name": "models/gemini-test", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/embed-test", "supportedGenerationMethods": ["embedContent"]},
+                {"name": "bad-prefix", "supportedGenerationMethods": ["generateContent"]}
+            ],
+            "nextPageToken": "opaque-token"
+        }))
+        .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gemini/gemini-test");
+        assert_eq!(models[0].wire_id, "gemini-test");
+        assert_eq!(next.as_deref(), Some("opaque-token"));
+    }
+
+    #[tokio::test]
+    async fn gemini_http_catalog_sends_key_and_walks_page_token() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let captured = queries.clone();
+        Mock::given(method("GET"))
+            .and(path("/v1beta/models"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert_eq!(
+                    request
+                        .headers
+                        .get("x-goog-api-key")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("gemini-secret")
+                );
+                let query = request.url.query().unwrap_or_default().to_owned();
+                captured.lock().unwrap().push(query.clone());
+                if query.contains("pageToken=page-one") {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "models": [{
+                            "name": "models/gemini-old",
+                            "supportedGenerationMethods": ["generateContent"]
+                        }]
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "models": [{
+                            "name": "models/gemini-new",
+                            "supportedGenerationMethods": ["generateContent"]
+                        }],
+                        "nextPageToken": "page-one"
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let endpoint = Url::parse(&format!("{}/v1beta/models", server.uri())).unwrap();
+        let models =
+            fetch_gemini_catalog_http_at(&reqwest::Client::new(), &key("gemini-secret"), &endpoint)
+                .await
+                .unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gemini/gemini-new", "gemini/gemini-old"]
+        );
+        let queries = queries.lock().unwrap();
+        assert!(queries[0].contains("pageSize=1000"));
+        assert!(queries[1].contains("pageToken=page-one"));
     }
 }

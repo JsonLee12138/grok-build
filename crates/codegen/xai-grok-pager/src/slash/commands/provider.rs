@@ -1,4 +1,4 @@
-//! `/provider <xai|anthropic|openai|openrouter>` -- configure authentication.
+//! `/provider <xai|anthropic|gemini|openai|openrouter>` -- configure authentication.
 
 use crate::app::actions::Action;
 use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand};
@@ -15,7 +15,7 @@ impl SlashCommand for ProviderCommand {
     }
 
     fn usage(&self) -> &str {
-        "/provider <xai|anthropic|openai|openrouter>"
+        "/provider <xai|anthropic|gemini|openai|openrouter>"
     }
 
     fn args_required(&self) -> bool {
@@ -28,6 +28,9 @@ impl SlashCommand for ProviderCommand {
             "anthropic" => CommandResult::Action(Action::OpenProviderApiKey(
                 xai_grok_shell::auth::provider_registry::ProviderId::Anthropic,
             )),
+            "gemini" => CommandResult::Action(Action::OpenProviderApiKey(
+                xai_grok_shell::auth::provider_registry::ProviderId::Gemini,
+            )),
             "openai" => CommandResult::Action(Action::OpenProviderApiKey(
                 xai_grok_shell::auth::provider_registry::ProviderId::Openai,
             )),
@@ -35,10 +38,10 @@ impl SlashCommand for ProviderCommand {
                 xai_grok_shell::auth::provider_registry::ProviderId::Openrouter,
             )),
             "" => CommandResult::Error(
-                "Usage: /provider <xai|anthropic|openai|openrouter>".to_string(),
+                "Usage: /provider <xai|anthropic|gemini|openai|openrouter>".to_string(),
             ),
             provider => CommandResult::Error(format!(
-                "Unknown provider `{provider}`. Available providers: xai, anthropic, openai, openrouter"
+                "Unknown provider `{provider}`. Available providers: xai, anthropic, gemini, openai, openrouter"
             )),
         }
     }
@@ -61,6 +64,12 @@ mod tests {
             pager_state: crate::settings::PagerLocalSnapshot::default(),
         };
 
+        assert!(matches!(
+            command.run(&mut ctx, "gemini"),
+            CommandResult::Action(Action::OpenProviderApiKey(
+                xai_grok_shell::auth::provider_registry::ProviderId::Gemini
+            ))
+        ));
         assert!(matches!(
             command.run(&mut ctx, "xai"),
             CommandResult::Action(Action::SelectXaiProvider)

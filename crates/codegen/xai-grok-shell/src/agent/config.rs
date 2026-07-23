@@ -3969,6 +3969,7 @@ impl ConfigModelOverride {
             entry.info.extra_headers.retain(|name, _| {
                 !name.eq_ignore_ascii_case("authorization")
                     && !name.eq_ignore_ascii_case("x-api-key")
+                    && !name.eq_ignore_ascii_case("x-goog-api-key")
             });
             if provider == crate::auth::provider_registry::ProviderId::Anthropic {
                 entry.info.base_url =
@@ -3984,6 +3985,12 @@ impl ConfigModelOverride {
                     "anthropic-version".to_owned(),
                     crate::auth::provider_registry::ANTHROPIC_API_VERSION.to_owned(),
                 );
+            } else if provider == crate::auth::provider_registry::ProviderId::Gemini {
+                entry.info.base_url =
+                    crate::auth::provider_registry::endpoint_base(provider).to_owned();
+                entry.api_base_url = None;
+                entry.info.api_backend = ApiBackend::GeminiGenerateContent;
+                entry.info.auth_scheme = AuthScheme::XGoogApiKey;
             }
         }
         entry
@@ -4654,6 +4661,7 @@ pub(crate) fn resolve_fixed_provider_credentials_at(
         auth_type: xai_chat_state::AuthType::ApiKey,
         auth_scheme: match provider {
             crate::auth::provider_registry::ProviderId::Anthropic => AuthScheme::XApiKey,
+            crate::auth::provider_registry::ProviderId::Gemini => AuthScheme::XGoogApiKey,
             crate::auth::provider_registry::ProviderId::Openai
             | crate::auth::provider_registry::ProviderId::Openrouter => AuthScheme::Bearer,
         },
@@ -7674,6 +7682,7 @@ reasoning_effort = "low"
                 ApiBackend::ChatCompletions => "chat_completions",
                 ApiBackend::Responses => "responses",
                 ApiBackend::Messages => "messages",
+                ApiBackend::GeminiGenerateContent => "gemini_generate_content",
             }
         }
 
@@ -7681,6 +7690,7 @@ reasoning_effort = "low"
             ("chat_completions", ApiBackend::ChatCompletions),
             ("messages", ApiBackend::Messages),
             ("responses", ApiBackend::Responses),
+            ("gemini_generate_content", ApiBackend::GeminiGenerateContent),
         ];
         for (configured, expected) in cases {
             let (_, catalog) = resolve_models_from_toml(
@@ -8510,6 +8520,32 @@ reasoning_effort = "low"
             Some(&crate::auth::provider_registry::ANTHROPIC_API_VERSION.to_owned())
         );
         assert_eq!(entry.info.extra_headers.len(), 1);
+    }
+
+    #[test]
+    fn gemini_adapter_forces_native_protocol_and_fixed_origin() {
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.gemini]
+            base_url = "https://attacker.invalid/v1"
+            api_backend = "responses"
+            auth_scheme = "bearer"
+            extra_headers = { Authorization = "Bearer wrong", "X-Api-Key" = "wrong" }
+
+            [model."gemini/gemini-test"]
+            provider = "gemini"
+            model = "gemini-test"
+            "#,
+            None,
+        );
+        let entry = catalog.get("gemini/gemini-test").unwrap();
+        assert_eq!(
+            entry.info.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(entry.info.api_backend, ApiBackend::GeminiGenerateContent);
+        assert_eq!(entry.info.auth_scheme, AuthScheme::XGoogApiKey);
+        assert!(entry.info.extra_headers.is_empty());
     }
 
     #[test]

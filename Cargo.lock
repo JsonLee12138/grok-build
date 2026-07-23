@@ -13535,6 +13535,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "wiremock",
  "xai-grok-sampling-types",
  "xai-grok-test-support",
  "xai-grok-version",

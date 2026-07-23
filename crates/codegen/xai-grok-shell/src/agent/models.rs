@@ -228,6 +228,23 @@ fn anthropic_model_entry(
     entry
 }
 
+fn gemini_model_entry(
+    cfg: &config::Config,
+    model: crate::auth::provider_registry::CatalogModel,
+) -> ModelEntry {
+    let mut entry = ModelEntry::fallback(&model.wire_id, &cfg.endpoints);
+    entry.info.id = Some(model.id);
+    entry.info.model = model.wire_id;
+    entry.info.base_url = crate::auth::provider_registry::endpoint_base(
+        crate::auth::provider_registry::ProviderId::Gemini,
+    )
+    .to_owned();
+    entry.info.api_backend = xai_grok_sampling_types::ApiBackend::GeminiGenerateContent;
+    entry.info.auth_scheme = xai_grok_sampler::config::AuthScheme::XGoogApiKey;
+    entry.info.supported_in_api = true;
+    entry
+}
+
 impl Default for ModelsManager {
     fn default() -> Self {
         let grok_home = crate::util::grok_home::grok_home();
@@ -1262,16 +1279,20 @@ impl ModelsManager {
                 next_discovered.retain(|model, _| !model.starts_with(&provider_prefix));
                 continue;
             }
-            if provider != ProviderId::Anthropic && provider_registered.is_empty() {
+            if matches!(provider, ProviderId::Openai | ProviderId::Openrouter)
+                && provider_registered.is_empty()
+            {
                 next.retain(|model| !model.starts_with(&provider_prefix));
                 continue;
             }
-            let discovery = if provider == ProviderId::Anthropic {
-                registry.discover_anthropic_http(&store, &client).await
-            } else {
-                registry
-                    .discover_registered_http(&store, provider, &provider_registered, &client)
-                    .await
+            let discovery = match provider {
+                ProviderId::Anthropic => registry.discover_anthropic_http(&store, &client).await,
+                ProviderId::Gemini => registry.discover_gemini_http(&store, &client).await,
+                ProviderId::Openai | ProviderId::Openrouter => {
+                    registry
+                        .discover_registered_http(&store, provider, &provider_registered, &client)
+                        .await
+                }
             };
             match discovery {
                 Ok(models) => {
@@ -1282,6 +1303,9 @@ impl ModelsManager {
                         if provider == ProviderId::Anthropic {
                             let id = model.id.clone();
                             next_discovered.insert(id, anthropic_model_entry(cfg, model));
+                        } else if provider == ProviderId::Gemini {
+                            let id = model.id.clone();
+                            next_discovered.insert(id, gemini_model_entry(cfg, model));
                         }
                     }
                 }
@@ -2386,6 +2410,33 @@ mod tests {
         assert_eq!(
             entry.info.extra_headers.get("anthropic-version"),
             Some(&crate::auth::provider_registry::ANTHROPIC_API_VERSION.to_owned())
+        );
+    }
+
+    #[test]
+    fn discovered_gemini_model_uses_native_generate_content_contract() {
+        use crate::auth::provider_registry::{CatalogModel, ProviderId};
+
+        let entry = gemini_model_entry(
+            &config::Config::default(),
+            CatalogModel {
+                id: "gemini/gemini-test".to_owned(),
+                wire_id: "gemini-test".to_owned(),
+                provider: ProviderId::Gemini,
+            },
+        );
+        assert_eq!(entry.info.model, "gemini-test");
+        assert_eq!(
+            entry.info.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(
+            entry.info.api_backend,
+            xai_grok_sampling_types::ApiBackend::GeminiGenerateContent
+        );
+        assert_eq!(
+            entry.info.auth_scheme,
+            xai_grok_sampler::config::AuthScheme::XGoogApiKey
         );
     }
 

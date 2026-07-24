@@ -371,9 +371,7 @@ impl ModelsManager {
 
         // Validate only against a real catalog; a bundled-only first run defers
         // to the async fetch (`apply_refresh_result`).
-        if has_prefetched && !catalog.is_empty() {
-            validate_selectable(cfg, &catalog)?;
-        } else if has_prefetched && !had_fixed_provider_models {
+        if has_prefetched && (!catalog.is_empty() || !had_fixed_provider_models) {
             validate_selectable(cfg, &catalog)?;
         }
 

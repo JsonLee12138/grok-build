@@ -49,8 +49,9 @@ use super::transcript::{
 };
 use super::turn::handle_bg_task_killed;
 use crate::app::actions::{
-    ClipboardPasteCompletion, ClipboardPasteContext, ClipboardPasteFailure, ClipboardPasteTarget,
-    Effect, ProbedAttachment, SubagentKillOutcome, TaskResult,
+    Action, ClipboardPasteCompletion, ClipboardPasteContext, ClipboardPasteFailure,
+    ClipboardPasteTarget, Effect, ProbedAttachment, ProviderMethodChoice, SubagentKillOutcome,
+    TaskResult,
 };
 use crate::app::app_view::{ActiveView, AppView, AuthState};
 use crate::scrollback::block::RenderBlock;
@@ -171,6 +172,16 @@ fn drain_clipboard_target(target: &ClipboardPasteTarget, app: &mut AppView) -> V
 /// Handle a completed async task result.
 pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec<Effect> {
     match result {
+        TaskResult::ProviderMethodsLoaded {
+            methods,
+            selected_method_id,
+            confirmed,
+        } => apply_provider_methods(methods, selected_method_id, confirmed, app),
+        TaskResult::ProviderMethodsLoadFailed { error } => {
+            tracing::warn!(error = %error, "Provider method catalog failed");
+            app.show_toast("Couldn't load Provider methods");
+            vec![]
+        }
         TaskResult::ProviderApiKeyStored { provider } => {
             app.show_toast(&format!("{provider} API key saved"));
             vec![]
@@ -1077,4 +1088,103 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             vec![]
         }
     }
+}
+
+fn apply_provider_methods(
+    methods: Vec<ProviderMethodChoice>,
+    selected_method_id: Option<String>,
+    confirmed: bool,
+    app: &mut AppView,
+) -> Vec<Effect> {
+    let Some(method_id) = selected_method_id else {
+        let items = methods
+            .into_iter()
+            .map(|method| {
+                let description = format!(
+                    "{} · {} · {}{}",
+                    method.provider,
+                    method.stability,
+                    method.availability,
+                    if method.requires_confirmation {
+                        " · requires explicit confirmation"
+                    } else {
+                        ""
+                    }
+                );
+                crate::slash::command::ArgItem {
+                    display: method.provider,
+                    match_text: format!("{} {} {}", method.id, description, method.availability),
+                    insert_text: format!("method:{}", method.id),
+                    description,
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Some(agent) = get_active_agent_mut(app) {
+            agent.active_modal = Some(crate::views::modal::ActiveModal::ArgPicker {
+                command: "provider".to_owned(),
+                args_query: String::new(),
+                items: items.clone(),
+                original_items: items,
+                state: crate::views::picker::PickerState::input_active(),
+                previous_palette: None,
+                window: crate::views::modal_window::ModalWindowState::new(),
+            });
+        }
+        return vec![];
+    };
+
+    let Some(method) = methods.into_iter().find(|method| method.id == method_id) else {
+        app.show_toast("Provider method is disabled by its release gate");
+        return vec![];
+    };
+    if method.availability != "available" {
+        app.show_toast(&format!("{} is {}", method.provider, method.availability));
+        return vec![];
+    }
+    if method.requires_confirmation && !confirmed {
+        let disclaimer = format!(
+            "{} is experimental and may rely on an external CLI-owned OAuth session. Grok Build will not copy that CLI's private credentials.",
+            method.provider
+        );
+        let items = vec![
+            crate::slash::command::ArgItem {
+                display: "Accept experimental integration".to_owned(),
+                match_text: "accept confirm experimental".to_owned(),
+                insert_text: format!("confirm:{}", method.id),
+                description: disclaimer,
+            },
+            crate::slash::command::ArgItem {
+                display: "Cancel".to_owned(),
+                match_text: "cancel".to_owned(),
+                insert_text: "cancel".to_owned(),
+                description: "Keep the current Provider configuration".to_owned(),
+            },
+        ];
+        if let Some(agent) = get_active_agent_mut(app) {
+            agent.active_modal = Some(crate::views::modal::ActiveModal::ArgPicker {
+                command: "provider".to_owned(),
+                args_query: String::new(),
+                items: items.clone(),
+                original_items: items,
+                state: crate::views::picker::PickerState::input_active(),
+                previous_palette: None,
+                window: crate::views::modal_window::ModalWindowState::new(),
+            });
+        }
+        return vec![];
+    }
+
+    let action = match method.id.as_str() {
+        "xai_session" => Action::SelectXaiProvider,
+        "openai_api_key" => Action::OpenProviderApiKey("openai".to_owned()),
+        "anthropic_api_key" => Action::OpenProviderApiKey("anthropic".to_owned()),
+        "gemini_api_key" => Action::OpenProviderApiKey("gemini".to_owned()),
+        "openrouter_api_key" => Action::OpenProviderApiKey("openrouter".to_owned()),
+        "gemini_oauth" => Action::StartGeminiOAuth,
+        _ => {
+            app.show_toast("Provider method is gated but has no executable adapter");
+            return vec![];
+        }
+    };
+    dispatch(action, app)
 }

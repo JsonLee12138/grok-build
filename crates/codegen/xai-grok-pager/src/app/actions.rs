@@ -605,6 +605,13 @@ pub enum Action {
     SelectXaiProvider,
     /// Open a masked API-key prompt for a fixed Provider adapter.
     OpenProviderApiKey(String),
+    /// Load the shell-owned, gate-aware Provider authentication methods.
+    LoadProviderMethods,
+    /// Revalidate and select a shell-owned Provider authentication method.
+    SelectProviderMethod {
+        method_id: String,
+        confirmed: bool,
+    },
     /// Start Gemini's user-owned OAuth client flow in the system browser.
     StartGeminiOAuth,
     /// Persist a Provider API key through the agent extension boundary.
@@ -1679,6 +1686,11 @@ pub enum Effect {
     },
     /// Run the Gemini OAuth loopback flow through the shell extension boundary.
     StartGeminiOAuth,
+    /// Fetch and optionally resolve the shell-owned Provider method catalog.
+    LoadProviderMethods {
+        selected_method_id: Option<String>,
+        confirmed: bool,
+    },
     /// Fetch MCP server list from the shell (x.ai/mcp/list).
     FetchMcpsList {
         agent_id: AgentId,
@@ -2067,6 +2079,14 @@ pub enum SubagentKillOutcome {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    ProviderMethodsLoaded {
+        methods: Vec<ProviderMethodChoice>,
+        selected_method_id: Option<String>,
+        confirmed: bool,
+    },
+    ProviderMethodsLoadFailed {
+        error: String,
+    },
     /// Provider API key was stored and its catalog refresh completed.
     ProviderApiKeyStored {
         provider: String,
@@ -2731,6 +2751,16 @@ pub enum TaskResult {
     },
     /// Shared prompt-image preview state was resolved off-thread.
     PromptImagePreviewPrepared,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderMethodChoice {
+    pub id: String,
+    pub provider: String,
+    pub stability: String,
+    pub availability: String,
+    pub requires_confirmation: bool,
 }
 #[cfg(test)]
 mod tests {

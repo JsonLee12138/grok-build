@@ -2065,6 +2065,42 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::LoadProviderMethods {
+            selected_method_id,
+            confirmed,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                #[derive(serde::Deserialize)]
+                struct Response {
+                    methods: Vec<actions::ProviderMethodChoice>,
+                }
+
+                let params = serde_json::json!({});
+                let request = acp::ExtRequest::new(
+                    "x.ai/provider/methods",
+                    serde_json::value::to_raw_value(&params)
+                        .expect("serialize Provider method params")
+                        .into(),
+                );
+                let result = async {
+                    let response = acp_send(request, &tx).await?;
+                    serde_json::from_str::<Response>(response.0.get())
+                        .map_err(|error| acp::Error::internal_error().data(error.to_string()))
+                }
+                .await;
+                match result {
+                    Ok(response) => TaskResult::ProviderMethodsLoaded {
+                        methods: response.methods,
+                        selected_method_id,
+                        confirmed,
+                    },
+                    Err(error) => TaskResult::ProviderMethodsLoadFailed {
+                        error: error.to_string(),
+                    },
+                }
+            });
+        }
         Effect::SetProviderApiKey { provider, key } => {
             let tx = acp_tx.clone();
             tasks.spawn(async move {

@@ -86,6 +86,13 @@ pub fn provider_auth_methods(
 ) -> Vec<ProviderAuthMethod> {
     let mut methods = vec![
         ProviderAuthMethod {
+            id: "xai_session",
+            provider: "xai",
+            stability: AdapterStability::Stable,
+            availability: AdapterAvailability::Available,
+            requires_confirmation: false,
+        },
+        ProviderAuthMethod {
             id: "openai_api_key",
             provider: "openai",
             stability: AdapterStability::Stable,
@@ -1599,6 +1606,26 @@ mod tests {
                 .any(|method| method.id == "openai_api_key"),
             "experimental compatibility must retain the stable API-key fallback"
         );
+    }
+
+    #[test]
+    fn stable_method_catalog_includes_xai_and_api_key_fallbacks() {
+        let methods = provider_auth_methods(ProviderReleaseGates::default(), false, false);
+        let ids: HashSet<_> = methods.iter().map(|method| method.id).collect();
+        assert_eq!(
+            ids,
+            HashSet::from([
+                "xai_session",
+                "openai_api_key",
+                "anthropic_api_key",
+                "gemini_api_key",
+                "openrouter_api_key",
+            ])
+        );
+        assert!(methods.iter().all(|method| {
+            method.stability == AdapterStability::Stable
+                && method.availability == AdapterAvailability::Available
+        }));
     }
 
     #[test]

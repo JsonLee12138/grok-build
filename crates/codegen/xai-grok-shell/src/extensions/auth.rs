@@ -179,7 +179,7 @@ fn handle_provider_methods(agent: &MvpAgent) -> ExtResult {
         });
     let methods = crate::auth::provider_registry::provider_auth_methods(
         gates,
-        command_on_path("copilot"),
+        github_copilot_sdk::HAS_BUNDLED_CLI || command_on_path("copilot"),
         gemini_oauth_ready,
     );
     ExtMethodResult::success(serde_json::json!({ "methods": methods }))

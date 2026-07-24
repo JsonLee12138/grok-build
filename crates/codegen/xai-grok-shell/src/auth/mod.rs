@@ -1,5 +1,6 @@
 pub(crate) mod attribution;
 mod config;
+pub mod copilot_sdk;
 pub mod credential_provider;
 #[path = "devbox_login_stub.rs"]
 pub(crate) mod devbox_login;

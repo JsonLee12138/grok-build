@@ -89,6 +89,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+github-copilot-sdk = "1.0.8"
 agent-client-protocol = { version = "0.10.4", features = ["unstable"] }
 alacritty_terminal = "0.26.0"
 ansi-to-tui = "7.0.0"

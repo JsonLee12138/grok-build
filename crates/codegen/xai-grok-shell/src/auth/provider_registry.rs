@@ -145,7 +145,9 @@ pub fn provider_auth_methods(
             id: "codex_oauth_compat",
             provider: "openai",
             stability: AdapterStability::Experimental,
-            availability: AdapterAvailability::NotEnabled,
+            // Codex owns ChatGPT OAuth and refreshes it inside the official CLI.
+            // We deliberately do not read or copy its private auth store.
+            availability: AdapterAvailability::BlockedExternal,
             requires_confirmation: true,
         });
     }
@@ -154,7 +156,9 @@ pub fn provider_auth_methods(
             id: "claude_oauth_compat",
             provider: "anthropic",
             stability: AdapterStability::Experimental,
-            availability: AdapterAvailability::NotEnabled,
+            // Claude Code owns its OAuth credential and does not expose a
+            // stable Provider HTTP token/catalog contract to embed here.
+            availability: AdapterAvailability::BlockedExternal,
             requires_confirmation: true,
         });
     }
@@ -1587,7 +1591,7 @@ mod tests {
         assert!(experimental[0].requires_confirmation);
         assert_eq!(
             experimental[0].availability,
-            AdapterAvailability::NotEnabled
+            AdapterAvailability::BlockedExternal
         );
         assert!(
             codex_only
@@ -1631,6 +1635,14 @@ mod tests {
                 .find(|method| method.id == "claude_oauth_compat")
                 .unwrap()
                 .requires_confirmation
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .find(|method| method.id == "claude_oauth_compat")
+                .unwrap()
+                .availability,
+            AdapterAvailability::BlockedExternal
         );
 
         let ready = provider_auth_methods(

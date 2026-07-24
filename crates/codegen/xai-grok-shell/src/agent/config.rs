@@ -7877,6 +7877,24 @@ reasoning_effort = "low"
     }
 
     #[test]
+    fn cli_owned_oauth_strategies_fail_closed_until_an_official_contract_exists() {
+        for (provider, strategy) in [
+            ("openai", "codex_oauth_compat"),
+            ("anthropic", "claude_oauth_compat"),
+        ] {
+            let raw: toml::Value = toml::from_str(&format!(
+                "[provider.{provider}]\nauth_strategy = \"{strategy}\"\n"
+            ))
+            .unwrap();
+            let cfg = Config::new_from_toml_cfg(&raw).unwrap();
+            assert!(
+                !cfg.providers.contains_key(provider),
+                "{strategy} must not create a configured-but-unusable Provider"
+            );
+        }
+    }
+
+    #[test]
     fn gemini_oauth_request_uses_oauth_token_without_api_key_namespace() {
         let (_, catalog) = resolve_models_from_toml(
             r#"

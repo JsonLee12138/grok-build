@@ -274,15 +274,11 @@ fn valid_provider_auth_strategy(provider_id: &str, provider: &ProviderConfig) ->
                     .is_some_and(|path| !path.trim().is_empty())
                 && provider.api_key.is_none()
         }
-        Some(ProviderAuthStrategy::CodexOauthCompat) => {
-            provider_id == "openai"
-                && provider.oauth_client_file.is_none()
-                && provider.api_key.is_none()
-        }
-        Some(ProviderAuthStrategy::ClaudeOauthCompat) => {
-            provider_id == "anthropic"
-                && provider.oauth_client_file.is_none()
-                && provider.api_key.is_none()
+        // These names are reserved for a future official embedding contract.
+        // Current Codex/Claude CLIs own their OAuth credentials, so accepting
+        // either strategy would create a configured-but-unusable Provider.
+        Some(ProviderAuthStrategy::CodexOauthCompat | ProviderAuthStrategy::ClaudeOauthCompat) => {
+            false
         }
     }
 }

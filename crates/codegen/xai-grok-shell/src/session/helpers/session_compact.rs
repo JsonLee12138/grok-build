@@ -587,6 +587,39 @@ pub(crate) async fn generate_session_compact(
                 itl_max_ms: timing.itl_max_ms(),
             }
         }
+        ApiBackend::GeminiGenerateContent => {
+            let request = ConversationRequest {
+                items: chat_history,
+                tools,
+                hosted_tools,
+                model: Some(sampling_config.model.to_owned()),
+                temperature: Some(1.0),
+                x_grok_conv_id: Some(session_id.to_string()),
+                x_grok_req_id: Some(format!("xai-compact-{}", uuid::Uuid::new_v4())),
+                x_grok_session_id: Some(session_id.to_string()),
+                x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
+                ..Default::default()
+            };
+            let response = client
+                .conversation_collect(request)
+                .await
+                .map_err(classify_sampling_error)?;
+            let stop_reason = response
+                .stop_reason
+                .map(|reason| reason.as_str().to_owned());
+            CompactOutput {
+                content: response.assistant_text(),
+                truncated: matches!(
+                    response.stop_reason,
+                    Some(xai_grok_sampling_types::StopReason::Length)
+                ),
+                stop_reason,
+                ttft_ms: None,
+                stream_ms: None,
+                delta_count: 1,
+                itl_max_ms: None,
+            }
+        }
         ApiBackend::Messages => {
             let request = ConversationRequest {
                 items: chat_history,

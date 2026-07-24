@@ -1008,6 +1008,31 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         }
         Action::Login => dispatch_login(app),
         Action::SelectXaiProvider => dispatch_select_xai_provider(app),
+        Action::OpenProviderApiKey(provider) => {
+            with_active_agent(app, |agent| {
+                agent.active_modal = Some(crate::views::modal::ActiveModal::ProviderApiKey {
+                    provider,
+                    secret: String::new(),
+                    window: crate::views::modal_window::ModalWindowState::new(),
+                });
+            });
+            vec![]
+        }
+        Action::LoadProviderMethods => vec![Effect::LoadProviderMethods {
+            selected_method_id: None,
+            confirmed: false,
+        }],
+        Action::SelectProviderMethod {
+            method_id,
+            confirmed,
+        } => vec![Effect::LoadProviderMethods {
+            selected_method_id: Some(method_id),
+            confirmed,
+        }],
+        Action::StartGeminiOAuth => vec![Effect::StartGeminiOAuth],
+        Action::SetProviderApiKey { provider, key } => {
+            vec![Effect::SetProviderApiKey { provider, key }]
+        }
         Action::CancelLogin => dispatch_cancel_login(app),
         Action::SubmitAuthCode(code) => dispatch_submit_auth_code(app, code),
         Action::CopyAuthUrl => {

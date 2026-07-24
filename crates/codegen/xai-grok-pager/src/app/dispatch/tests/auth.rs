@@ -2,6 +2,87 @@
 
 use super::*;
 
+fn provider_method(
+    id: &str,
+    availability: &str,
+    requires_confirmation: bool,
+) -> crate::app::actions::ProviderMethodChoice {
+    crate::app::actions::ProviderMethodChoice {
+        id: id.to_owned(),
+        provider: id.to_owned(),
+        stability: if requires_confirmation {
+            "experimental".to_owned()
+        } else {
+            "stable".to_owned()
+        },
+        availability: availability.to_owned(),
+        requires_confirmation,
+    }
+}
+
+#[test]
+fn provider_picker_is_built_from_shell_catalog() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ProviderMethodsLoaded {
+            methods: vec![provider_method("openai_api_key", "available", false)],
+            selected_method_id: None,
+            confirmed: false,
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(matches!(
+        app.agents[&AgentId(0)].active_modal.as_ref(),
+        Some(crate::views::modal::ActiveModal::ArgPicker { items, .. })
+            if items.len() == 1 && items[0].insert_text == "method:openai_api_key"
+    ));
+}
+
+#[test]
+fn experimental_provider_requires_explicit_confirmation() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ProviderMethodsLoaded {
+            methods: vec![provider_method("codex_oauth_compat", "available", true)],
+            selected_method_id: Some("codex_oauth_compat".to_owned()),
+            confirmed: false,
+        }),
+        &mut app,
+    );
+
+    assert!(effects.is_empty());
+    assert!(matches!(
+        app.agents[&AgentId(0)].active_modal.as_ref(),
+        Some(crate::views::modal::ActiveModal::ArgPicker { items, .. })
+            if items.iter().any(|item| {
+                item.insert_text == "confirm:codex_oauth_compat"
+                    && item.description.contains("will not copy")
+            })
+    ));
+}
+
+#[test]
+fn provider_method_selection_always_revalidates_shell_gate() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(
+        Action::SelectProviderMethod {
+            method_id: "codex_oauth_compat".to_owned(),
+            confirmed: true,
+        },
+        &mut app,
+    );
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::LoadProviderMethods {
+            selected_method_id: Some(method_id),
+            confirmed: true,
+        }] if method_id == "codex_oauth_compat"
+    ));
+}
+
 #[test]
 fn cta_mcps_loaded_needs_auth_opens_modal_and_seeds() {
     use crate::app::agent_view::CtaPhase;

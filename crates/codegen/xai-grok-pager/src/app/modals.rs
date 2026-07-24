@@ -104,6 +104,41 @@ impl AgentView {
             return InputOutcome::Changed;
         };
 
+        if let ActiveModal::ProviderApiKey {
+            provider, secret, ..
+        } = modal
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    secret.clear();
+                    self.active_modal = None;
+                    return InputOutcome::Changed;
+                }
+                KeyCode::Enter => {
+                    let provider = provider.clone();
+                    let raw = std::mem::take(secret);
+                    self.active_modal = None;
+                    return match xai_grok_shell::auth::provider_registry::ApiKey::new(raw) {
+                        Ok(key) => {
+                            InputOutcome::Action(Action::SetProviderApiKey { provider, key })
+                        }
+                        Err(_) => InputOutcome::Changed,
+                    };
+                }
+                KeyCode::Backspace => {
+                    secret.pop();
+                    return InputOutcome::Changed;
+                }
+                KeyCode::Char(ch)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    secret.push(ch);
+                    return InputOutcome::Changed;
+                }
+                _ => return InputOutcome::Changed,
+            }
+        }
+
         // Picker-based modals: route Esc through ModalWindow chrome first,
         // then delegate remaining keys to the picker input handler.
         if matches!(
@@ -466,6 +501,7 @@ impl AgentView {
                 pending_target,
             } => self.handle_edit_confirm_choice(confirm, pending_target, ch),
             ActiveModal::CommandPalette { .. }
+            | ActiveModal::ProviderApiKey { .. }
             | ActiveModal::ArgPicker { .. }
             | ActiveModal::SessionPicker { .. }
             | ActiveModal::DocPicker { .. }
@@ -1620,7 +1656,63 @@ impl AgentView {
             // EditConfirm has no draw arm and is no longer armed anywhere (the
             // dirty pane-switch lock blocks instead) — arming it would capture
             // all input invisibly.
-            if let modal::ActiveModal::CommandPalette {
+            if let modal::ActiveModal::ProviderApiKey {
+                provider,
+                secret,
+                window,
+            } = active_modal
+            {
+                let title = match provider.as_str() {
+                    "anthropic" => "Anthropic API key",
+                    "gemini" => "Gemini API key",
+                    "openai" => "OpenAI API key",
+                    "openrouter" => "OpenRouter API key",
+                    _ => "Custom Provider API key",
+                };
+                let shortcuts = [
+                    Shortcut {
+                        label: "Enter save",
+                        clickable: false,
+                        id: 0,
+                    },
+                    Shortcut {
+                        label: "Esc cancel",
+                        clickable: false,
+                        id: 0,
+                    },
+                ];
+                let config = ModalWindowConfig {
+                    title,
+                    tabs: None,
+                    shortcuts: &shortcuts,
+                    sizing: ModalSizing {
+                        width_pct: 0.50,
+                        max_width: 72,
+                        min_width: 44,
+                        v_margin: 8,
+                        h_pad: 2,
+                        v_pad: 1,
+                        footer_lines: 2,
+                    }
+                    .with_compact(compact),
+                    fold_info: None,
+                };
+                if let Some(content) = mw::render_modal_window(buf, area, window, &config, &theme) {
+                    let masked = "\u{2022}".repeat(secret.chars().count());
+                    let lines = vec![
+                        Line::from("Paste or type the key; it is never shown."),
+                        Line::from(""),
+                        Line::from(if masked.is_empty() {
+                            "\u{2022}".to_owned()
+                        } else {
+                            masked
+                        }),
+                    ];
+                    ratatui::widgets::Paragraph::new(lines)
+                        .style(theme.fg(theme.text_primary))
+                        .render(content.content, buf);
+                }
+            } else if let modal::ActiveModal::CommandPalette {
                 entries: _,
                 state,
                 window,
@@ -2796,5 +2888,31 @@ mod command_palette_vim_input_tests {
             unfocused_text.contains("/ to search"),
             "unfocused command palette should show the `/ to search` placeholder, got {unfocused_text:?}",
         );
+    }
+
+    #[test]
+    fn provider_api_key_modal_masks_render_and_action_debug() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let secret = "sk-sensitive-provider-key";
+        let mut agent = make_agent();
+        agent.active_modal = Some(ActiveModal::ProviderApiKey {
+            provider: "openai".to_owned(),
+            secret: secret.to_owned(),
+            window: crate::views::modal_window::ModalWindowState::new(),
+        });
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        agent.draw_active_modal(area, &mut buf, crate::theme::Theme::current(), false);
+        let rendered: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains('\u{2022}'));
+
+        let outcome = agent.handle_modal_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let InputOutcome::Action(action) = outcome else {
+            panic!("expected Provider API key action");
+        };
+        assert!(!format!("{action:?}").contains(secret));
     }
 }

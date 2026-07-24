@@ -3777,13 +3777,63 @@ fn is_default_laziness_detector(cfg: &LazinessDetectorPerModelConfig) -> bool {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ProviderConfig {
+    /// Explicitly marks a user-defined provider. Legacy provider tables may
+    /// omit this field, but model discovery is only available to `custom`.
+    pub kind: Option<ProviderKind>,
     pub base_url: Option<String>,
     pub api_base_url: Option<String>,
     pub api_backend: Option<ApiBackend>,
     pub auth_scheme: Option<AuthScheme>,
     pub api_key: Option<ApiKeySource>,
+    /// Selects a non-default credential strategy for a built-in Provider.
+    pub auth_strategy: Option<ProviderAuthStrategy>,
+    /// User-owned OAuth client JSON. The file path is persisted, never its
+    /// client secret.
+    pub oauth_client_file: Option<String>,
+    pub model_discovery: Option<ProviderModelDiscoveryConfig>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthStrategy {
+    ApiKey,
+    GeminiOauth,
+    CodexOauthCompat,
+    ClaudeOauthCompat,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    Custom,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ProviderModelDiscoveryConfig {
+    pub format: ProviderModelDiscoveryFormat,
+    /// URL path only. Absolute URLs are rejected so credentials cannot cross
+    /// the provider base URL's origin.
+    pub path: Option<String>,
+}
+
+impl Default for ProviderModelDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            format: ProviderModelDiscoveryFormat::Configured,
+            path: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderModelDiscoveryFormat {
+    Openai,
+    #[default]
+    Configured,
 }
 /// A `[model.foo]` entry from config.toml, parsed directly from raw TOML
 /// (bypassing deep merge). Scalar fields are `Option` so absent means "inherit
@@ -3859,6 +3909,11 @@ impl ConfigModelOverride {
         endpoints: &EndpointsConfig,
     ) -> ModelEntry {
         let mut entry = base.unwrap_or_else(|| ModelEntry::fallback(key, endpoints));
+        if self.provider.is_some() {
+            // Preserve the canonical provider/model identity after the raw
+            // provider config has been flattened into ModelEntry.
+            entry.info.id = Some(key.to_owned());
+        }
         if let Some(ref v) = self.model {
             entry.info.model = v.clone();
         }
@@ -3956,6 +4011,39 @@ impl ConfigModelOverride {
         }
         if self.supported_in_api.is_none() && (self.api_key.is_some() || self.env_key.is_some()) {
             entry.info.supported_in_api = true;
+        }
+        if self.provider.is_some()
+            && let Some(provider) =
+                crate::auth::provider_registry::ProviderId::from_canonical_model(key)
+        {
+            entry.info.extra_headers.retain(|name, _| {
+                !name.eq_ignore_ascii_case("authorization")
+                    && !name.eq_ignore_ascii_case("x-api-key")
+                    && !name.eq_ignore_ascii_case("x-goog-api-key")
+            });
+            if provider == crate::auth::provider_registry::ProviderId::Anthropic {
+                entry.info.base_url =
+                    crate::auth::provider_registry::endpoint_base(provider).to_owned();
+                entry.api_base_url = None;
+                entry.info.api_backend = ApiBackend::Messages;
+                entry.info.auth_scheme = AuthScheme::XApiKey;
+                entry
+                    .info
+                    .extra_headers
+                    .retain(|name, _| !name.eq_ignore_ascii_case("anthropic-version"));
+                entry.info.extra_headers.insert(
+                    "anthropic-version".to_owned(),
+                    crate::auth::provider_registry::ANTHROPIC_API_VERSION.to_owned(),
+                );
+            } else if provider == crate::auth::provider_registry::ProviderId::Gemini {
+                entry.info.base_url =
+                    crate::auth::provider_registry::endpoint_base(provider).to_owned();
+                entry.api_base_url = None;
+                entry.info.api_backend = ApiBackend::GeminiGenerateContent;
+                if self.auth_scheme != Some(AuthScheme::Bearer) {
+                    entry.info.auth_scheme = AuthScheme::XGoogApiKey;
+                }
+            }
         }
         entry
     }
@@ -4358,6 +4446,18 @@ pub struct AutoModeConfig {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Features {
+    /// User-client Gemini OAuth adapter. Conditional and disabled by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_gemini_oauth: Option<bool>,
+    /// Official Copilot SDK/CLI adapter. Conditional and disabled by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_github_copilot: Option<bool>,
+    /// Experimental Codex CLI compatibility adapter. Disabled by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_codex_oauth: Option<bool>,
+    /// Experimental Claude Code compatibility adapter. Disabled by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_claude_oauth: Option<bool>,
     /// when set, the agent may ask permission for tool executions
     #[serde(default)]
     pub support_permission: bool,
@@ -4554,6 +4654,11 @@ pub(crate) fn first_own_credential(
 /// When `env_key` lists multiple names, the first set non-empty value is used.
 pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> ResolvedCredentials {
     let info = model.info();
+    if let Some(credentials) =
+        resolve_fixed_provider_credentials_at(model, &crate::util::grok_home::grok_home())
+    {
+        return credentials;
+    }
     let (api_key, base_url, auth_type) = if let Some(key) = model.own_credential() {
         (
             Some(key),
@@ -4598,6 +4703,63 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
         auth_type,
         auth_scheme,
     }
+}
+
+pub(crate) fn resolve_fixed_provider_credentials_at(
+    model: &ModelEntry,
+    grok_home: &std::path::Path,
+) -> Option<ResolvedCredentials> {
+    let canonical = model.info.id.as_deref()?;
+    let (provider_name, wire_model) = canonical.split_once('/')?;
+    if wire_model.is_empty() {
+        return None;
+    }
+    let store = crate::auth::provider_registry::ProviderCredentialStore::new(grok_home);
+    let builtin = crate::auth::provider_registry::ProviderId::from_canonical_model(canonical);
+    let api_key = match builtin {
+        Some(crate::auth::provider_registry::ProviderId::Gemini)
+            if model.info.auth_scheme == AuthScheme::Bearer =>
+        {
+            store
+                .oauth(
+                    crate::auth::provider_registry::ProviderId::Gemini,
+                    crate::auth::gemini_oauth::GEMINI_OAUTH_STRATEGY,
+                )
+                .map(|credential| {
+                    credential.map(|credential| {
+                        crate::auth::provider_registry::ApiKey::new(credential.access_token)
+                            .expect("stored OAuth access token was validated")
+                    })
+                })
+        }
+        Some(provider) => store.api_key(provider),
+        None => store.custom_api_key(provider_name),
+    }
+    .ok()
+    .flatten()
+    .map(crate::auth::provider_registry::ApiKey::into_secret);
+    if builtin.is_none() && api_key.is_none() {
+        // A direct/legacy model containing `/` is not necessarily a named
+        // custom Provider. Let the regular credential resolver handle it.
+        return None;
+    }
+    Some(ResolvedCredentials {
+        api_key,
+        base_url: builtin
+            .map(crate::auth::provider_registry::endpoint_base)
+            .unwrap_or(model.info.base_url.as_str())
+            .to_owned(),
+        auth_type: xai_chat_state::AuthType::ApiKey,
+        auth_scheme: match builtin {
+            Some(crate::auth::provider_registry::ProviderId::Anthropic) => AuthScheme::XApiKey,
+            Some(crate::auth::provider_registry::ProviderId::Gemini) => model.info.auth_scheme,
+            Some(
+                crate::auth::provider_registry::ProviderId::Openai
+                | crate::auth::provider_registry::ProviderId::Openrouter,
+            ) => AuthScheme::Bearer,
+            None => model.info.auth_scheme,
+        },
+    })
 }
 /// `disable_api_key_auth` at the credential seam: swap a first-party xAI API
 /// key for the IdP session (absent => request fails => forces login). BYOK
@@ -4666,6 +4828,7 @@ pub fn try_resolve_model_credentials(
 pub struct ModelAuthFacts {
     pub byok: ModelByok,
     pub auth_scheme: AuthScheme,
+    pub gemini_oauth: bool,
 }
 /// Resolve `model_id` to its auth facts from one effective-config load.
 /// Load/parse failure → `byok = Unknown`; model absent from the catalog →
@@ -4676,6 +4839,7 @@ pub fn resolve_model_auth_facts(model_id: &str) -> ModelAuthFacts {
         return ModelAuthFacts {
             byok: ModelByok::Unknown,
             auth_scheme: AuthScheme::default(),
+            gemini_oauth: false,
         };
     }
     with_resolved_model(model_id, |lookup| ModelAuthFacts {
@@ -4684,6 +4848,12 @@ pub fn resolve_model_auth_facts(model_id: &str) -> ModelAuthFacts {
             ModelLookup::Loaded(Some(e)) => e.info().auth_scheme,
             _ => AuthScheme::default(),
         },
+        gemini_oauth: matches!(
+            lookup,
+            ModelLookup::Loaded(Some(e))
+                if e.info().id.as_deref().is_some_and(|id| id.starts_with("gemini/"))
+                    && e.info().auth_scheme == AuthScheme::Bearer
+        ),
     })
 }
 fn byok_from_lookup(lookup: &ModelLookup) -> ModelByok {
@@ -7543,6 +7713,230 @@ reasoning_effort = "low"
     }
 
     #[test]
+    fn custom_provider_contract_accepts_named_isolated_instances() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.custom-a]
+            kind = "custom"
+            base_url = "https://a.example/v1"
+            api_backend = "chat_completions"
+            model_discovery = { format = "openai", path = "/v1/models" }
+
+            [provider.custom-b]
+            kind = "custom"
+            base_url = "http://127.0.0.1:8080/v1"
+            api_backend = "messages"
+            model_discovery = { format = "configured" }
+
+            [model."custom-a/remote"]
+            provider = "custom-a"
+
+            [model."custom-b/local"]
+            provider = "custom-b"
+            "#,
+            None,
+        );
+
+        assert_eq!(cfg.providers.len(), 2);
+        assert_eq!(catalog["custom-a/remote"].info.model, "remote");
+        assert_eq!(
+            catalog["custom-b/local"].info.api_backend,
+            ApiBackend::Messages
+        );
+    }
+
+    #[test]
+    fn custom_provider_request_uses_only_its_named_store_credential() {
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.custom-a]
+            kind = "custom"
+            base_url = "https://a.example/v1"
+            api_backend = "messages"
+            auth_scheme = "x_api_key"
+            model_discovery = { format = "configured" }
+
+            [model."custom-a/demo"]
+            provider = "custom-a"
+            "#,
+            None,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        crate::auth::provider_registry::ProviderCredentialStore::new(directory.path())
+            .store_custom_api_key(
+                "custom-a",
+                crate::auth::provider_registry::ApiKey::new("named-secret").unwrap(),
+            )
+            .unwrap();
+
+        let resolved =
+            resolve_fixed_provider_credentials_at(&catalog["custom-a/demo"], directory.path())
+                .expect("named Provider credential resolves");
+        assert_eq!(resolved.api_key.as_deref(), Some("named-secret"));
+        assert_eq!(resolved.base_url, "https://a.example/v1");
+        assert_eq!(resolved.auth_scheme, AuthScheme::XApiKey);
+    }
+
+    #[test]
+    fn custom_provider_contract_rejects_builtin_names_and_unsafe_discovery() {
+        for input in [
+            r#"
+            [provider.openai]
+            kind = "custom"
+            base_url = "https://evil.example/v1"
+            "#,
+            r#"
+            [provider.unsafe]
+            kind = "custom"
+            base_url = "https://safe.example/v1"
+            model_discovery = { format = "openai", path = "https://evil.example/models" }
+            "#,
+            r#"
+            [provider.scripted]
+            kind = "custom"
+            base_url = "https://safe.example/v1"
+            model_discovery = { format = "jsonpath" }
+            "#,
+            r#"
+            [provider.secret-in-config]
+            kind = "custom"
+            base_url = "https://safe.example/v1"
+            api_key = "must-live-in-auth-json"
+            "#,
+        ] {
+            let raw: toml::Value = toml::from_str(input).expect("fixture TOML");
+            let cfg = Config::new_from_toml_cfg(&raw).expect("config remains recoverable");
+            assert!(cfg.providers.is_empty());
+            assert!(cfg.model_override_warnings.iter().any(|warning| {
+                warning.kind
+                    == super::super::config_model_override_parse::ModelOverrideWarningKind::InvalidValue
+            }));
+        }
+    }
+
+    #[test]
+    fn custom_provider_model_rejects_model_local_credentials() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.custom-a]
+            kind = "custom"
+            base_url = "https://a.example/v1"
+
+            [model."custom-a/demo"]
+            provider = "custom-a"
+            api_key = "must-live-in-auth-json"
+            "#,
+            None,
+        );
+        assert!(!catalog.contains_key("custom-a/demo"));
+        assert!(cfg.model_override_warnings.iter().any(|warning| {
+            warning.model_key.as_deref() == Some("custom-a/demo")
+                && warning.field.as_deref() == Some("api_key")
+        }));
+    }
+
+    #[test]
+    fn gemini_oauth_strategy_requires_user_client_and_uses_bearer_projection() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.gemini]
+            auth_strategy = "gemini_oauth"
+            oauth_client_file = "/tmp/google-client.json"
+
+            [model."gemini/gemini-test"]
+            provider = "gemini"
+            "#,
+            None,
+        );
+        assert_eq!(
+            cfg.providers["gemini"].auth_strategy,
+            Some(ProviderAuthStrategy::GeminiOauth)
+        );
+        let model = &catalog["gemini/gemini-test"];
+        assert_eq!(model.info.auth_scheme, AuthScheme::Bearer);
+        assert_eq!(model.info.api_backend, ApiBackend::GeminiGenerateContent);
+        assert_eq!(
+            model.info.base_url,
+            crate::auth::provider_registry::endpoint_base(
+                crate::auth::provider_registry::ProviderId::Gemini
+            )
+        );
+    }
+
+    #[test]
+    fn gemini_oauth_strategy_without_client_fails_closed() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [provider.gemini]
+            auth_strategy = "gemini_oauth"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        assert!(!cfg.providers.contains_key("gemini"));
+    }
+
+    #[test]
+    fn cli_owned_oauth_strategies_fail_closed_until_an_official_contract_exists() {
+        for (provider, strategy) in [
+            ("openai", "codex_oauth_compat"),
+            ("anthropic", "claude_oauth_compat"),
+        ] {
+            let raw: toml::Value = toml::from_str(&format!(
+                "[provider.{provider}]\nauth_strategy = \"{strategy}\"\n"
+            ))
+            .unwrap();
+            let cfg = Config::new_from_toml_cfg(&raw).unwrap();
+            assert!(
+                !cfg.providers.contains_key(provider),
+                "{strategy} must not create a configured-but-unusable Provider"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_oauth_request_uses_oauth_token_without_api_key_namespace() {
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.gemini]
+            auth_strategy = "gemini_oauth"
+            oauth_client_file = "/tmp/google-client.json"
+
+            [model."gemini/gemini-test"]
+            provider = "gemini"
+            "#,
+            None,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::auth::provider_registry::ProviderCredentialStore::new(directory.path());
+        store
+            .store_api_key(
+                crate::auth::provider_registry::ProviderId::Gemini,
+                crate::auth::provider_registry::ApiKey::new("api-key-must-not-win").unwrap(),
+            )
+            .unwrap();
+        store
+            .store_oauth(
+                crate::auth::provider_registry::ProviderId::Gemini,
+                crate::auth::provider_registry::ProviderOAuthCredential {
+                    strategy: crate::auth::gemini_oauth::GEMINI_OAUTH_STRATEGY.to_owned(),
+                    access_token: "oauth-access-token".to_owned(),
+                    refresh_token: Some("refresh-token".to_owned()),
+                    expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+                    token_endpoint: "https://oauth2.googleapis.com/token".to_owned(),
+                    client_id: "user-client".to_owned(),
+                    source: Some("/tmp/google-client.json".to_owned()),
+                },
+            )
+            .unwrap();
+        let resolved =
+            resolve_fixed_provider_credentials_at(&catalog["gemini/gemini-test"], directory.path())
+                .unwrap();
+        assert_eq!(resolved.api_key.as_deref(), Some("oauth-access-token"));
+        assert_eq!(resolved.auth_scheme, AuthScheme::Bearer);
+    }
+
+    #[test]
     fn provider_model_acceptance_ac_02() {
         use crate::agent::models::ModelsManager;
 
@@ -7614,6 +8008,7 @@ reasoning_effort = "low"
                 ApiBackend::ChatCompletions => "chat_completions",
                 ApiBackend::Responses => "responses",
                 ApiBackend::Messages => "messages",
+                ApiBackend::GeminiGenerateContent => "gemini_generate_content",
             }
         }
 
@@ -7621,6 +8016,7 @@ reasoning_effort = "low"
             ("chat_completions", ApiBackend::ChatCompletions),
             ("messages", ApiBackend::Messages),
             ("responses", ApiBackend::Responses),
+            ("gemini_generate_content", ApiBackend::GeminiGenerateContent),
         ];
         for (configured, expected) in cases {
             let (_, catalog) = resolve_models_from_toml(
@@ -8418,6 +8814,64 @@ reasoning_effort = "low"
             resolve_model_reference(&catalog, &cfg.model_aliases, "acme/demo-v1").is_none(),
             "the rejected catalog key must not resolve"
         );
+    }
+
+    #[test]
+    fn anthropic_adapter_forces_native_messages_protocol_and_fixed_origin() {
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.anthropic]
+            base_url = "https://attacker.invalid/v1"
+            api_backend = "responses"
+            auth_scheme = "bearer"
+            extra_headers = { Authorization = "Bearer wrong", "X-Api-Key" = "wrong", "Anthropic-Version" = "wrong" }
+
+            [model."anthropic/claude-test"]
+            provider = "anthropic"
+            model = "claude-test"
+            "#,
+            None,
+        );
+        let entry = catalog
+            .get("anthropic/claude-test")
+            .expect("Anthropic model should remain selectable after protocol normalization");
+        assert_eq!(entry.info.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(
+            entry.info.api_backend,
+            xai_grok_sampling_types::ApiBackend::Messages
+        );
+        assert_eq!(entry.info.auth_scheme, AuthScheme::XApiKey);
+        assert_eq!(
+            entry.info.extra_headers.get("anthropic-version"),
+            Some(&crate::auth::provider_registry::ANTHROPIC_API_VERSION.to_owned())
+        );
+        assert_eq!(entry.info.extra_headers.len(), 1);
+    }
+
+    #[test]
+    fn gemini_adapter_forces_native_protocol_and_fixed_origin() {
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.gemini]
+            base_url = "https://attacker.invalid/v1"
+            api_backend = "responses"
+            auth_scheme = "bearer"
+            extra_headers = { Authorization = "Bearer wrong", "X-Api-Key" = "wrong" }
+
+            [model."gemini/gemini-test"]
+            provider = "gemini"
+            model = "gemini-test"
+            "#,
+            None,
+        );
+        let entry = catalog.get("gemini/gemini-test").unwrap();
+        assert_eq!(
+            entry.info.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(entry.info.api_backend, ApiBackend::GeminiGenerateContent);
+        assert_eq!(entry.info.auth_scheme, AuthScheme::XGoogApiKey);
+        assert!(entry.info.extra_headers.is_empty());
     }
 
     #[test]

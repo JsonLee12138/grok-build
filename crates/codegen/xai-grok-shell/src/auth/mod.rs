@@ -1,5 +1,6 @@
 pub(crate) mod attribution;
 mod config;
+pub mod copilot_sdk;
 pub mod credential_provider;
 #[path = "devbox_login_stub.rs"]
 pub(crate) mod devbox_login;
@@ -7,10 +8,12 @@ pub mod device_code;
 pub mod error;
 mod external_auth;
 mod flow;
+pub mod gemini_oauth;
 mod jwt;
 pub(crate) mod manager;
 mod model;
 pub mod oidc;
+pub mod provider_registry;
 pub(crate) mod recovery;
 pub(crate) mod refresh;
 mod storage;

@@ -603,6 +603,22 @@ pub enum Action {
     /// Explicitly select xAI as the authentication provider. This first tries
     /// a cached xAI session without opening an interactive browser flow.
     SelectXaiProvider,
+    /// Open a masked API-key prompt for a fixed Provider adapter.
+    OpenProviderApiKey(String),
+    /// Load the shell-owned, gate-aware Provider authentication methods.
+    LoadProviderMethods,
+    /// Revalidate and select a shell-owned Provider authentication method.
+    SelectProviderMethod {
+        method_id: String,
+        confirmed: bool,
+    },
+    /// Start Gemini's user-owned OAuth client flow in the system browser.
+    StartGeminiOAuth,
+    /// Persist a Provider API key through the agent extension boundary.
+    SetProviderApiKey {
+        provider: String,
+        key: xai_grok_shell::auth::provider_registry::ApiKey,
+    },
     /// Cancel an in-progress login that was started from inside a session
     /// (`/login` or a 401 re-auth prompt) and return to the previous view.
     /// Distinct from `Quit`: abandoning a mid-session re-auth must not exit
@@ -1663,6 +1679,18 @@ pub enum Effect {
     PollAuthUrl { request_seq: u64 },
     /// Submit a manually-pasted auth code (ext request).
     SubmitAuthCode { request_seq: u64, code: String },
+    /// Persist a Provider API key and refresh its model catalog.
+    SetProviderApiKey {
+        provider: String,
+        key: xai_grok_shell::auth::provider_registry::ApiKey,
+    },
+    /// Run the Gemini OAuth loopback flow through the shell extension boundary.
+    StartGeminiOAuth,
+    /// Fetch and optionally resolve the shell-owned Provider method catalog.
+    LoadProviderMethods {
+        selected_method_id: Option<String>,
+        confirmed: bool,
+    },
     /// Fetch MCP server list from the shell (x.ai/mcp/list).
     FetchMcpsList {
         agent_id: AgentId,
@@ -2051,6 +2079,27 @@ pub enum SubagentKillOutcome {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    ProviderMethodsLoaded {
+        methods: Vec<ProviderMethodChoice>,
+        selected_method_id: Option<String>,
+        confirmed: bool,
+    },
+    ProviderMethodsLoadFailed {
+        error: String,
+    },
+    /// Provider API key was stored and its catalog refresh completed.
+    ProviderApiKeyStored {
+        provider: String,
+    },
+    /// Provider API key could not be stored or validated.
+    ProviderApiKeyStoreFailed {
+        provider: String,
+        error: String,
+    },
+    GeminiOAuthCompleted,
+    GeminiOAuthFailed {
+        error: String,
+    },
     /// Session was created successfully.
     SessionCreated {
         agent_id: AgentId,
@@ -2702,6 +2751,16 @@ pub enum TaskResult {
     },
     /// Shared prompt-image preview state was resolved off-thread.
     PromptImagePreviewPrepared,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderMethodChoice {
+    pub id: String,
+    pub provider: String,
+    pub stability: String,
+    pub availability: String,
+    pub requires_confirmation: bool,
 }
 #[cfg(test)]
 mod tests {

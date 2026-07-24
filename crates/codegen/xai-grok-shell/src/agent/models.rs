@@ -1,5 +1,6 @@
 //! Model fetching, resolution, and management.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -150,6 +151,9 @@ struct Inner {
     fetch_auth: RwLock<ModelFetchAuth>,
     gateway: RwLock<Option<xai_acp_lib::AcpAgentGatewaySender>>,
     cache: ModelsCacheManager,
+    provider_registry: tokio::sync::Mutex<crate::auth::provider_registry::ProviderAdapterRegistry>,
+    validated_provider_models: RwLock<HashSet<String>>,
+    discovered_provider_models: RwLock<IndexMap<String, ModelEntry>>,
     /// Guard to prevent overlapping retry loops.
     retry_in_flight: AtomicBool,
     /// `allowed_models` matched nothing in the fetched catalog; the prompt path
@@ -176,6 +180,108 @@ struct Inner {
     /// registry — no manual fan-out, no listener-leak risk, no
     /// `unregister` API to maintain.
     model_switch_watch: tokio::sync::watch::Sender<u64>,
+}
+
+fn filter_fixed_provider_models(
+    mut catalog: IndexMap<String, ModelEntry>,
+    validated: &HashSet<String>,
+) -> (IndexMap<String, ModelEntry>, bool) {
+    let mut had_fixed_provider_models = false;
+    catalog.retain(|catalog_key, entry| {
+        let canonical = entry.info.id.as_deref().unwrap_or(catalog_key);
+        let is_fixed =
+            crate::auth::provider_registry::ProviderId::from_canonical_model(canonical).is_some();
+        had_fixed_provider_models |= is_fixed;
+        !is_fixed || validated.contains(canonical)
+    });
+    (catalog, had_fixed_provider_models)
+}
+
+fn merge_discovered_provider_models(
+    mut catalog: IndexMap<String, ModelEntry>,
+    discovered: &IndexMap<String, ModelEntry>,
+) -> IndexMap<String, ModelEntry> {
+    for (key, entry) in discovered {
+        catalog.entry(key.clone()).or_insert_with(|| entry.clone());
+    }
+    catalog
+}
+
+fn anthropic_model_entry(
+    cfg: &config::Config,
+    model: crate::auth::provider_registry::CatalogModel,
+) -> ModelEntry {
+    let mut entry = ModelEntry::fallback(&model.wire_id, &cfg.endpoints);
+    entry.info.id = Some(model.id);
+    entry.info.model = model.wire_id;
+    entry.info.base_url = crate::auth::provider_registry::endpoint_base(
+        crate::auth::provider_registry::ProviderId::Anthropic,
+    )
+    .to_owned();
+    entry.info.api_backend = xai_grok_sampling_types::ApiBackend::Messages;
+    entry.info.auth_scheme = xai_grok_sampler::config::AuthScheme::XApiKey;
+    entry.info.extra_headers.insert(
+        "anthropic-version".to_owned(),
+        crate::auth::provider_registry::ANTHROPIC_API_VERSION.to_owned(),
+    );
+    entry.info.supported_in_api = true;
+    entry
+}
+
+fn gemini_model_entry(
+    cfg: &config::Config,
+    model: crate::auth::provider_registry::CatalogModel,
+) -> ModelEntry {
+    let mut entry = ModelEntry::fallback(&model.wire_id, &cfg.endpoints);
+    entry.info.id = Some(model.id);
+    entry.info.model = model.wire_id;
+    entry.info.base_url = crate::auth::provider_registry::endpoint_base(
+        crate::auth::provider_registry::ProviderId::Gemini,
+    )
+    .to_owned();
+    entry.info.api_backend = xai_grok_sampling_types::ApiBackend::GeminiGenerateContent;
+    entry.info.auth_scheme = xai_grok_sampler::config::AuthScheme::XGoogApiKey;
+    entry.info.supported_in_api = true;
+    entry
+}
+
+fn custom_model_entry(
+    cfg: &config::Config,
+    provider: &str,
+    provider_config: &config::ProviderConfig,
+    model: crate::auth::provider_registry::CustomCatalogModel,
+) -> ModelEntry {
+    let mut entry = ModelEntry::fallback(&model.wire_id, &cfg.endpoints);
+    entry.info.id = Some(model.id);
+    entry.info.model = model.wire_id;
+    entry.info.base_url = provider_config
+        .base_url
+        .clone()
+        .expect("validated custom Provider has base_url");
+    entry.api_base_url.clone_from(&provider_config.api_base_url);
+    entry.info.api_backend = provider_config.api_backend.clone().unwrap_or_default();
+    entry.info.auth_scheme = provider_config.auth_scheme.unwrap_or_default();
+    entry.info.extra_headers = provider_config.extra_headers.clone();
+    entry.info.supported_in_api = true;
+    debug_assert_eq!(
+        entry.info.id.as_deref().unwrap().split('/').next(),
+        Some(provider)
+    );
+    entry
+}
+
+fn copilot_model_entry(
+    cfg: &config::Config,
+    model: crate::auth::copilot_sdk::CopilotModel,
+) -> ModelEntry {
+    let mut entry = ModelEntry::fallback(&model.id, &cfg.endpoints);
+    entry.info.id = Some(format!("github-copilot/{}", model.id));
+    entry.info.name = Some(model.name);
+    entry.info.model = model.id;
+    // This sentinel is intercepted before the HTTP sampler is constructed.
+    entry.info.base_url = "copilot-sdk://runtime".to_owned();
+    entry.info.supported_in_api = true;
+    entry
 }
 
 impl Default for ModelsManager {
@@ -219,6 +325,11 @@ impl ModelsManager {
                 fetch_auth: RwLock::new(fetch_auth),
                 gateway: RwLock::new(None),
                 cache: ModelsCacheManager::new(),
+                provider_registry: tokio::sync::Mutex::new(
+                    crate::auth::provider_registry::ProviderAdapterRegistry::default(),
+                ),
+                validated_provider_models: RwLock::new(HashSet::new()),
+                discovered_provider_models: RwLock::new(IndexMap::new()),
                 retry_in_flight: AtomicBool::new(false),
                 allowlist_excludes_all: AtomicBool::new(false),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
@@ -268,11 +379,13 @@ impl ModelsManager {
                 .map(|c| c.models)
         });
         let has_prefetched = prefetched_models.is_some();
-        let catalog = resolve_model_catalog(cfg, prefetched_models.clone());
+        let raw_catalog = resolve_model_catalog(cfg, prefetched_models.clone());
+        let (catalog, had_fixed_provider_models) =
+            filter_fixed_provider_models(raw_catalog, &HashSet::new());
 
         // Validate only against a real catalog; a bundled-only first run defers
         // to the async fetch (`apply_refresh_result`).
-        if has_prefetched {
+        if has_prefetched && (!catalog.is_empty() || !had_fixed_provider_models) {
             validate_selectable(cfg, &catalog)?;
         }
 
@@ -316,9 +429,17 @@ impl ModelsManager {
             return;
         }
         let prefetched = self.inner.prefetched.read().clone();
-        let new_catalog = resolve_model_catalog(&new_config, prefetched);
+        let new_catalog = merge_discovered_provider_models(
+            resolve_model_catalog(&new_config, prefetched),
+            &self.inner.discovered_provider_models.read(),
+        );
+        let (new_catalog, had_fixed_provider_models) =
+            filter_fixed_provider_models(new_catalog, &self.inner.validated_provider_models.read());
         let has_real_catalog = *self.inner.has_fetched_real_catalog.read();
-        if has_real_catalog && let Err(e) = validate_selectable(&new_config, &new_catalog) {
+        if has_real_catalog
+            && !(new_catalog.is_empty() && had_fixed_provider_models)
+            && let Err(e) = validate_selectable(&new_config, &new_catalog)
+        {
             tracing::error!(error = %e, "ignoring config reload: allowed_models excludes all models");
             return;
         }
@@ -627,11 +748,13 @@ impl ModelsManager {
     // ── Mutations ───────────────────────────────────────────────────
 
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
-        self.replace_catalog(
+        let catalog = merge_discovered_provider_models(
             resolve_model_catalog(cfg, prefetched),
-            cfg.model_aliases.clone(),
-            None,
+            &self.inner.discovered_provider_models.read(),
         );
+        let (catalog, _) =
+            filter_fixed_provider_models(catalog, &self.inner.validated_provider_models.read());
+        self.replace_catalog(catalog, cfg.model_aliases.clone(), None);
     }
 
     /// Publish catalog entries and their derived alias index as one snapshot.
@@ -1014,6 +1137,8 @@ impl ModelsManager {
     /// Wipe in-memory state so a previous identity's catalog doesn't leak.
     fn clear(&self) {
         *self.inner.prefetched.write() = None;
+        self.inner.validated_provider_models.write().clear();
+        self.inner.discovered_provider_models.write().clear();
         self.replace_catalog(IndexMap::new(), config::AliasIndex::default(), None);
         *self.inner.etag.write() = None;
         *self.inner.has_fetched_real_catalog.write() = false;
@@ -1150,6 +1275,238 @@ impl ModelsManager {
             .await
     }
 
+    async fn refresh_fixed_provider_models(&self, cfg: &config::Config) -> bool {
+        use crate::auth::provider_registry::{CatalogModel, ProviderCredentialStore, ProviderId};
+
+        let prefetched = self.inner.prefetched.read().clone();
+        let raw_catalog = resolve_model_catalog(cfg, prefetched);
+        let mut registered = std::collections::HashMap::<ProviderId, Vec<CatalogModel>>::new();
+        for (catalog_key, entry) in raw_catalog {
+            let canonical = entry.info.id.as_deref().unwrap_or(&catalog_key);
+            let Some(provider) = ProviderId::from_canonical_model(canonical) else {
+                continue;
+            };
+            registered.entry(provider).or_default().push(CatalogModel {
+                id: canonical.to_owned(),
+                wire_id: entry.info.model,
+                provider,
+            });
+        }
+
+        let store = ProviderCredentialStore::new(crate::util::grok_home::grok_home());
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(error = %error, "provider catalog client construction failed");
+                return false;
+            }
+        };
+        let mut next = self.inner.validated_provider_models.read().clone();
+        let mut next_discovered = self.inner.discovered_provider_models.read().clone();
+        let mut registry = self.inner.provider_registry.lock().await;
+        for provider in ProviderId::ALL {
+            let provider_registered = registered.remove(&provider).unwrap_or_default();
+            let provider_prefix = format!("{}/", provider.as_str());
+            let gemini_oauth_config = (provider == ProviderId::Gemini
+                && cfg.features.provider_gemini_oauth.unwrap_or(false))
+            .then(|| cfg.providers.get("gemini"))
+            .flatten()
+            .filter(|provider| {
+                provider.auth_strategy == Some(config::ProviderAuthStrategy::GeminiOauth)
+            });
+            let gemini_oauth_credential = if let Some(provider_config) = gemini_oauth_config {
+                match provider_config
+                    .oauth_client_file
+                    .as_deref()
+                    .map(crate::auth::gemini_oauth::GeminiOAuthClient::from_client_file)
+                {
+                    Some(Ok(oauth_client)) => {
+                        match oauth_client.valid_credential(&client, &store).await {
+                            Ok(credential) => Some(credential),
+                            Err(error) => {
+                                tracing::warn!(
+                                    provider = "gemini",
+                                    error = %error,
+                                    "Gemini OAuth credential unavailable; reauthentication required"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(
+                            provider = "gemini",
+                            error = %error,
+                            "Gemini OAuth client configuration is invalid"
+                        );
+                        None
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let has_credential = gemini_oauth_credential.is_some()
+                || (gemini_oauth_config.is_none()
+                    && store.api_key(provider).ok().flatten().is_some());
+            if !has_credential {
+                next.retain(|model| !model.starts_with(&provider_prefix));
+                next_discovered.retain(|model, _| !model.starts_with(&provider_prefix));
+                continue;
+            }
+            if matches!(provider, ProviderId::Openai | ProviderId::Openrouter)
+                && provider_registered.is_empty()
+            {
+                next.retain(|model| !model.starts_with(&provider_prefix));
+                continue;
+            }
+            let discovery = match provider {
+                ProviderId::Anthropic => registry.discover_anthropic_http(&store, &client).await,
+                ProviderId::Gemini => {
+                    if let Some(credential) = gemini_oauth_credential.as_ref() {
+                        registry
+                            .discover_gemini_oauth_http(credential, &client)
+                            .await
+                    } else {
+                        registry.discover_gemini_http(&store, &client).await
+                    }
+                }
+                ProviderId::Openai | ProviderId::Openrouter => {
+                    registry
+                        .discover_registered_http(&store, provider, &provider_registered, &client)
+                        .await
+                }
+            };
+            match discovery {
+                Ok(models) => {
+                    next.retain(|model| !model.starts_with(&provider_prefix));
+                    next_discovered.retain(|model, _| !model.starts_with(&provider_prefix));
+                    for model in models {
+                        next.insert(model.id.clone());
+                        if provider == ProviderId::Anthropic {
+                            let id = model.id.clone();
+                            next_discovered.insert(id, anthropic_model_entry(cfg, model));
+                        } else if provider == ProviderId::Gemini {
+                            let id = model.id.clone();
+                            next_discovered.insert(id, gemini_model_entry(cfg, model));
+                        }
+                    }
+                }
+                Err(error) => {
+                    // Preserve the last validated subset on a transient failure.
+                    // The error has no response body or credential material.
+                    tracing::warn!(
+                        provider = provider.as_str(),
+                        error = %error,
+                        "provider model discovery failed; preserving prior validated catalog"
+                    );
+                }
+            }
+        }
+
+        for (provider, provider_config) in &cfg.providers {
+            if provider_config.kind != Some(config::ProviderKind::Custom)
+                || provider_config
+                    .model_discovery
+                    .as_ref()
+                    .is_none_or(|discovery| {
+                        discovery.format != config::ProviderModelDiscoveryFormat::Openai
+                    })
+            {
+                continue;
+            }
+            let Some(base_url) = provider_config.base_url.as_deref() else {
+                continue;
+            };
+            let Some(key) = store.custom_api_key(provider).ok().flatten() else {
+                next_discovered.retain(|model, _| !model.starts_with(&format!("{provider}/")));
+                continue;
+            };
+            drop(key);
+            let discovery_config = provider_config.model_discovery.as_ref().unwrap();
+            let header = match provider_config.auth_scheme.unwrap_or_default() {
+                xai_grok_sampler::config::AuthScheme::Bearer => "authorization",
+                xai_grok_sampler::config::AuthScheme::XApiKey => "x-api-key",
+                xai_grok_sampler::config::AuthScheme::XGoogApiKey => "x-goog-api-key",
+            };
+            match registry
+                .discover_custom_http(
+                    provider,
+                    base_url,
+                    discovery_config.path.as_deref(),
+                    header,
+                    &store,
+                    &client,
+                )
+                .await
+            {
+                Ok(models) => {
+                    let prefix = format!("{provider}/");
+                    next_discovered.retain(|model, _| !model.starts_with(&prefix));
+                    for model in models {
+                        let id = model.id.clone();
+                        next_discovered.insert(
+                            id,
+                            custom_model_entry(cfg, provider, provider_config, model),
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    provider,
+                    error = %error,
+                    "custom Provider model discovery failed; preserving prior catalog"
+                ),
+            }
+        }
+        drop(registry);
+
+        const COPILOT_PREFIX: &str = "github-copilot/";
+        if cfg.features.provider_github_copilot.unwrap_or(false) {
+            use crate::auth::copilot_sdk::{CopilotRuntime, OfficialCopilotRuntime};
+
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                OfficialCopilotRuntime.list_models(),
+            )
+            .await
+            {
+                Ok(Ok(models)) => {
+                    next_discovered.retain(|model, _| !model.starts_with(COPILOT_PREFIX));
+                    for model in models {
+                        let id = format!("{COPILOT_PREFIX}{}", model.id);
+                        next_discovered.insert(id, copilot_model_entry(cfg, model));
+                    }
+                }
+                Ok(Err(error)) => tracing::warn!(
+                    failure_kind = ?error.kind,
+                    "Copilot SDK model discovery unavailable; preserving prior catalog"
+                ),
+                Err(_) => tracing::warn!(
+                    "Copilot SDK model discovery timed out; preserving prior catalog"
+                ),
+            }
+        } else {
+            next_discovered.retain(|model, _| !model.starts_with(COPILOT_PREFIX));
+        }
+
+        let discovered_changed = {
+            let current = self.inner.discovered_provider_models.read();
+            current.len() != next_discovered.len() || current.keys().ne(next_discovered.keys())
+        };
+        if discovered_changed {
+            *self.inner.discovered_provider_models.write() = next_discovered;
+        }
+        let mut validated = self.inner.validated_provider_models.write();
+        let validated_changed = *validated != next;
+        if validated_changed {
+            *validated = next;
+        }
+        discovered_changed || validated_changed
+    }
+
     /// `remote_fetch_enabled` is a parameter so tests can drive the gate
     /// without touching on-disk config layers.
     async fn fetch_and_apply_inner(&self, remote_fetch_enabled: bool) {
@@ -1162,6 +1519,7 @@ impl ModelsManager {
         let has_auth = auth.is_some();
         let fetch_auth = *self.inner.fetch_auth.read();
         let cfg = self.inner.cfg.read().clone();
+        let provider_catalog_changed = self.refresh_fixed_provider_models(&cfg).await;
         xai_grok_telemetry::unified_log::info(
             "model catalog: fetching",
             None,
@@ -1172,6 +1530,10 @@ impl ModelsManager {
         );
         let new_prefetched = fetch_models_async(cfg.endpoints.clone(), auth, fetch_auth).await;
         let success = self.apply_refresh_result(&cfg, new_prefetched, None);
+        if !success && provider_catalog_changed {
+            self.rebuild(&cfg, self.inner.prefetched.read().clone());
+            self.reselect_current_model_if_missing(&cfg);
+        }
         if success {
             xai_grok_telemetry::unified_log::info(
                 "model catalog: fetch succeeded",
@@ -2128,6 +2490,24 @@ pub(crate) async fn fetch_models_async(
 mod tests {
     use super::*;
 
+    #[test]
+    fn copilot_model_entry_uses_sdk_runtime_sentinel() {
+        let cfg = config::Config::default();
+        let entry = copilot_model_entry(
+            &cfg,
+            crate::auth::copilot_sdk::CopilotModel {
+                id: "gpt-5".to_owned(),
+                name: "GPT-5".to_owned(),
+            },
+        );
+
+        assert_eq!(entry.info.id.as_deref(), Some("github-copilot/gpt-5"));
+        assert_eq!(entry.info.name.as_deref(), Some("GPT-5"));
+        assert_eq!(entry.info.model, "gpt-5");
+        assert_eq!(entry.info.base_url, "copilot-sdk://runtime");
+        assert!(entry.info.supported_in_api);
+    }
+
     fn test_manager() -> ModelsManager {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -2148,6 +2528,104 @@ mod tests {
 
     fn config_from_toml(toml: &str) -> config::Config {
         config::Config::new_from_toml_cfg(&toml::from_str(toml).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn fixed_provider_models_are_hidden_until_directory_validation() {
+        let cfg = config_from_toml(
+            r#"
+            [provider.openai]
+            base_url = "https://api.openai.com/v1"
+
+            [model."openai/gpt-approved"]
+            provider = "openai"
+            model = "gpt-approved"
+            "#,
+        );
+        let raw = resolve_model_catalog(&cfg, None);
+        assert!(raw.contains_key("openai/gpt-approved"));
+
+        let (hidden, had_fixed) = filter_fixed_provider_models(raw.clone(), &HashSet::new());
+        assert!(had_fixed);
+        assert!(!hidden.contains_key("openai/gpt-approved"));
+
+        let validated = HashSet::from(["openai/gpt-approved".to_owned()]);
+        let (visible, _) = filter_fixed_provider_models(raw, &validated);
+        assert!(visible.contains_key("openai/gpt-approved"));
+    }
+
+    #[test]
+    fn non_fixed_custom_provider_does_not_require_fixed_directory_validation() {
+        let cfg = config_from_toml(
+            r#"
+            [provider.acme]
+            base_url = "https://api.acme.example/v1"
+
+            [model."acme/model"]
+            provider = "acme"
+            "#,
+        );
+        let raw = resolve_model_catalog(&cfg, None);
+        let (catalog, had_fixed) = filter_fixed_provider_models(raw, &HashSet::new());
+        assert!(!had_fixed);
+        assert!(catalog.contains_key("acme/model"));
+    }
+
+    #[test]
+    fn discovered_anthropic_model_uses_native_messages_contract() {
+        use crate::auth::provider_registry::{CatalogModel, ProviderId};
+
+        let cfg = config::Config::default();
+        let entry = anthropic_model_entry(
+            &cfg,
+            CatalogModel {
+                id: "anthropic/claude-test".to_owned(),
+                wire_id: "claude-test".to_owned(),
+                provider: ProviderId::Anthropic,
+            },
+        );
+        assert_eq!(entry.info.id.as_deref(), Some("anthropic/claude-test"));
+        assert_eq!(entry.info.model, "claude-test");
+        assert_eq!(entry.info.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(
+            entry.info.api_backend,
+            xai_grok_sampling_types::ApiBackend::Messages
+        );
+        assert_eq!(
+            entry.info.auth_scheme,
+            xai_grok_sampler::config::AuthScheme::XApiKey
+        );
+        assert_eq!(
+            entry.info.extra_headers.get("anthropic-version"),
+            Some(&crate::auth::provider_registry::ANTHROPIC_API_VERSION.to_owned())
+        );
+    }
+
+    #[test]
+    fn discovered_gemini_model_uses_native_generate_content_contract() {
+        use crate::auth::provider_registry::{CatalogModel, ProviderId};
+
+        let entry = gemini_model_entry(
+            &config::Config::default(),
+            CatalogModel {
+                id: "gemini/gemini-test".to_owned(),
+                wire_id: "gemini-test".to_owned(),
+                provider: ProviderId::Gemini,
+            },
+        );
+        assert_eq!(entry.info.model, "gemini-test");
+        assert_eq!(
+            entry.info.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(
+            entry.info.api_backend,
+            xai_grok_sampling_types::ApiBackend::GeminiGenerateContent
+        );
+        assert_eq!(
+            entry.info.auth_scheme,
+            xai_grok_sampler::config::AuthScheme::XGoogApiKey
+        );
     }
 
     #[test]

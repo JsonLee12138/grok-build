@@ -22,10 +22,11 @@ use serde::Serialize;
 
 use xai_grok_sampling_types::error::{parse_error_bytes, try_parse_stream_error};
 use xai_grok_sampling_types::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
-    ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
-    ResponseModelMetadata, Result, SamplingError, build_messages_request, is_check_event, messages,
-    rs,
+    ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, ChatCompletionRequest,
+    ChatCompletionResponse, ConversationRequest, ConversationResponse, CreateResponseWrapper,
+    DOOM_LOOP_CHECK_HEADER, FinishReason, MessagesRequestWrapper, ResponseModelMetadata, Result,
+    Role, SamplingError, ToolCallDelta, ToolCallFunctionDelta, Usage, build_messages_request,
+    is_check_event, messages, rs,
 };
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
@@ -415,6 +416,15 @@ impl SamplingClient {
                     })?;
                     headers.insert(HeaderName::from_static("x-api-key"), header_value);
                 }
+                AuthScheme::XGoogApiKey => {
+                    let header_value = HeaderValue::from_str(api_key).map_err(|_| {
+                        SamplingError::Auth(
+                            "Invalid api_key: cannot be converted to a valid HTTP header"
+                                .to_string(),
+                        )
+                    })?;
+                    headers.insert(HeaderName::from_static("x-goog-api-key"), header_value);
+                }
                 AuthScheme::Bearer => {
                     let bearer = format!("Bearer {}", api_key);
                     let header_value = HeaderValue::from_str(&bearer).map_err(|_| {
@@ -557,8 +567,15 @@ impl SamplingClient {
                         headers.insert(HeaderName::from_static("x-api-key"), v);
                     }
                 }
+                AuthScheme::XGoogApiKey => {
+                    headers.remove(AUTHORIZATION);
+                    if let Ok(v) = HeaderValue::from_str(&fresh) {
+                        headers.insert(HeaderName::from_static("x-goog-api-key"), v);
+                    }
+                }
                 AuthScheme::Bearer => {
                     headers.remove(HeaderName::from_static("x-api-key"));
+                    headers.remove(HeaderName::from_static("x-goog-api-key"));
                     if let Ok(v) = HeaderValue::from_str(&format!("Bearer {fresh}")) {
                         headers.insert(AUTHORIZATION, v);
                     }
@@ -596,6 +613,9 @@ impl SamplingClient {
 
     /// Bearer prefix for 401 attribution. Prefers live resolver, falls back to default_headers.
     fn current_sent_bearer_prefix(&self) -> Option<String> {
+        if self.defaults.auth_scheme == AuthScheme::XGoogApiKey {
+            return None;
+        }
         self.bearer_resolver
             .as_ref()
             .and_then(|r| r.current_bearer())
@@ -615,6 +635,7 @@ impl SamplingClient {
                 .get(HeaderName::from_static("x-api-key"))
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string()),
+            AuthScheme::XGoogApiKey => None,
             AuthScheme::Bearer => self
                 .default_headers
                 .get(AUTHORIZATION)
@@ -657,6 +678,10 @@ impl SamplingClient {
         let auth_prefix = self.current_sent_bearer_prefix();
         let auth_type = match (&self.defaults.auth_scheme, &auth_prefix) {
             (AuthScheme::XApiKey, Some(_)) => "x-api-key",
+            (AuthScheme::XGoogApiKey, _) if self.default_headers.contains_key("x-goog-api-key") => {
+                "x-goog-api-key"
+            }
+            (AuthScheme::XGoogApiKey, _) => "none",
             (AuthScheme::Bearer, Some(_)) => "bearer",
             (_, None) => "none",
         };
@@ -1932,6 +1957,50 @@ impl SamplingClient {
         self.create_message_stream(wrapper).await
     }
 
+    pub async fn conversation_stream_gemini(
+        &self,
+        request: ConversationRequest,
+    ) -> Result<(
+        BoxStream<'static, Result<ChatCompletionChunk>>,
+        Option<ResponseModelMetadata>,
+    )> {
+        let chat: ChatCompletionRequest = request.into();
+        let payload = self.apply_defaults(chat)?;
+        let model = payload
+            .model
+            .clone()
+            .unwrap_or_else(|| self.defaults.model.clone());
+        let body = gemini_request_body(&payload)?;
+        let endpoint = self.endpoint(&format!("models/{model}:generateContent"));
+        let response = self.post(endpoint).json(&body).send().await?;
+        let status = response.status();
+        let metadata = extract_model_metadata(response.headers());
+        let retry_after_secs = extract_retry_after(response.headers());
+        let should_retry = extract_should_retry(response.headers());
+        let bytes = response.bytes().await?;
+        if !status.is_success() {
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::ChatCompletionsStream,
+                );
+                return Err(SamplingError::Auth(parse_error_bytes(bytes.as_ref())));
+            }
+            return Err(SamplingError::Api {
+                status,
+                message: parse_error_bytes(bytes.as_ref()),
+                model_metadata: metadata,
+                retry_after_secs,
+                should_retry,
+            });
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(SamplingError::Serialization)?;
+        let chunk = gemini_response_chunk(&model, value)?;
+        Ok((futures_util::stream::iter([Ok(chunk)]).boxed(), metadata))
+    }
+
     /// Send a conversation request using the Anthropic Messages API (non-streaming).
     ///
     /// Converts the `ConversationRequest` to Messages API format internally.
@@ -1989,6 +2058,12 @@ impl SamplingClient {
                 let events = crate::stream::stream_messages(raw, meta, request_id, idle_timeout);
                 crate::stream::collect_response(events).await
             }
+            ApiBackend::GeminiGenerateContent => {
+                let (raw, meta) = self.conversation_stream_gemini(request).await?;
+                let events =
+                    crate::stream::stream_chat_completions(raw, meta, request_id, idle_timeout);
+                crate::stream::collect_response(events).await
+            }
         };
         result
             .map(|(response, _metrics)| response)
@@ -2003,6 +2078,204 @@ impl SamplingClient {
                 should_retry: None,
             })
     }
+}
+
+fn gemini_request_body(request: &ChatCompletionRequest) -> Result<serde_json::Value> {
+    use serde_json::{Map, Value, json};
+
+    let mut system_parts = Vec::new();
+    let mut contents = Vec::new();
+    let mut tool_names = std::collections::HashMap::new();
+    for message in &request.messages {
+        let mut message_parts = Vec::new();
+        for block in message.content.blocks() {
+            match block {
+                xai_grok_sampling_types::ChatContentBlock::Text { text } => {
+                    message_parts.push(json!({"text": text}));
+                }
+                xai_grok_sampling_types::ChatContentBlock::ImageUrl { image_url } => {
+                    let Some(data_url) = image_url.url.strip_prefix("data:") else {
+                        return Err(SamplingError::InvalidConfiguration(
+                            "Gemini image inputs must use data URLs",
+                        ));
+                    };
+                    let Some((mime, data)) = data_url.split_once(";base64,") else {
+                        return Err(SamplingError::InvalidConfiguration(
+                            "Gemini image data URL must be base64 encoded",
+                        ));
+                    };
+                    message_parts.push(json!({
+                        "inlineData": {"mimeType": mime, "data": data}
+                    }));
+                }
+            }
+        }
+        if message.role == Role::System {
+            system_parts.extend(message_parts);
+            continue;
+        }
+        let mut parts: Vec<Value> = message_parts;
+        for call in &message.tool_calls {
+            let id = call
+                .id
+                .clone()
+                .unwrap_or_else(|| call.function.name.clone());
+            tool_names.insert(id, call.function.name.clone());
+            let args = serde_json::from_str::<Value>(&call.function.arguments)
+                .unwrap_or_else(|_| json!({"input": call.function.arguments}));
+            parts.push(json!({
+                "functionCall": {"name": call.function.name, "args": args}
+            }));
+        }
+        if message.role == Role::Tool {
+            let id = message.tool_call_id.as_deref().unwrap_or("tool");
+            let name = tool_names.get(id).map(String::as_str).unwrap_or(id);
+            parts = vec![json!({
+                "functionResponse": {
+                    "name": name,
+                    "response": {"output": message.text_content()}
+                }
+            })];
+        }
+        if !parts.is_empty() {
+            contents.push(json!({
+                "role": if message.role == Role::Assistant { "model" } else { "user" },
+                "parts": parts
+            }));
+        }
+    }
+
+    let mut root = Map::new();
+    root.insert("contents".to_owned(), Value::Array(contents));
+    if !system_parts.is_empty() {
+        root.insert(
+            "systemInstruction".to_owned(),
+            json!({"parts": system_parts}),
+        );
+    }
+    let mut generation = Map::new();
+    if let Some(value) = request.temperature {
+        generation.insert("temperature".to_owned(), json!(value));
+    }
+    if let Some(value) = request.top_p {
+        generation.insert("topP".to_owned(), json!(value));
+    }
+    if let Some(value) = request.max_tokens {
+        generation.insert("maxOutputTokens".to_owned(), json!(value));
+    }
+    if !generation.is_empty() {
+        root.insert("generationConfig".to_owned(), Value::Object(generation));
+    }
+    if let Some(tools) = &request.tools {
+        let declarations = tools
+            .iter()
+            .filter_map(|tool| {
+                serde_json::to_value(tool)
+                    .ok()
+                    .and_then(|value| value.get("function").cloned())
+            })
+            .collect::<Vec<_>>();
+        if !declarations.is_empty() {
+            root.insert(
+                "tools".to_owned(),
+                json!([{"functionDeclarations": declarations}]),
+            );
+        }
+    }
+    Ok(Value::Object(root))
+}
+
+fn gemini_response_chunk(model: &str, value: serde_json::Value) -> Result<ChatCompletionChunk> {
+    let candidate = value
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .ok_or_else(|| SamplingError::serialization_message("Gemini response has no candidate"))?;
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(parts) = candidate
+        .pointer("/content/parts")
+        .and_then(serde_json::Value::as_array)
+    {
+        for (index, part) in parts.iter().enumerate() {
+            if let Some(fragment) = part.get("text").and_then(serde_json::Value::as_str) {
+                text.push_str(fragment);
+            }
+            if let Some(call) = part.get("functionCall") {
+                let name = call
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool");
+                let arguments = call
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}))
+                    .to_string();
+                tool_calls.push(ToolCallDelta {
+                    index: index as u32,
+                    id: Some(format!("gemini-call-{index}")),
+                    kind: Some("function".to_owned()),
+                    function: Some(ToolCallFunctionDelta {
+                        name: Some(name.to_owned()),
+                        arguments: Some(arguments),
+                    }),
+                });
+            }
+        }
+    }
+    let finish_reason = match candidate
+        .get("finishReason")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("MAX_TOKENS") => Some(FinishReason::Length),
+        Some("SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT") => {
+            Some(FinishReason::ContentFilter)
+        }
+        Some(_) if !tool_calls.is_empty() => Some(FinishReason::ToolCalls),
+        Some(_) => Some(FinishReason::Stop),
+        None => None,
+    };
+    let usage = value.get("usageMetadata").map(|usage| {
+        let prompt = usage
+            .get("promptTokenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        let completion = usage
+            .get("candidatesTokenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        let total = usage
+            .get("totalTokenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or((prompt + completion) as u64) as u32;
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: total,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+            cost_in_usd_ticks: None,
+        }
+    });
+    Ok(ChatCompletionChunk {
+        id: "gemini-generate-content".to_owned(),
+        object: "chat.completion.chunk".to_owned(),
+        created: 0,
+        model: model.to_owned(),
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta: ChatChunkDelta {
+                role: Some(Role::Assistant),
+                content: (!text.is_empty()).then_some(text),
+                reasoning_content: None,
+                tool_calls,
+                tool_call_id: None,
+            },
+            finish_reason,
+        }],
+        usage,
+        system_fingerprint: None,
+    })
 }
 
 #[cfg(test)]
@@ -2041,6 +2314,103 @@ mod tests {
             doom_loop_recovery: None,
             header_injector: None,
         }
+    }
+
+    #[test]
+    fn gemini_native_body_uses_contents_and_system_instruction() {
+        let request = ChatCompletionRequest::new(
+            "gemini-test",
+            vec![
+                ChatRequestMessage::system("be concise"),
+                ChatRequestMessage::user("hello"),
+            ],
+        );
+        let value = gemini_request_body(&request).unwrap();
+        assert_eq!(value["systemInstruction"]["parts"][0]["text"], "be concise");
+        assert_eq!(value["contents"][0]["role"], "user");
+        assert_eq!(value["contents"][0]["parts"][0]["text"], "hello");
+        assert!(value.get("messages").is_none());
+    }
+
+    #[test]
+    fn gemini_response_maps_text_tools_and_usage() {
+        let chunk = gemini_response_chunk(
+            "gemini-test",
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"parts": [
+                        {"text": "hello"},
+                        {"functionCall": {"name": "read_file", "args": {"path": "a"}}}
+                    ]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 3,
+                    "candidatesTokenCount": 2,
+                    "totalTokenCount": 5
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hello"));
+        assert_eq!(
+            chunk.choices[0].delta.tool_calls[0]
+                .function
+                .as_ref()
+                .and_then(|function| function.name.as_deref()),
+            Some("read_file")
+        );
+        assert_eq!(
+            chunk.usage.as_ref().map(|usage| usage.total_tokens),
+            Some(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_client_sends_native_endpoint_header_and_body() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-test:generateContent"))
+            .and(header("x-goog-api-key", "gemini-secret"))
+            .and(body_json(serde_json::json!({
+                "contents": [{
+                    "role": "user",
+                    "parts": [{"text": "hello"}]
+                }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "world"}]},
+                    "finishReason": "STOP"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = minimal_config();
+        config.api_key = Some("gemini-secret".to_owned());
+        config.base_url = format!("{}/v1beta", server.uri());
+        config.model = "gemini-test".to_owned();
+        config.api_backend = ApiBackend::GeminiGenerateContent;
+        config.auth_scheme = AuthScheme::XGoogApiKey;
+        let client = SamplingClient::new(config).unwrap();
+        let auth = client.auth_info();
+        assert_eq!(auth.auth_type, "x-goog-api-key");
+        assert!(
+            auth.auth_prefix.is_none(),
+            "API keys must never be projected into diagnostic log fields"
+        );
+        let request = ConversationRequest {
+            items: vec![xai_grok_sampling_types::ConversationItem::user("hello")],
+            model: Some("gemini-test".to_owned()),
+            ..Default::default()
+        };
+        let (mut stream, _) = client.conversation_stream_gemini(request).await.unwrap();
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("world"));
     }
 
     /// Verify the serialized shape of StreamingChatRequest matches the

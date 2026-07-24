@@ -230,6 +230,8 @@ fn parse_providers(
                     .api_key
                     .as_ref()
                     .is_some_and(|source| !source.is_valid())
+                    || !valid_custom_provider(provider_id, &provider)
+                    || !valid_provider_auth_strategy(provider_id, &provider)
                 {
                     warnings.push(ModelOverrideWarning {
                         model_key: None,
@@ -257,6 +259,74 @@ fn parse_providers(
         }
     }
     providers
+}
+
+fn valid_provider_auth_strategy(provider_id: &str, provider: &ProviderConfig) -> bool {
+    use super::config::ProviderAuthStrategy;
+
+    match provider.auth_strategy {
+        None | Some(ProviderAuthStrategy::ApiKey) => provider.oauth_client_file.is_none(),
+        Some(ProviderAuthStrategy::GeminiOauth) => {
+            provider_id == "gemini"
+                && provider
+                    .oauth_client_file
+                    .as_deref()
+                    .is_some_and(|path| !path.trim().is_empty())
+                && provider.api_key.is_none()
+        }
+        // These names are reserved for a future official embedding contract.
+        // Current Codex/Claude CLIs own their OAuth credentials, so accepting
+        // either strategy would create a configured-but-unusable Provider.
+        Some(ProviderAuthStrategy::CodexOauthCompat | ProviderAuthStrategy::ClaudeOauthCompat) => {
+            false
+        }
+    }
+}
+
+fn valid_custom_provider(provider_id: &str, provider: &ProviderConfig) -> bool {
+    use super::config::{ProviderKind, ProviderModelDiscoveryFormat};
+
+    if provider.kind != Some(ProviderKind::Custom) {
+        return true;
+    }
+    if matches!(
+        provider_id,
+        "xai" | "anthropic" | "gemini" | "openai" | "openrouter" | "github-copilot"
+    ) || provider.api_key.is_some()
+        || provider.auth_strategy.is_some()
+        || provider.oauth_client_file.is_some()
+    {
+        return false;
+    }
+    let Some(base_url) = provider.base_url.as_deref() else {
+        return false;
+    };
+    let Ok(base_url) = url::Url::parse(base_url) else {
+        return false;
+    };
+    if !matches!(base_url.scheme(), "http" | "https") || base_url.host_str().is_none() {
+        return false;
+    }
+    if matches!(
+        provider.api_backend,
+        Some(xai_grok_sampler::ApiBackend::GeminiGenerateContent)
+    ) {
+        return false;
+    }
+    let Some(discovery) = provider.model_discovery.as_ref() else {
+        return true;
+    };
+    match discovery.format {
+        ProviderModelDiscoveryFormat::Configured => discovery.path.is_none(),
+        ProviderModelDiscoveryFormat::Openai => discovery.path.as_deref().is_none_or(|path| {
+            path.starts_with('/')
+                && !path.starts_with("//")
+                && url::Url::parse(path).is_err()
+                && base_url
+                    .join(path)
+                    .is_ok_and(|url| url.origin() == base_url.origin())
+        }),
+    }
 }
 
 fn is_valid_provider_id(provider_id: &str) -> bool {
@@ -336,6 +406,16 @@ fn normalize_provider_model(
         });
         return false;
     };
+    if provider.kind == Some(super::config::ProviderKind::Custom)
+        && (entry.api_key.is_some() || entry.env_key.is_some())
+    {
+        warnings.push(ModelOverrideWarning {
+            model_key: Some(model_key.to_owned()),
+            field: Some("api_key".to_owned()),
+            kind: ModelOverrideWarningKind::InvalidValue,
+        });
+        return false;
+    }
     let Some((key_provider, key_model_id)) = model_key.split_once('/') else {
         warnings.push(ModelOverrideWarning {
             model_key: Some(model_key.to_owned()),
@@ -357,7 +437,11 @@ fn normalize_provider_model(
     // let the downstream catalog builder fill in the default cli-chat-proxy
     // URL when neither side supplies a session `base_url`; the override must
     // fail closed and its caller will tombstone any stale catalog entries.
-    if entry.base_url.is_none() && provider.base_url.is_none() {
+    let fixed_provider = matches!(
+        provider_id,
+        "anthropic" | "gemini" | "openai" | "openrouter"
+    );
+    if entry.base_url.is_none() && provider.base_url.is_none() && !fixed_provider {
         warnings.push(ModelOverrideWarning {
             model_key: Some(model_key.to_owned()),
             field: Some("provider".to_owned()),
@@ -382,6 +466,9 @@ fn normalize_provider_model(
     }
 
     entry.provider = Some(provider_id.to_owned());
+    if provider.auth_strategy == Some(super::config::ProviderAuthStrategy::GeminiOauth) {
+        entry.auth_scheme = Some(xai_grok_sampler::AuthScheme::Bearer);
+    }
     if entry.model.is_none() {
         entry.model = Some(key_model_id.to_owned());
     }

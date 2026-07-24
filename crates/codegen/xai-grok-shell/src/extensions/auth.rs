@@ -6,6 +6,9 @@
 
 use agent_client_protocol as acp;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use super::{ExtResult, parse_params, to_raw_response};
 use crate::agent::MvpAgent;
@@ -17,6 +20,11 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         "x.ai/auth/getBearerToken" => handle_get_bearer_token(agent).await,
         "x.ai/getApiKey" => handle_get_api_key(),
         "x.ai/setApiKey" => handle_set_api_key(args),
+        "x.ai/provider/setApiKey" => handle_set_provider_api_key(agent, args).await,
+        "x.ai/provider/methods" => handle_provider_methods(agent),
+        "x.ai/provider/geminiOAuthStart" => handle_gemini_oauth_start(agent, args),
+        "x.ai/provider/geminiOAuthComplete" => handle_gemini_oauth_complete(agent, args).await,
+        "x.ai/provider/geminiOAuthCancel" => handle_gemini_oauth_cancel(args),
         "x.ai/auth/submit_code" => handle_submit_code(agent, args),
         "x.ai/auth/get_url" => handle_get_url(agent).await,
         "x.ai/auth/logout" => handle_logout(agent, args).await,
@@ -24,6 +32,209 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         "x.ai/auth/check_subscription" => handle_check_subscription(agent).await,
         _ => Err(acp::Error::method_not_found()),
     }
+}
+
+struct PendingGeminiOAuth {
+    client: crate::auth::gemini_oauth::GeminiOAuthClient,
+    start: crate::auth::gemini_oauth::GeminiOAuthStart,
+    created_at: Instant,
+}
+
+fn pending_gemini_oauth() -> &'static Mutex<HashMap<String, PendingGeminiOAuth>> {
+    static PENDING: OnceLock<Mutex<HashMap<String, PendingGeminiOAuth>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn take_pending_gemini_oauth(
+    flow_id: &str,
+    returned_state: &str,
+) -> Result<PendingGeminiOAuth, &'static str> {
+    let mut pending = pending_gemini_oauth()
+        .lock()
+        .map_err(|_| "Gemini OAuth flow registry unavailable")?;
+    let candidate = pending
+        .get(flow_id)
+        .ok_or("Gemini OAuth flow is missing or expired")?;
+    if candidate.start.state != returned_state {
+        return Err("Gemini OAuth state mismatch");
+    }
+    pending
+        .remove(flow_id)
+        .ok_or("Gemini OAuth flow is missing or expired")
+}
+
+fn handle_gemini_oauth_start(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Params {
+        redirect_uri: String,
+    }
+
+    let params: Params = parse_params(args)?;
+    let cfg = agent.cfg.borrow();
+    if !cfg.features.provider_gemini_oauth.unwrap_or(false) {
+        return Err(acp::Error::invalid_params().data("Gemini OAuth is not enabled".to_owned()));
+    }
+    let client_file = cfg
+        .providers
+        .get("gemini")
+        .filter(|provider| {
+            provider.auth_strategy == Some(crate::agent::config::ProviderAuthStrategy::GeminiOauth)
+        })
+        .and_then(|provider| provider.oauth_client_file.as_deref())
+        .ok_or_else(|| {
+            acp::Error::invalid_params()
+                .data("Gemini OAuth client file is not configured".to_owned())
+        })?;
+    let client = crate::auth::gemini_oauth::GeminiOAuthClient::from_client_file(client_file)
+        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+    let redirect_uri = url::Url::parse(&params.redirect_uri)
+        .map_err(|_| acp::Error::invalid_params().data("invalid redirect URI".to_owned()))?;
+    let start = client
+        .begin(redirect_uri)
+        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+    let flow_id = uuid::Uuid::now_v7().to_string();
+    let mut pending = pending_gemini_oauth()
+        .lock()
+        .map_err(|_| acp::Error::internal_error())?;
+    pending.retain(|_, flow| flow.created_at.elapsed() < Duration::from_secs(600));
+    pending.insert(
+        flow_id.clone(),
+        PendingGeminiOAuth {
+            client,
+            start: start.clone(),
+            created_at: Instant::now(),
+        },
+    );
+    ExtMethodResult::success(serde_json::json!({
+        "flowId": flow_id,
+        "authorizationUrl": start.authorization_url,
+    }))
+    .to_ext_response()
+    .map_err(|error| acp::Error::internal_error().data(error.to_string()))
+}
+
+async fn handle_gemini_oauth_complete(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Params {
+        flow_id: String,
+        state: String,
+        code: String,
+    }
+
+    let params: Params = parse_params(args)?;
+    let flow = take_pending_gemini_oauth(&params.flow_id, &params.state)
+        .map_err(|message| acp::Error::invalid_params().data(message.to_owned()))?;
+    if flow.created_at.elapsed() >= Duration::from_secs(600) {
+        return Err(acp::Error::invalid_params().data("Gemini OAuth flow expired".to_owned()));
+    }
+    let store = crate::auth::provider_registry::ProviderCredentialStore::new(
+        crate::util::grok_home::grok_home(),
+    );
+    flow.client
+        .exchange_and_store(
+            &reqwest::Client::new(),
+            &store,
+            &flow.start,
+            &params.state,
+            &params.code,
+        )
+        .await
+        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+    agent.models_manager.on_auth_changed().await;
+    ExtMethodResult::success(serde_json::json!({ "ok": true, "provider": "gemini" }))
+        .to_ext_response()
+        .map_err(|error| acp::Error::internal_error().data(error.to_string()))
+}
+
+fn handle_gemini_oauth_cancel(args: &acp::ExtRequest) -> ExtResult {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Params {
+        flow_id: String,
+    }
+    let params: Params = parse_params(args)?;
+    pending_gemini_oauth()
+        .lock()
+        .map_err(|_| acp::Error::internal_error())?
+        .remove(&params.flow_id);
+    ExtMethodResult::success(serde_json::json!({ "ok": true }))
+        .to_ext_response()
+        .map_err(|error| acp::Error::internal_error().data(error.to_string()))
+}
+
+fn handle_provider_methods(agent: &MvpAgent) -> ExtResult {
+    let cfg = agent.cfg.borrow();
+    let gates = crate::auth::provider_registry::ProviderReleaseGates::from_features(&cfg.features);
+    let gemini_oauth_ready = cfg
+        .providers
+        .get("gemini")
+        .filter(|provider| {
+            provider.auth_strategy == Some(crate::agent::config::ProviderAuthStrategy::GeminiOauth)
+        })
+        .and_then(|provider| provider.oauth_client_file.as_deref())
+        .is_some_and(|path| {
+            crate::auth::gemini_oauth::GeminiOAuthClient::from_client_file(path).is_ok()
+        });
+    let methods = crate::auth::provider_registry::provider_auth_methods(
+        gates,
+        github_copilot_sdk::HAS_BUNDLED_CLI || command_on_path("copilot"),
+        gemini_oauth_ready,
+    );
+    ExtMethodResult::success(serde_json::json!({ "methods": methods }))
+        .to_ext_response()
+        .map_err(|error| acp::Error::internal_error().data(error.to_string()))
+}
+
+fn command_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| directory.join(name).is_file())
+}
+
+async fn handle_set_provider_api_key(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+    #[derive(Deserialize)]
+    struct Params {
+        provider: String,
+        key: String,
+    }
+
+    let params: Params = parse_params(args)?;
+    let key = crate::auth::provider_registry::ApiKey::new(params.key)
+        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+    let store = crate::auth::provider_registry::ProviderCredentialStore::new(
+        crate::util::grok_home::grok_home(),
+    );
+    if let Ok(provider) = serde_json::from_value::<crate::auth::provider_registry::ProviderId>(
+        serde_json::Value::String(params.provider.clone()),
+    ) {
+        store.store_api_key(provider, key)
+    } else {
+        let is_configured_custom = agent
+            .cfg
+            .borrow()
+            .providers
+            .get(&params.provider)
+            .is_some_and(|provider| {
+                provider.kind == Some(crate::agent::config::ProviderKind::Custom)
+            });
+        if !is_configured_custom {
+            return Err(
+                acp::Error::invalid_params().data("custom Provider is not configured".to_owned())
+            );
+        }
+        store.store_custom_api_key(&params.provider, key)
+    }
+    .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+    agent.models_manager.on_auth_changed().await;
+    ExtMethodResult::success(serde_json::json!({
+        "ok": true,
+        "provider": params.provider
+    }))
+    .to_ext_response()
+    .map_err(|error| acp::Error::internal_error().data(error.to_string()))
 }
 
 async fn handle_get_bearer_token(agent: &MvpAgent) -> ExtResult {
@@ -222,4 +433,51 @@ fn handle_info(agent: &MvpAgent) -> ExtResult {
             .as_ref()
             .is_some_and(|a| a.coding_data_retention_opt_out),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemini_oauth_state_mismatch_does_not_consume_pending_flow() {
+        let directory = tempfile::tempdir().unwrap();
+        let client_file = directory.path().join("client.json");
+        std::fs::write(
+            &client_file,
+            serde_json::json!({
+                "installed": {
+                    "client_id": "user-client.apps.googleusercontent.com",
+                    "client_secret": "secret",
+                    "auth_uri": "https://accounts.google.com/o/oauth2/v2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": ["http://localhost"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let client =
+            crate::auth::gemini_oauth::GeminiOAuthClient::from_client_file(client_file).unwrap();
+        let start = client
+            .begin(url::Url::parse("http://127.0.0.1:43123/oauth/callback").unwrap())
+            .unwrap();
+        let flow_id = uuid::Uuid::now_v7().to_string();
+        pending_gemini_oauth().lock().unwrap().insert(
+            flow_id.clone(),
+            PendingGeminiOAuth {
+                client,
+                start: start.clone(),
+                created_at: Instant::now(),
+            },
+        );
+
+        assert!(matches!(
+            take_pending_gemini_oauth(&flow_id, "attacker-state"),
+            Err("Gemini OAuth state mismatch")
+        ));
+        assert!(pending_gemini_oauth().lock().unwrap().contains_key(&flow_id));
+        assert!(take_pending_gemini_oauth(&flow_id, &start.state).is_ok());
+        assert!(!pending_gemini_oauth().lock().unwrap().contains_key(&flow_id));
+    }
 }

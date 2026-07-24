@@ -270,6 +270,20 @@ fn custom_model_entry(
     entry
 }
 
+fn copilot_model_entry(
+    cfg: &config::Config,
+    model: crate::auth::copilot_sdk::CopilotModel,
+) -> ModelEntry {
+    let mut entry = ModelEntry::fallback(&model.id, &cfg.endpoints);
+    entry.info.id = Some(format!("github-copilot/{}", model.id));
+    entry.info.name = Some(model.name);
+    entry.info.model = model.id;
+    // This sentinel is intercepted before the HTTP sampler is constructed.
+    entry.info.base_url = "copilot-sdk://runtime".to_owned();
+    entry.info.supported_in_api = true;
+    entry
+}
+
 impl Default for ModelsManager {
     fn default() -> Self {
         let grok_home = crate::util::grok_home::grok_home();
@@ -1449,6 +1463,35 @@ impl ModelsManager {
         }
         drop(registry);
 
+        const COPILOT_PREFIX: &str = "github-copilot/";
+        if cfg.features.provider_github_copilot.unwrap_or(false) {
+            use crate::auth::copilot_sdk::{CopilotRuntime, OfficialCopilotRuntime};
+
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                OfficialCopilotRuntime.list_models(),
+            )
+            .await
+            {
+                Ok(Ok(models)) => {
+                    next_discovered.retain(|model, _| !model.starts_with(COPILOT_PREFIX));
+                    for model in models {
+                        let id = format!("{COPILOT_PREFIX}{}", model.id);
+                        next_discovered.insert(id, copilot_model_entry(cfg, model));
+                    }
+                }
+                Ok(Err(error)) => tracing::warn!(
+                    failure_kind = ?error.kind,
+                    "Copilot SDK model discovery unavailable; preserving prior catalog"
+                ),
+                Err(_) => tracing::warn!(
+                    "Copilot SDK model discovery timed out; preserving prior catalog"
+                ),
+            }
+        } else {
+            next_discovered.retain(|model, _| !model.starts_with(COPILOT_PREFIX));
+        }
+
         let discovered_changed = {
             let current = self.inner.discovered_provider_models.read();
             current.len() != next_discovered.len() || current.keys().ne(next_discovered.keys())
@@ -2446,6 +2489,24 @@ pub(crate) async fn fetch_models_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copilot_model_entry_uses_sdk_runtime_sentinel() {
+        let cfg = config::Config::default();
+        let entry = copilot_model_entry(
+            &cfg,
+            crate::auth::copilot_sdk::CopilotModel {
+                id: "gpt-5".to_owned(),
+                name: "GPT-5".to_owned(),
+            },
+        );
+
+        assert_eq!(entry.info.id.as_deref(), Some("github-copilot/gpt-5"));
+        assert_eq!(entry.info.name.as_deref(), Some("GPT-5"));
+        assert_eq!(entry.info.model, "gpt-5");
+        assert_eq!(entry.info.base_url, "copilot-sdk://runtime");
+        assert!(entry.info.supported_in_api);
+    }
 
     fn test_manager() -> ModelsManager {
         let _ = tracing_subscriber::fmt()

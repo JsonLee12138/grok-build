@@ -905,6 +905,63 @@ impl SessionActor {
         self: &Arc<Self>,
         request: ConversationRequest,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
+        if let Some(config) = self.chat_state_handle.get_sampling_config().await
+            && config.base_url == "copilot-sdk://runtime"
+        {
+            use crate::auth::copilot_sdk::{CopilotRuntime, OfficialCopilotRuntime};
+
+            let started = std::time::Instant::now();
+            let prompt = request
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let content = item.text_content();
+                    (!content.is_empty()).then(|| {
+                        let role = match item {
+                            ConversationItem::System(_) => "system",
+                            ConversationItem::User(_) => "user",
+                            ConversationItem::Assistant(_) => "assistant",
+                            ConversationItem::ToolResult(_) => "tool",
+                            ConversationItem::BackendToolCall(_) => "backend_tool",
+                            ConversationItem::Reasoning(_) => "reasoning",
+                        };
+                        format!("{role}: {content}")
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let completion = OfficialCopilotRuntime
+                .send_and_wait(&config.model, &prompt)
+                .await
+                .map_err(|error| {
+                    acp::Error::internal_error()
+                        .data(format!("GitHub Copilot unavailable ({:?})", error.kind))
+                })?;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let response = ConversationResponse {
+                items: vec![
+                    ConversationItem::assistant(completion.content).with_model_id(config.model),
+                ],
+                stop_reason: None,
+                usage: None,
+                cost_usd_ticks: None,
+                message_chunks_emitted: 0,
+                doom_loop_signals: Vec::new(),
+                stop_message: None,
+            };
+            let metrics = xai_grok_sampler::InferenceLatencyStats {
+                time_to_first_token_ms: Some(elapsed_ms),
+                time_to_last_byte_ms: elapsed_ms,
+                chunk_count: 1,
+                attempts: 1,
+                ..Default::default()
+            };
+            return Ok(SamplerTurnOutcome::Response(
+                Box::new(response),
+                Box::new(metrics),
+            ));
+        }
+
         self.prepare_sampler_for_turn().await;
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();

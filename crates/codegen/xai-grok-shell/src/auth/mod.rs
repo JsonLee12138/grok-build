@@ -7,6 +7,7 @@ pub mod device_code;
 pub mod error;
 mod external_auth;
 mod flow;
+pub mod gemini_oauth;
 mod jwt;
 pub(crate) mod manager;
 mod model;

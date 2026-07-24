@@ -1298,8 +1298,49 @@ impl ModelsManager {
         for provider in ProviderId::ALL {
             let provider_registered = registered.remove(&provider).unwrap_or_default();
             let provider_prefix = format!("{}/", provider.as_str());
-            let has_key = store.api_key(provider).ok().flatten().is_some();
-            if !has_key {
+            let gemini_oauth_config = (provider == ProviderId::Gemini
+                && cfg.features.provider_gemini_oauth.unwrap_or(false))
+            .then(|| cfg.providers.get("gemini"))
+            .flatten()
+            .filter(|provider| {
+                provider.auth_strategy == Some(config::ProviderAuthStrategy::GeminiOauth)
+            });
+            let gemini_oauth_credential = if let Some(provider_config) = gemini_oauth_config {
+                match provider_config
+                    .oauth_client_file
+                    .as_deref()
+                    .map(crate::auth::gemini_oauth::GeminiOAuthClient::from_client_file)
+                {
+                    Some(Ok(oauth_client)) => {
+                        match oauth_client.valid_credential(&client, &store).await {
+                            Ok(credential) => Some(credential),
+                            Err(error) => {
+                                tracing::warn!(
+                                    provider = "gemini",
+                                    error = %error,
+                                    "Gemini OAuth credential unavailable; reauthentication required"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(
+                            provider = "gemini",
+                            error = %error,
+                            "Gemini OAuth client configuration is invalid"
+                        );
+                        None
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let has_credential = gemini_oauth_credential.is_some()
+                || (gemini_oauth_config.is_none()
+                    && store.api_key(provider).ok().flatten().is_some());
+            if !has_credential {
                 next.retain(|model| !model.starts_with(&provider_prefix));
                 next_discovered.retain(|model, _| !model.starts_with(&provider_prefix));
                 continue;
@@ -1312,7 +1353,15 @@ impl ModelsManager {
             }
             let discovery = match provider {
                 ProviderId::Anthropic => registry.discover_anthropic_http(&store, &client).await,
-                ProviderId::Gemini => registry.discover_gemini_http(&store, &client).await,
+                ProviderId::Gemini => {
+                    if let Some(credential) = gemini_oauth_credential.as_ref() {
+                        registry
+                            .discover_gemini_oauth_http(credential, &client)
+                            .await
+                    } else {
+                        registry.discover_gemini_http(&store, &client).await
+                    }
+                }
                 ProviderId::Openai | ProviderId::Openrouter => {
                     registry
                         .discover_registered_http(&store, provider, &provider_registered, &client)

@@ -269,8 +269,25 @@ impl SessionActor {
                 reasoning_effort: None,
                 stream_tool_calls: None,
             });
-        let creds = self.chat_state_handle.get_credentials().await;
+        let mut creds = self.chat_state_handle.get_credentials().await;
         let model_facts = self.model_auth_facts(cfg.model.as_str());
+        if model_facts.gemini_oauth {
+            match crate::auth::gemini_oauth::valid_credential_from_effective_config(
+                &reqwest::Client::new(),
+            )
+            .await
+            {
+                Ok(credential) => creds.api_key = Some(credential.access_token),
+                Err(error) => {
+                    creds.api_key = None;
+                    tracing::warn!(
+                        provider = "gemini",
+                        error = %error,
+                        "Gemini OAuth refresh unavailable; authentication is required"
+                    );
+                }
+            }
+        }
         let auth_method = self.auth_method_id.load();
         let gate =
             SessionTokenAuthGate::new(auth_method.as_deref(), model_facts.byok, &cfg.base_url);

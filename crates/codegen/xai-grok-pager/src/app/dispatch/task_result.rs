@@ -184,6 +184,15 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.show_toast(&format!("Couldn't save {provider} API key"));
             vec![]
         }
+        TaskResult::GeminiOAuthCompleted => {
+            app.show_toast("Gemini OAuth connected");
+            vec![]
+        }
+        TaskResult::GeminiOAuthFailed { error } => {
+            tracing::warn!(error = %error, "Gemini OAuth failed");
+            app.show_toast("Gemini OAuth failed");
+            vec![]
+        }
         TaskResult::SessionCreated {
             agent_id,
             session_id,

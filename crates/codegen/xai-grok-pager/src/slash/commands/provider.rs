@@ -15,7 +15,7 @@ impl SlashCommand for ProviderCommand {
     }
 
     fn usage(&self) -> &str {
-        "/provider <xai|anthropic|gemini|openai|openrouter|custom-name>"
+        "/provider <xai|anthropic|gemini|gemini-oauth|openai|openrouter|custom-name>"
     }
 
     fn args_required(&self) -> bool {
@@ -25,11 +25,13 @@ impl SlashCommand for ProviderCommand {
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
         match args.trim() {
             "xai" => CommandResult::Action(Action::SelectXaiProvider),
+            "gemini-oauth" => CommandResult::Action(Action::StartGeminiOAuth),
             "anthropic" | "gemini" | "openai" | "openrouter" => {
                 CommandResult::Action(Action::OpenProviderApiKey(args.trim().to_owned()))
             }
             "" => CommandResult::Error(
-                "Usage: /provider <xai|anthropic|gemini|openai|openrouter|custom-name>".to_string(),
+                "Usage: /provider <xai|anthropic|gemini|gemini-oauth|openai|openrouter|custom-name>"
+                    .to_string(),
             ),
             provider if valid_custom_provider_name(provider) => {
                 CommandResult::Action(Action::OpenProviderApiKey(provider.to_owned()))
@@ -125,6 +127,10 @@ mod tests {
             command.run(&mut ctx, "custom-a"),
             CommandResult::Action(Action::OpenProviderApiKey(provider))
                 if provider == "custom-a"
+        ));
+        assert!(matches!(
+            command.run(&mut ctx, "gemini-oauth"),
+            CommandResult::Action(Action::StartGeminiOAuth)
         ));
     }
 }

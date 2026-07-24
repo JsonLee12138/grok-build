@@ -1018,6 +1018,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             });
             vec![]
         }
+        Action::StartGeminiOAuth => vec![Effect::StartGeminiOAuth],
         Action::SetProviderApiKey { provider, key } => {
             vec![Effect::SetProviderApiKey { provider, key }]
         }

@@ -605,6 +605,8 @@ pub enum Action {
     SelectXaiProvider,
     /// Open a masked API-key prompt for a fixed Provider adapter.
     OpenProviderApiKey(String),
+    /// Start Gemini's user-owned OAuth client flow in the system browser.
+    StartGeminiOAuth,
     /// Persist a Provider API key through the agent extension boundary.
     SetProviderApiKey {
         provider: String,
@@ -1675,6 +1677,8 @@ pub enum Effect {
         provider: String,
         key: xai_grok_shell::auth::provider_registry::ApiKey,
     },
+    /// Run the Gemini OAuth loopback flow through the shell extension boundary.
+    StartGeminiOAuth,
     /// Fetch MCP server list from the shell (x.ai/mcp/list).
     FetchMcpsList {
         agent_id: AgentId,
@@ -2070,6 +2074,10 @@ pub enum TaskResult {
     /// Provider API key could not be stored or validated.
     ProviderApiKeyStoreFailed {
         provider: String,
+        error: String,
+    },
+    GeminiOAuthCompleted,
+    GeminiOAuthFailed {
         error: String,
     },
     /// Session was created successfully.

@@ -3785,9 +3785,23 @@ pub struct ProviderConfig {
     pub api_backend: Option<ApiBackend>,
     pub auth_scheme: Option<AuthScheme>,
     pub api_key: Option<ApiKeySource>,
+    /// Selects a non-default credential strategy for a built-in Provider.
+    pub auth_strategy: Option<ProviderAuthStrategy>,
+    /// User-owned OAuth client JSON. The file path is persisted, never its
+    /// client secret.
+    pub oauth_client_file: Option<String>,
     pub model_discovery: Option<ProviderModelDiscoveryConfig>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthStrategy {
+    ApiKey,
+    GeminiOauth,
+    CodexOauthCompat,
+    ClaudeOauthCompat,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -4026,7 +4040,9 @@ impl ConfigModelOverride {
                     crate::auth::provider_registry::endpoint_base(provider).to_owned();
                 entry.api_base_url = None;
                 entry.info.api_backend = ApiBackend::GeminiGenerateContent;
-                entry.info.auth_scheme = AuthScheme::XGoogApiKey;
+                if self.auth_scheme != Some(AuthScheme::Bearer) {
+                    entry.info.auth_scheme = AuthScheme::XGoogApiKey;
+                }
             }
         }
         entry
@@ -4701,6 +4717,21 @@ pub(crate) fn resolve_fixed_provider_credentials_at(
     let store = crate::auth::provider_registry::ProviderCredentialStore::new(grok_home);
     let builtin = crate::auth::provider_registry::ProviderId::from_canonical_model(canonical);
     let api_key = match builtin {
+        Some(crate::auth::provider_registry::ProviderId::Gemini)
+            if model.info.auth_scheme == AuthScheme::Bearer =>
+        {
+            store
+                .oauth(
+                    crate::auth::provider_registry::ProviderId::Gemini,
+                    crate::auth::gemini_oauth::GEMINI_OAUTH_STRATEGY,
+                )
+                .map(|credential| {
+                    credential.map(|credential| {
+                        crate::auth::provider_registry::ApiKey::new(credential.access_token)
+                            .expect("stored OAuth access token was validated")
+                    })
+                })
+        }
         Some(provider) => store.api_key(provider),
         None => store.custom_api_key(provider_name),
     }
@@ -4721,7 +4752,7 @@ pub(crate) fn resolve_fixed_provider_credentials_at(
         auth_type: xai_chat_state::AuthType::ApiKey,
         auth_scheme: match builtin {
             Some(crate::auth::provider_registry::ProviderId::Anthropic) => AuthScheme::XApiKey,
-            Some(crate::auth::provider_registry::ProviderId::Gemini) => AuthScheme::XGoogApiKey,
+            Some(crate::auth::provider_registry::ProviderId::Gemini) => model.info.auth_scheme,
             Some(
                 crate::auth::provider_registry::ProviderId::Openai
                 | crate::auth::provider_registry::ProviderId::Openrouter,
@@ -4797,6 +4828,7 @@ pub fn try_resolve_model_credentials(
 pub struct ModelAuthFacts {
     pub byok: ModelByok,
     pub auth_scheme: AuthScheme,
+    pub gemini_oauth: bool,
 }
 /// Resolve `model_id` to its auth facts from one effective-config load.
 /// Load/parse failure → `byok = Unknown`; model absent from the catalog →
@@ -4807,6 +4839,7 @@ pub fn resolve_model_auth_facts(model_id: &str) -> ModelAuthFacts {
         return ModelAuthFacts {
             byok: ModelByok::Unknown,
             auth_scheme: AuthScheme::default(),
+            gemini_oauth: false,
         };
     }
     with_resolved_model(model_id, |lookup| ModelAuthFacts {
@@ -4815,6 +4848,12 @@ pub fn resolve_model_auth_facts(model_id: &str) -> ModelAuthFacts {
             ModelLookup::Loaded(Some(e)) => e.info().auth_scheme,
             _ => AuthScheme::default(),
         },
+        gemini_oauth: matches!(
+            lookup,
+            ModelLookup::Loaded(Some(e))
+                if e.info().id.as_deref().is_some_and(|id| id.starts_with("gemini/"))
+                    && e.info().auth_scheme == AuthScheme::Bearer
+        ),
     })
 }
 fn byok_from_lookup(lookup: &ModelLookup) -> ModelByok {
@@ -7794,6 +7833,89 @@ reasoning_effort = "low"
             warning.model_key.as_deref() == Some("custom-a/demo")
                 && warning.field.as_deref() == Some("api_key")
         }));
+    }
+
+    #[test]
+    fn gemini_oauth_strategy_requires_user_client_and_uses_bearer_projection() {
+        let (cfg, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.gemini]
+            auth_strategy = "gemini_oauth"
+            oauth_client_file = "/tmp/google-client.json"
+
+            [model."gemini/gemini-test"]
+            provider = "gemini"
+            "#,
+            None,
+        );
+        assert_eq!(
+            cfg.providers["gemini"].auth_strategy,
+            Some(ProviderAuthStrategy::GeminiOauth)
+        );
+        let model = &catalog["gemini/gemini-test"];
+        assert_eq!(model.info.auth_scheme, AuthScheme::Bearer);
+        assert_eq!(model.info.api_backend, ApiBackend::GeminiGenerateContent);
+        assert_eq!(
+            model.info.base_url,
+            crate::auth::provider_registry::endpoint_base(
+                crate::auth::provider_registry::ProviderId::Gemini
+            )
+        );
+    }
+
+    #[test]
+    fn gemini_oauth_strategy_without_client_fails_closed() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [provider.gemini]
+            auth_strategy = "gemini_oauth"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        assert!(!cfg.providers.contains_key("gemini"));
+    }
+
+    #[test]
+    fn gemini_oauth_request_uses_oauth_token_without_api_key_namespace() {
+        let (_, catalog) = resolve_models_from_toml(
+            r#"
+            [provider.gemini]
+            auth_strategy = "gemini_oauth"
+            oauth_client_file = "/tmp/google-client.json"
+
+            [model."gemini/gemini-test"]
+            provider = "gemini"
+            "#,
+            None,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::auth::provider_registry::ProviderCredentialStore::new(directory.path());
+        store
+            .store_api_key(
+                crate::auth::provider_registry::ProviderId::Gemini,
+                crate::auth::provider_registry::ApiKey::new("api-key-must-not-win").unwrap(),
+            )
+            .unwrap();
+        store
+            .store_oauth(
+                crate::auth::provider_registry::ProviderId::Gemini,
+                crate::auth::provider_registry::ProviderOAuthCredential {
+                    strategy: crate::auth::gemini_oauth::GEMINI_OAUTH_STRATEGY.to_owned(),
+                    access_token: "oauth-access-token".to_owned(),
+                    refresh_token: Some("refresh-token".to_owned()),
+                    expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+                    token_endpoint: "https://oauth2.googleapis.com/token".to_owned(),
+                    client_id: "user-client".to_owned(),
+                    source: Some("/tmp/google-client.json".to_owned()),
+                },
+            )
+            .unwrap();
+        let resolved =
+            resolve_fixed_provider_credentials_at(&catalog["gemini/gemini-test"], directory.path())
+                .unwrap();
+        assert_eq!(resolved.api_key.as_deref(), Some("oauth-access-token"));
+        assert_eq!(resolved.auth_scheme, AuthScheme::Bearer);
     }
 
     #[test]

@@ -31,6 +31,94 @@ use agent::AgentId;
 use crate::unified_log as ulog;
 use xai_grok_shell::sampling::error::http_status_from_error;
 use xai_grok_shell::session::{ExtMethodResult, SessionInfoResponse};
+
+async fn run_gemini_oauth_loopback(tx: &AcpAgentTx) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| format!("could not bind OAuth callback: {error}"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("could not read OAuth callback address: {error}"))?;
+    let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", address.port());
+    let params = serde_json::json!({ "redirectUri": redirect_uri });
+    let request = acp::ExtRequest::new(
+        "x.ai/provider/geminiOAuthStart",
+        serde_json::value::to_raw_value(&params)
+            .map_err(|error| error.to_string())?
+            .into(),
+    );
+    let response = acp_send(request, tx)
+        .await
+        .map_err(|error| error.to_string())?;
+    let start: serde_json::Value =
+        serde_json::from_str(response.0.get()).map_err(|error| error.to_string())?;
+    let flow_id = start
+        .get("flowId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Gemini OAuth response did not include flowId".to_owned())?;
+    let authorization_url = start
+        .get("authorizationUrl")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Gemini OAuth response did not include authorizationUrl".to_owned())?;
+    crate::app::link_opener::open_url(authorization_url);
+
+    let (mut stream, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(600), listener.accept())
+        .await
+        .map_err(|_| "Gemini OAuth callback timed out".to_owned())?
+        .map_err(|error| format!("Gemini OAuth callback failed: {error}"))?;
+    let mut request_bytes = vec![0_u8; 8192];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read(&mut request_bytes),
+    )
+    .await
+    .map_err(|_| "Gemini OAuth callback read timed out".to_owned())?
+    .map_err(|error| format!("Gemini OAuth callback read failed: {error}"))?;
+    let request_text = std::str::from_utf8(&request_bytes[..read])
+        .map_err(|_| "Gemini OAuth callback was not valid HTTP".to_owned())?;
+    let target = request_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| "Gemini OAuth callback request was malformed".to_owned())?;
+    let callback = url::Url::parse(&format!("http://127.0.0.1{target}"))
+        .map_err(|_| "Gemini OAuth callback URL was malformed".to_owned())?;
+    let query: std::collections::HashMap<_, _> = callback.query_pairs().into_owned().collect();
+    let code = query
+        .get("code")
+        .ok_or_else(|| query.get("error").cloned().unwrap_or_else(|| "authorization code missing".to_owned()))?;
+    let state = query
+        .get("state")
+        .ok_or_else(|| "Gemini OAuth callback state missing".to_owned())?;
+
+    let complete_params = serde_json::json!({
+        "flowId": flow_id,
+        "state": state,
+        "code": code,
+    });
+    let complete = acp::ExtRequest::new(
+        "x.ai/provider/geminiOAuthComplete",
+        serde_json::value::to_raw_value(&complete_params)
+            .map_err(|error| error.to_string())?
+            .into(),
+    );
+    let result = acp_send(complete, tx).await.map_err(|error| error.to_string());
+    let (status, body) = if result.is_ok() {
+        ("200 OK", "Gemini OAuth connected. You can return to Grok Build.")
+    } else {
+        ("400 Bad Request", "Gemini OAuth failed. Return to Grok Build for details.")
+    };
+    let http_response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(http_response.as_bytes()).await;
+    result.map(|_| ())
+}
+
 pub(crate) fn execute(
     effect: Effect,
     tasks: &mut JoinSet<TaskResult>,
@@ -1996,6 +2084,15 @@ pub(crate) fn execute(
                         provider,
                         error: error.to_string(),
                     },
+                }
+            });
+        }
+        Effect::StartGeminiOAuth => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                match run_gemini_oauth_loopback(&tx).await {
+                    Ok(()) => TaskResult::GeminiOAuthCompleted,
+                    Err(error) => TaskResult::GeminiOAuthFailed { error },
                 }
             });
         }

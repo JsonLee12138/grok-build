@@ -82,6 +82,7 @@ impl ProviderReleaseGates {
 pub fn provider_auth_methods(
     gates: ProviderReleaseGates,
     copilot_external_ready: bool,
+    gemini_oauth_ready: bool,
 ) -> Vec<ProviderAuthMethod> {
     let mut methods = vec![
         ProviderAuthMethod {
@@ -118,9 +119,11 @@ pub fn provider_auth_methods(
             id: "gemini_oauth",
             provider: "gemini",
             stability: AdapterStability::Conditional,
-            // The user-owned OAuth client flow is not enabled until its
-            // implementation and real-account UAT both pass.
-            availability: AdapterAvailability::NotEnabled,
+            availability: if gemini_oauth_ready {
+                AdapterAvailability::Available
+            } else {
+                AdapterAvailability::NotEnabled
+            },
             requires_confirmation: false,
         });
     }
@@ -290,10 +293,15 @@ impl std::fmt::Debug for ProviderOAuthCredential {
 }
 
 impl ProviderOAuthCredential {
-    fn refresh_fingerprint(&self) -> Option<String> {
+    pub(crate) fn refresh_fingerprint(&self) -> Option<String> {
         self.refresh_token
             .as_ref()
             .map(|token| blake3::hash(token.as_bytes()).to_hex().to_string())
+    }
+
+    pub fn is_expired_or_near_expiry(&self) -> bool {
+        self.expires_at
+            .is_some_and(|expires_at| expires_at <= chrono::Utc::now().timestamp() + 60)
     }
 
     fn validate(&self) -> Result<()> {
@@ -519,6 +527,45 @@ impl ProviderCredentialStore {
         observed_refresh_fingerprint: Option<&str>,
         client: &reqwest::Client,
     ) -> Result<ProviderOAuthCredential> {
+        self.refresh_oauth_http_inner(
+            provider,
+            strategy,
+            observed_refresh_fingerprint,
+            client,
+            None,
+        )
+        .await
+    }
+
+    pub async fn refresh_oauth_http_with_client_secret(
+        &self,
+        provider: ProviderId,
+        strategy: &str,
+        observed_refresh_fingerprint: Option<&str>,
+        client: &reqwest::Client,
+        client_secret: &str,
+    ) -> Result<ProviderOAuthCredential> {
+        if client_secret.is_empty() {
+            bail!("provider OAuth client secret is empty");
+        }
+        self.refresh_oauth_http_inner(
+            provider,
+            strategy,
+            observed_refresh_fingerprint,
+            client,
+            Some(client_secret),
+        )
+        .await
+    }
+
+    async fn refresh_oauth_http_inner(
+        &self,
+        provider: ProviderId,
+        strategy: &str,
+        observed_refresh_fingerprint: Option<&str>,
+        client: &reqwest::Client,
+        client_secret: Option<&str>,
+    ) -> Result<ProviderOAuthCredential> {
         let lock = self.lock_with_timeout(Duration::from_secs(10))?;
         let mut root = self.read_provider_root_while_locked(&lock)?;
         let current_value = root
@@ -544,13 +591,17 @@ impl ProviderCredentialStore {
             .refresh_token
             .as_deref()
             .ok_or_else(|| anyhow!("provider OAuth credential has no refresh token"))?;
+        let mut form = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", current.client_id.as_str()),
+        ];
+        if let Some(client_secret) = client_secret {
+            form.push(("client_secret", client_secret));
+        }
         let response = client
             .post(&current.token_endpoint)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-                ("client_id", current.client_id.as_str()),
-            ])
+            .form(&form)
             .send()
             .await
             .context("requesting provider OAuth token refresh")?;
@@ -1072,6 +1123,36 @@ impl ProviderAdapterRegistry {
         }
     }
 
+    pub async fn discover_gemini_oauth_http(
+        &mut self,
+        credential: &ProviderOAuthCredential,
+        client: &reqwest::Client,
+    ) -> Result<Vec<CatalogModel>> {
+        if credential.strategy != crate::auth::gemini_oauth::GEMINI_OAUTH_STRATEGY {
+            bail!("Gemini OAuth credential strategy mismatch");
+        }
+        let provider = ProviderId::Gemini;
+        let endpoint = Url::parse(catalog_endpoint(provider)).expect("fixed provider catalog URL");
+        let cache_key = CatalogCacheKey {
+            provider,
+            policy: "gemini-oauth-generate-content-v1beta".to_owned(),
+            // Bind OAuth cache to the public client/account strategy, not the
+            // short-lived access token, so a normal refresh keeps fallback.
+            key_fingerprint: blake3::hash(credential.client_id.as_bytes())
+                .to_hex()
+                .to_string(),
+            origin: endpoint.origin().ascii_serialization(),
+        };
+        match fetch_gemini_catalog_oauth_http_at(client, &credential.access_token, &endpoint).await
+        {
+            Ok(models) => {
+                self.cache.insert(cache_key, models.clone());
+                Ok(models)
+            }
+            Err(error) => self.cache.get(&cache_key).cloned().ok_or(error),
+        }
+    }
+
     /// Production HTTP transport for fixed Provider model discovery.
     pub async fn discover_registered_http(
         &mut self,
@@ -1242,6 +1323,53 @@ async fn fetch_gemini_catalog_http_at(
     }
     if page_token.is_some() {
         bail!("Gemini catalog exceeded pagination safety limit");
+    }
+    Ok(models)
+}
+
+async fn fetch_gemini_catalog_oauth_http_at(
+    client: &reqwest::Client,
+    access_token: &str,
+    endpoint: &Url,
+) -> Result<Vec<CatalogModel>> {
+    let mut models = Vec::new();
+    let mut seen_models = HashSet::new();
+    let mut page_token: Option<String> = None;
+    let mut seen_tokens = HashSet::new();
+    for _ in 0..100 {
+        let mut request = client
+            .get(endpoint.clone())
+            .bearer_auth(access_token)
+            .query(&[("pageSize", "1000")]);
+        if let Some(token) = page_token.as_deref() {
+            request = request.query(&[("pageToken", token)]);
+        }
+        let value = request
+            .send()
+            .await
+            .context("requesting Gemini OAuth model catalog")?
+            .error_for_status()
+            .context("Gemini OAuth model catalog returned an error status")?
+            .json::<Value>()
+            .await
+            .context("decoding Gemini OAuth model catalog")?;
+        let (page_models, next_token) = parse_gemini_page(value)?;
+        for model in page_models {
+            if seen_models.insert(model.wire_id.clone()) {
+                models.push(model);
+            }
+        }
+        let Some(token) = next_token else {
+            page_token = None;
+            break;
+        };
+        if !seen_tokens.insert(token.clone()) {
+            bail!("Gemini OAuth catalog repeated pagination token");
+        }
+        page_token = Some(token);
+    }
+    if page_token.is_some() {
+        bail!("Gemini OAuth catalog exceeded pagination safety limit");
     }
     Ok(models)
 }
@@ -1435,7 +1563,7 @@ mod tests {
 
     #[test]
     fn experimental_oauth_visibility_is_default_hidden_and_independently_gated() {
-        let default_methods = provider_auth_methods(ProviderReleaseGates::default(), false);
+        let default_methods = provider_auth_methods(ProviderReleaseGates::default(), false, false);
         assert!(
             default_methods
                 .iter()
@@ -1447,6 +1575,7 @@ mod tests {
                 codex_oauth: true,
                 ..Default::default()
             },
+            false,
             false,
         );
         let experimental: Vec<_> = codex_only
@@ -1478,6 +1607,7 @@ mod tests {
                 ..Default::default()
             },
             false,
+            false,
         );
         assert_eq!(
             methods
@@ -1501,6 +1631,23 @@ mod tests {
                 .find(|method| method.id == "claude_oauth_compat")
                 .unwrap()
                 .requires_confirmation
+        );
+
+        let ready = provider_auth_methods(
+            ProviderReleaseGates {
+                gemini_oauth: true,
+                ..Default::default()
+            },
+            false,
+            true,
+        );
+        assert_eq!(
+            ready
+                .iter()
+                .find(|method| method.id == "gemini_oauth")
+                .unwrap()
+                .availability,
+            AdapterAvailability::Available
         );
     }
 
@@ -1634,6 +1781,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["custom-a/remote-a", "custom-a/remote-b"]
         );
+    }
+
+    #[tokio::test]
+    async fn gemini_oauth_catalog_uses_bearer_and_native_pagination() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1beta/models"))
+            .and(header("authorization", "Bearer oauth-access"))
+            .and(query_param("pageSize", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{
+                    "name": "models/gemini-oauth-model",
+                    "supportedGenerationMethods": ["generateContent"]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let endpoint = Url::parse(&format!("{}/v1beta/models", server.uri())).unwrap();
+        let models =
+            fetch_gemini_catalog_oauth_http_at(&reqwest::Client::new(), "oauth-access", &endpoint)
+                .await
+                .unwrap();
+        assert_eq!(models[0].id, "gemini/gemini-oauth-model");
     }
 
     fn write_legacy_xai_api_key(directory: &std::path::Path, key: &str) {

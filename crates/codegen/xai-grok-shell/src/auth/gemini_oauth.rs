@@ -43,7 +43,6 @@ impl std::fmt::Debug for GeminiOAuthClient {
 #[derive(Debug, Deserialize)]
 struct GoogleClientFile {
     installed: Option<GoogleClientSection>,
-    web: Option<GoogleClientSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,15 +80,18 @@ impl GeminiOAuthClient {
             serde_json::from_slice(&bytes).context("invalid Google OAuth client JSON")?;
         let section = file
             .installed
-            .or(file.web)
-            .ok_or_else(|| anyhow!("Google OAuth client JSON has no installed or web client"))?;
+            .ok_or_else(|| anyhow!("Google OAuth client JSON is not a Desktop app client"))?;
         if section.client_id.trim().is_empty() || section.client_secret.trim().is_empty() {
             bail!("Google OAuth client id or secret is empty");
         }
         let auth_uri = Url::parse(&section.auth_uri).context("invalid Google authorization URI")?;
         let token_uri = Url::parse(&section.token_uri).context("invalid Google token URI")?;
-        if auth_uri.scheme() != "https" || token_uri.scheme() != "https" {
-            bail!("Google OAuth endpoints must use HTTPS");
+        if auth_uri.scheme() != "https"
+            || auth_uri.host_str() != Some("accounts.google.com")
+            || token_uri.scheme() != "https"
+            || token_uri.host_str() != Some("oauth2.googleapis.com")
+        {
+            bail!("Google OAuth client uses an unsupported authorization or token endpoint");
         }
         if !section.redirect_uris.is_empty()
             && !section.redirect_uris.iter().any(|uri| {
@@ -176,6 +178,9 @@ impl GeminiOAuthClient {
             .json()
             .await
             .context("invalid Gemini OAuth token response")?;
+        if token.access_token.trim().is_empty() {
+            bail!("Gemini OAuth token response has an empty access token");
+        }
         let credential = ProviderOAuthCredential {
             strategy: GEMINI_OAUTH_STRATEGY.to_owned(),
             access_token: token.access_token,
@@ -285,6 +290,30 @@ mod tests {
         let invalid = directory.path().join("invalid.json");
         std::fs::write(&invalid, "{}").unwrap();
         assert!(GeminiOAuthClient::from_client_file(invalid).is_err());
+
+        let web = directory.path().join("web.json");
+        std::fs::write(
+            &web,
+            serde_json::json!({
+                "web": {
+                    "client_id": "web.apps.googleusercontent.com",
+                    "client_secret": "secret",
+                    "auth_uri": "https://accounts.google.com/o/oauth2/v2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(GeminiOAuthClient::from_client_file(web).is_err());
+    }
+
+    #[test]
+    fn tc12_rejects_non_google_oauth_endpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("client.json");
+        client_fixture(&path, "https://attacker.example/token");
+        assert!(GeminiOAuthClient::from_client_file(path).is_err());
     }
 
     #[test]

@@ -45,6 +45,24 @@ fn pending_gemini_oauth() -> &'static Mutex<HashMap<String, PendingGeminiOAuth>>
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn take_pending_gemini_oauth(
+    flow_id: &str,
+    returned_state: &str,
+) -> Result<PendingGeminiOAuth, &'static str> {
+    let mut pending = pending_gemini_oauth()
+        .lock()
+        .map_err(|_| "Gemini OAuth flow registry unavailable")?;
+    let candidate = pending
+        .get(flow_id)
+        .ok_or("Gemini OAuth flow is missing or expired")?;
+    if candidate.start.state != returned_state {
+        return Err("Gemini OAuth state mismatch");
+    }
+    pending
+        .remove(flow_id)
+        .ok_or("Gemini OAuth flow is missing or expired")
+}
+
 fn handle_gemini_oauth_start(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -106,13 +124,8 @@ async fn handle_gemini_oauth_complete(agent: &MvpAgent, args: &acp::ExtRequest) 
     }
 
     let params: Params = parse_params(args)?;
-    let flow = pending_gemini_oauth()
-        .lock()
-        .map_err(|_| acp::Error::internal_error())?
-        .remove(&params.flow_id)
-        .ok_or_else(|| {
-            acp::Error::invalid_params().data("Gemini OAuth flow is missing or expired".to_owned())
-        })?;
+    let flow = take_pending_gemini_oauth(&params.flow_id, &params.state)
+        .map_err(|message| acp::Error::invalid_params().data(message.to_owned()))?;
     if flow.created_at.elapsed() >= Duration::from_secs(600) {
         return Err(acp::Error::invalid_params().data("Gemini OAuth flow expired".to_owned()));
     }
@@ -420,4 +433,51 @@ fn handle_info(agent: &MvpAgent) -> ExtResult {
             .as_ref()
             .is_some_and(|a| a.coding_data_retention_opt_out),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemini_oauth_state_mismatch_does_not_consume_pending_flow() {
+        let directory = tempfile::tempdir().unwrap();
+        let client_file = directory.path().join("client.json");
+        std::fs::write(
+            &client_file,
+            serde_json::json!({
+                "installed": {
+                    "client_id": "user-client.apps.googleusercontent.com",
+                    "client_secret": "secret",
+                    "auth_uri": "https://accounts.google.com/o/oauth2/v2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": ["http://localhost"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let client =
+            crate::auth::gemini_oauth::GeminiOAuthClient::from_client_file(client_file).unwrap();
+        let start = client
+            .begin(url::Url::parse("http://127.0.0.1:43123/oauth/callback").unwrap())
+            .unwrap();
+        let flow_id = uuid::Uuid::now_v7().to_string();
+        pending_gemini_oauth().lock().unwrap().insert(
+            flow_id.clone(),
+            PendingGeminiOAuth {
+                client,
+                start: start.clone(),
+                created_at: Instant::now(),
+            },
+        );
+
+        assert!(matches!(
+            take_pending_gemini_oauth(&flow_id, "attacker-state"),
+            Err("Gemini OAuth state mismatch")
+        ));
+        assert!(pending_gemini_oauth().lock().unwrap().contains_key(&flow_id));
+        assert!(take_pending_gemini_oauth(&flow_id, &start.state).is_ok());
+        assert!(!pending_gemini_oauth().lock().unwrap().contains_key(&flow_id));
+    }
 }
